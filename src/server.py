@@ -92,7 +92,8 @@ def login_ui():
         username = request.form['username']
         password = request.form['password']
         if User.query.filter_by(is_admin=True).count() == 0:
-            new_user = User(username=username, password=password, is_admin=True)
+            hashed_password = generate_password_hash(password)
+            new_user = User(username=username, password=hashed_password, is_admin=True)
             db.session.add(new_user)
             db.session.commit()
             session['user_id'] = new_user.id

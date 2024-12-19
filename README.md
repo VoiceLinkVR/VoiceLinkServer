@@ -9,13 +9,15 @@
 
 本程序推荐使用docker方式运行
 
+请先下载本仓库
+
 如果机器的GPU支持cuda12.2以上请运行：
 ```
 docker-compose -f docker-compose-cuda.yml up -d
 ```
 如果仅拥有cpu以上请运行：
 ```
-docker-compose -f docker-compose-cuda.yml up -d
+docker-compose -f docker-compose-cpu.yml up -d
 ```
 等待一切运行就绪后请访问：`http://{服务器ip}:8980/ui/login` 
 

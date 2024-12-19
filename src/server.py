@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask,render_template, request, redirect, url_for, flash, session, abort, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity,verify_jwt_in_request
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -15,6 +15,7 @@ libreTranslate_host=os.getenv("LIBRETRANSLATE_HOST")
 libreTranslate_port=os.getenv("LIBRETRANSLATE_PORT")
 libreTranslate_apiKey=os.getenv("LIBRETRANSLATE_APIKEY")
 jwt_secret_key=os.getenv("JWT_SECRET_KEY")
+flask_secret_key=os.getenv("FLASK_SECRET_KEY")
 jwt_access_token_expires=os.getenv("JWT_ACCESS_TOKEN_EXPIRES")
 whisper_model=os.getenv("WHISPER_MODEL")
 sqlitePath=os.getenv("SQLITE_PATH")
@@ -41,6 +42,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{sqlitePath if sqlitePath is
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'wVLAF_13N6XL_QmP.DjkKsV' if jwt_secret_key is None else jwt_secret_key  # JWT 秘钥
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 604800 if jwt_access_token_expires is None else int(jwt_access_token_expires)
+app.config['SECRET_KEY'] = 'wVddLAF_13dsdddN6XL_QmP.DjkKsV' if flask_secret_key is None else flask_secret_key
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
@@ -48,7 +50,7 @@ jwt = JWTManager(app)
 
 
 #过滤规则检查 filter.json check
-with open('filter.json', 'r',encoding='utf-8') as src ,open('data/filterConfig/filter.json', 'r') as dest:
+with open('filter.json', 'r',encoding='utf-8') as src ,open('data/filterConfig/filter.json', 'r',encoding='utf-8') as dest:
     try:
         srcConfig=json.load(src)
         destConfig=json.load(dest)
@@ -77,52 +79,100 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(50), unique=True, nullable=False)
     password = db.Column(db.String(80), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
 
-class AdminUser(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(50), unique=True, nullable=False)
-    password = db.Column(db.String(80), nullable=False)
 # 创建数据库
 @app.before_request
 def create_tables():
     db.create_all()
+# 登录表单处理
+@app.route('/ui/login', methods=['GET', 'POST'])
+def login_ui():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        if User.query.filter_by(is_admin=True).count() == 0:
+            new_user = User(username=username, password=password, is_admin=True)
+            db.session.add(new_user)
+            db.session.commit()
+            session['user_id'] = new_user.id
+            return redirect(url_for('manage_users_ui'))
+        user = User.query.filter_by(username=username).first()
+        if user and check_password_hash(user.password, password) and user.is_admin:
+            session['user_id'] = user.id
+            return redirect(url_for('manage_users_ui'))
+        
+        else:
+            flash('Invalid username or password')
+    return render_template('login.html')
+ 
+# 用户管理页面
+@app.route('/ui/manage_users', methods=['GET', 'POST'])
+def manage_users_ui():
+    if 'user_id' not in session:
+        return redirect(url_for('logout_ui'))
+ 
+    if request.method == 'POST':
+        new_username = request.form['new_username']
+        new_password = request.form['new_password']
+        new_is_admin = request.form.get('new_is_admin', 'false') == 'true'
+ 
+        hashed_password = generate_password_hash(new_password)
+        new_user = User(username=new_username, password=hashed_password, is_admin=new_is_admin)
+        db.session.add(new_user)
+        db.session.commit()
+        flash('User added successfully')
+ 
+    users = User.query.all()
+    return render_template('manage_users.html', users=users)
 
-@app.route('/registerAdmin', methods=['POST'])
+# 注销
+@app.route('/ui/logout')
+def logout_ui():
+    session.pop('user_id', None)
+    return redirect(url_for('login_ui'))
+@app.route('/ui/deleteUser', methods=['POST'])
+def delete_user_ui():
+    if 'user_id' not in session:
+        return redirect(url_for('logout_ui'))
+    app.logger.info(request.form['id'])
+    db.session.delete(User.query.filter_by(id= int(request.form['id'])).first())
+    db.session.commit()
+    return redirect(url_for('manage_users_ui'))
+
+@app.route('/manageapi/registerAdmin', methods=['POST'])
 def registerAdmin():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-    if AdminUser.query.count() != 0:
+    adminTag=False
+    adminNum=User.query.filter_by(is_admin=True).count()
+    if adminNum != 0:
         verify_jwt_in_request()
         current_user = get_jwt_identity()
-        if not AdminUser.query.filter_by(username=current_user).first():
+        if not User.query.filter_by(username=current_user,is_admin=True).first():
             return jsonify({'message': 'permission denied'}), 400
         elif not username or not password:
             return jsonify({'message': 'Missing username or password'}), 400
-        elif AdminUser.query.filter_by(username=username).first():
+        elif User.query.filter_by(username=username,is_admin=True).first():
                 return jsonify({'message': 'Username already exists'}), 400
-
+    else: adminTag=True
     hashed_password = generate_password_hash(password)
-    new_adminuser = AdminUser(username=username, password=hashed_password)
+    new_adminuser = User(username=username, password=hashed_password,is_admin=adminTag)
     db.session.add(new_adminuser)
-    if not User.query.filter_by(username=username).first():
-        new_user = User(username=username, password=hashed_password)
-        db.session.add(new_user)
-   
-    
     db.session.commit()
     return jsonify({'message': 'AdminUser created successfully'}), 201
 
 
 
-@app.route('/changePassword', methods=['POST'])
+@app.route('/manageapi/changePassword', methods=['POST'])
 @jwt_required()
 def changePassword():
     current_user = get_jwt_identity()
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-    if not AdminUser.query.filter_by(username=current_user).first():
+    if not User.query.filter_by(username=current_user,is_admin=True).first():
         return jsonify({'message': 'permission denied'}), 400
     hashed_password = generate_password_hash(password)
     new_user = User(username=username, password=hashed_password)
@@ -133,7 +183,7 @@ def changePassword():
 
 
 # 注册接口
-@app.route('/register', methods=['POST'])
+@app.route('/manageapi/register', methods=['POST'])
 @jwt_required()
 def register():
     
@@ -144,7 +194,7 @@ def register():
     app.logger.info(f"/register {username},damin: {current_user}")
     if not username or not password:
         return jsonify({'message': 'Missing username or password'}), 400
-    if not AdminUser.query.filter_by(username=current_user).first():
+    if not User.query.filter_by(username=current_user,is_admin=True).first():
         return jsonify({'message': 'permission denied'}), 400
     if User.query.filter_by(username=username).first():
         return jsonify({'message': 'Username already exists'}), 400
@@ -156,8 +206,28 @@ def register():
 
     return jsonify({'message': 'User created successfully'}), 201
 
+# 删除接口
+@app.route('/manageapi/deleteUser', methods=['POST'])
+@jwt_required()
+def deleteUser():
+    
+    data = request.get_json()
+    username = data.get('username')
+    current_user = get_jwt_identity()
+    app.logger.info(f"/register {username},damin: {current_user}")
+    if not username :
+        return jsonify({'message': 'Missing username or password'}), 400
+
+    if not User.query.filter_by(username=username).first():
+        return jsonify({'message': 'Username not exist'}), 400
+    
+    User.query.filter_by(username=username).delete()
+
+    return jsonify({'message': 'User deleted successfully'}), 201
+
+
 # 登录接口
-@app.route('/login', methods=['POST'])
+@app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
     username = data.get('username')
@@ -174,7 +244,7 @@ def login():
         return jsonify({'message': 'Invalid credentials'}), 401
 
 # 语音识别
-@app.route('/whisper/transcriptions', methods=['POST'])
+@app.route('/api/whisper/transcriptions', methods=['POST'])
 @jwt_required()
 def whisper_transcriptions():
     current_user = get_jwt_identity()
@@ -213,7 +283,7 @@ def translate_local(text,source,target)-> str:
         app.logger.info(f"翻译API响应错误: {result}")
         return text  # 如果翻译失败，返回原文
 # 翻译
-@app.route('/libreTranslate', methods=['POST'])
+@app.route('/api/libreTranslate', methods=['POST'])
 @jwt_required()
 def libreTranslate():
     current_user = get_jwt_identity()
@@ -226,7 +296,7 @@ def libreTranslate():
     return jsonify({'text': res}), 200
 
 # 翻译
-@app.route('/func/translateToEnglish', methods=['POST'])
+@app.route('/api/func/translateToEnglish', methods=['POST'])
 @jwt_required()
 def translate():
     current_user = get_jwt_identity()
@@ -240,7 +310,7 @@ def translate():
     return jsonify({'text': text.text,'translatedText':translatedText.text}), 200
 
 # 多语言翻译
-@app.route('/func/translateToOtherLanguage', methods=['POST'])
+@app.route('/api/func/translateToOtherLanguage', methods=['POST'])
 @jwt_required()
 def translateDouble():
     current_user = get_jwt_identity()
@@ -271,6 +341,5 @@ def translateDouble():
 
 if __name__ == '__main__':
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///test.db'
-    db = SQLAlchemy(app)
     app.run(debug=True,host='0.0.0.0',port=8980)
 

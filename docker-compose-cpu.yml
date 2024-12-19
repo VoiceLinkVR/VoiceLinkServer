@@ -1,26 +1,15 @@
 services:
   faster-whisper-server-cuda:
-    image: fedirz/faster-whisper-server:latest-cuda
+    image: fedirz/faster-whisper-server:latest-cpu
     restart: unless-stopped
     ports:
       - 8000:8000
     volumes:
-      - hugging_face_cache:/root/.cache/huggingface
+      - hugging_face_cache:/root/.cache/huggingface:rw
     develop:
       watch:
         - path: faster_whisper_server
           action: rebuild
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: ["gpu"]
-              # If you have CDI feature enabled use the following instead
-              # https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html
-              # https://docs.docker.com/reference/cli/dockerd/#enable-cdi-devices
-              # - driver: cdi
-              #   device_ids:
-              #   - nvidia.com/gpu=all
 
   libretranslate:
     image: libretranslate/libretranslate
@@ -48,7 +37,7 @@ services:
     ports:
       - 8980:8980
     volumes:
-      -  voice-link-vr-server-local:/usr/src/app/data
+      -  voice-link-vr-server-local:/usr/src/app/data:rw
     
 volumes:
   lt-local:

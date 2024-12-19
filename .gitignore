@@ -5,7 +5,7 @@ data/db/test.db
 __pycache__/
 *.py[cod]
 *$py.class
-
+src/data
 # C extensions
 *.so
 

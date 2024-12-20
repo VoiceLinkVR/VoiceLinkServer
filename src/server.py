@@ -19,6 +19,7 @@ flask_secret_key=os.getenv("FLASK_SECRET_KEY")
 jwt_access_token_expires=os.getenv("JWT_ACCESS_TOKEN_EXPIRES")
 whisper_model=os.getenv("WHISPER_MODEL")
 sqlitePath=os.getenv("SQLITE_PATH")
+filter_web_url=os.getenv("FILTER_WEB_URL")
 
 # whisper config
 if whisper_host is not None and whisper_prot is not None:whisper_url=f'http://{whisper_host}:{whisper_prot}/v1/'
@@ -46,32 +47,43 @@ app.config['SECRET_KEY'] = 'wVddLAF_13dsdddN6XL_QmP.DjkKsV' if flask_secret_key 
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-
-
-
-#过滤规则检查 filter.json check
-with open('filter.json', 'r',encoding='utf-8') as src ,open('data/filterConfig/filter.json', 'r',encoding='utf-8') as dest:
+with open('filter.json', 'r',encoding='utf-8') as src:
     try:
-        srcConfig=json.load(src)
-        destConfig=json.load(dest)
+        srcConfig1=json.load(src)  
     except requests.exceptions.JSONDecodeError as e:
-        app.logger.warning("过滤配置文件异常,详情："+str(e.strerror))
+        app.logger.warning("local filter.json error||源过滤配置文件异常,详情："+str(e.strerror))
         exit(1)
-configDiff=list(set(srcConfig.keys())-set(destConfig.keys()))
-if configDiff != [] :
-    app.logger.info(" filter in filter.json updated ||filter.json文件更新 :"+str(configDiff))
-    for newConfig in configDiff:
-        destConfig[newConfig]=srcConfig[newConfig]
-    with open('data/filterConfig/filter.json', 'w', encoding="utf-8") as file:
-        file.write(json.dumps(destConfig,ensure_ascii=False, indent=4))
-for filter in srcConfig.keys():
-    filterDiff=[rule for rule in srcConfig[filter] if rule not in destConfig[filter]]
-    if filterDiff != []:
-        app.logger.info("rules in filter.json column updated ||filter.json文件更新 规则更新,增加："+str(filterDiff))
-        for newFilter in filterDiff:
-            destConfig[filter].append(newFilter)
+
+try:
+    responce= requests.get("https://raw.githubusercontent.com/VoiceLinkVR/VoiceLinkServer/refs/heads/main/src/filter.json" if filter_web_url is None else filter_web_url) 
+    srcConfig2= responce.json()
+except Exception as e:
+    app.logger.warning("failed to update filter.json through web || 通过网络获取源过滤配置文件失败,详情："+str(e.strerror))
+
+
+for srcConfig in [srcConfig1,srcConfig2]:
+    #过滤规则检查 filter.json check
+    with open('data/filterConfig/filter.json', 'r',encoding='utf-8') as dest:
+        try:
+            destConfig=json.load(dest)
+        except requests.exceptions.JSONDecodeError as e:
+            app.logger.warning("过滤配置文件异常,详情："+str(e.strerror))
+            exit(1)
+    configDiff=list(set(srcConfig.keys())-set(destConfig.keys()))
+    if configDiff != [] :
+        app.logger.info(" filter in filter.json updated ||filter.json文件更新 :"+str(configDiff))
+        for newConfig in configDiff:
+            destConfig[newConfig]=srcConfig[newConfig]
         with open('data/filterConfig/filter.json', 'w', encoding="utf-8") as file:
             file.write(json.dumps(destConfig,ensure_ascii=False, indent=4))
+    for filter in srcConfig.keys():
+        filterDiff=[rule for rule in srcConfig[filter] if rule not in destConfig[filter]]
+        if filterDiff != []:
+            app.logger.info("rules in filter.json column updated ||filter.json文件更新 规则更新,增加："+str(filterDiff))
+            for newFilter in filterDiff:
+                destConfig[filter].append(newFilter)
+            with open('data/filterConfig/filter.json', 'w', encoding="utf-8") as file:
+                file.write(json.dumps(destConfig,ensure_ascii=False, indent=4))
 errorFilter=destConfig
 
 # 用户模型

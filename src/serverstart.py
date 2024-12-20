@@ -2,7 +2,7 @@ from waitress import serve
 from logging.config import dictConfig
 from datetime import date
 import os
-import json
+
 today = date.today()
 formatted_today = today.strftime('%Y-%m-%d')
 checkdirList=['data','data/db','data/filterConfig','data/logs']

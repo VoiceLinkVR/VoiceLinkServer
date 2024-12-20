@@ -32,7 +32,7 @@ whisperclient = OpenAI(api_key=whisper_apiKey, base_url=whisper_url)
 # libreTranslate config
 supportedLanguagesList=[]
 libreTranslate_apiKey= "" if  libreTranslate_apiKey is None else libreTranslate_apiKey
-if libreTranslate_host is not None and libreTranslate_host is not None:localTransBaseUrl=f'http://{libreTranslate_host}:{libreTranslate_host}/'
+if libreTranslate_host is not None and libreTranslate_host is not None:localTransBaseUrl=f'http://{libreTranslate_host}:{libreTranslate_port}/'
 else: localTransBaseUrl="http://127.0.0.1:5000/"
 localTransUrl=localTransBaseUrl+"translate"
 localLanguageUrl=localTransBaseUrl+"languages"

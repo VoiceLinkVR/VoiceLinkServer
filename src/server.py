@@ -27,7 +27,11 @@ else: whisper_url='http://127.0.0.1:8000/v1/'
 whisper_apiKey= "something" if  whisper_apiKey is None else whisper_apiKey
 model="Systran/faster-whisper-large-v3"if whisper_model is None else whisper_model
 whisperclient = OpenAI(api_key=whisper_apiKey, base_url=whisper_url)
-
+whisperSupportedLanguageList=["af","am","ar","as","az","ba","be","bg","bn","bo","br","bs","ca","cs","cy","da","de","el","en","es"
+                              ,"et","eu","fa","fi","fo","fr","gl","gu","ha","haw","he","hi","hr","ht","hu","hy","id","is","it",
+                              "ja","jw","ka","kk","km","kn","ko","la","lb","ln","lo","lt","lv","mg","mi","mk","ml","mn","mr","ms",
+                              "mt","my","ne","nl","nn","no","oc","pa","pl","ps","pt","ro","ru","sa","sd","si","sk","sl","sn","so","sq",
+                              "sr", "su", "sv","sw","ta", "te","tg","th","tk","tl","tr","tt","uk","ur","uz","vi","yi","yo","yue","zh"]
 
 # libreTranslate config
 supportedLanguagesList=[]
@@ -271,6 +275,31 @@ def whisper_transcriptions():
         return jsonify({'text': "",'message':"filtered"}), 200
     return jsonify({'text': text}), 200
 
+def init_supportedLanguagesList():
+    global supportedLanguagesList
+    if supportedLanguagesList == []:
+        res=requests.get(localLanguageUrl)
+        datas=res.json()
+        for data in datas:
+            if data["code"]=='en':
+                supportedLanguagesList=data["targets"]
+                break
+
+
+# 语音识别
+@app.route('/api/whisper/translations', methods=['POST'])
+@jwt_required()
+def whisper_transcriptions():
+    current_user = get_jwt_identity()
+    app.logger.info(f"/whisper/translations user:{current_user}")
+    file=request.files['file']
+
+    audiofile=file.stream.read()
+    res=whisperclient.audio.translations.create(model=model, file=audiofile,language='zh')
+    text=res.text
+    if(text in errorFilter["errorResultDict"]) or any(errorKey in text for errorKey in errorFilter["errorKeyString"]):
+        return jsonify({'text': "",'message':"filtered"}), 200
+    return jsonify({'text': text}), 200
 
 def translate_local(text,source,target)-> str: 
     url = localTransUrl
@@ -329,13 +358,7 @@ def translateDouble():
     current_user = get_jwt_identity()
     app.logger.info(f"/func/translateToOtherLanguage user:{current_user}")
     global supportedLanguagesList
-    if supportedLanguagesList == []:
-        res=requests.get(localLanguageUrl)
-        datas=res.json()
-        for data in datas:
-            if data["code"]=='en':
-                supportedLanguagesList=data["targets"]
-                break
+    init_supportedLanguagesList()
     file=request.files['file']
     params=request.form.to_dict()
     targetLanguage=params["targetLanguage"]
@@ -350,6 +373,54 @@ def translateDouble():
     if targetLanguage =='en':transText=translatedText.text
     else:transText=translate_local(translatedText.text,"en",targetLanguage)
     return jsonify({'text': text.text,'translatedText':transText}), 200
+
+# 多语言翻译
+@app.route('/api/func/multitranslateToOtherLanguage', methods=['POST'])
+@jwt_required()
+def translateDouble():
+    current_user = get_jwt_identity()
+    app.logger.info(f"/func/multitranslateToOtherLanguage user:{current_user}")
+    global supportedLanguagesList
+    init_supportedLanguagesList()
+    file=request.files['file']
+    params=request.form.to_dict()
+    targetLanguage=params["targetLanguage"]
+    sourceLanguage=params["sourceLanguage"]
+    app.logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
+    if sourceLanguage not in whisperSupportedLanguageList:
+         return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
+    if targetLanguage not in supportedLanguagesList:
+        return jsonify({'message':f"targetLanguage error,please use following languages:{str(supportedLanguagesList)}"}), 401
+    audiofile=file.stream.read()
+    text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
+    if(text.text in errorFilter["errorResultDict"]) or any(errorKey in text.text for errorKey in errorFilter["errorKeyString"]):
+        return jsonify({'text': "",'message':"filtered"}), 200
+    translatedText=whisperclient.audio.translations.create(model=model, file=audiofile)
+    if targetLanguage =='en':transText=translatedText.text
+    else:transText=translate_local(translatedText.text,"en",targetLanguage)
+    return jsonify({'text': text.text,'translatedText':transText}), 200
+
+
+# 多语言翻译
+@app.route('/api/whisper/multitranscription', methods=['POST'])
+@jwt_required()
+def translateDouble():
+    current_user = get_jwt_identity()
+    app.logger.info(f"/api/whisper/multitranscription user:{current_user}")
+    global supportedLanguagesList
+    init_supportedLanguagesList()
+    file=request.files['file']
+    params=request.form.to_dict()
+    sourceLanguage=params["sourceLanguage"]
+    app.logger.info(f"sourceLanguage:{sourceLanguage}")
+    if sourceLanguage not in whisperSupportedLanguageList:
+        return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
+    audiofile=file.stream.read()
+    text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language='sourceLanguage')
+    if(text.text in errorFilter["errorResultDict"]) or any(errorKey in text.text for errorKey in errorFilter["errorKeyString"]):
+        return jsonify({'text': "",'message':"filtered"}), 200
+    return jsonify({'text': text.text}), 200
+
 
 
 if __name__ == '__main__':

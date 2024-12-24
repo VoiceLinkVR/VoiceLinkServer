@@ -7,7 +7,7 @@ It can be used together with other clients of VoiceLinkVR or independently as a 
 
 Integrated a very simple user control interface, the project relies on faster whisper server and libreTranslation
 
-##Deployment method
+## Deployment method
 
 This program is only recommended to run in Docker compose mode
 
@@ -19,7 +19,7 @@ If the GPU of the machine supports CUDA12.2 or above, please run:
 ```
 docker-compose -f docker-compose-cuda.yml up -d
 ```
-If you only have a CPU or above, please run:
+If you only have a CPU, please run:
 ```
 docker-compose -f docker-compose-cpu.yml up -d
 ```
@@ -30,15 +30,15 @@ The username and password entered during the first login will be used as the def
 If you forget your administrator account and password, please modify the database file yourself. In Docker, this file can be found in `/usr/src/app/data/db/users.db '`
 
 
-##Service Interface Document
+## Service Interface Document
 
-###Management interface
+### Management interface
 -Management interface entrance:/ ui/login
 -Management interface homepage:/ ui/manage_users
 -Exit the management interface/ui/logout
 -Delete user/ui/deleteUser in the management interface
 
-###Control API
+### Control API
 Except for the administrator registration interface, which does not require a token when there are no users after startup, tokens need to be added for all other interfaces
 ####Registration administrator interface
 
@@ -58,7 +58,7 @@ Response format:
 {"message": "User created successfully"}
 ```
 
-####Change user password interface
+#### Change user password interface
 method: POST
 url:/manageapi/changePassword
 Pass in parameters:
@@ -72,7 +72,7 @@ Response format:
 ```json
 {"message": "User created successfully"}
 ```
-####Register User Interface
+#### Register User Interface
 method: POST
 url:/manageapi/register
 Pass in parameters:
@@ -86,7 +86,7 @@ Response format:
 ```json
 {"message": "User created successfully"}
 ```
-####Delete user interface
+#### Delete user interface
 method: POST
 url:/manageapi/deleteUser
 Pass in parameters:
@@ -100,8 +100,8 @@ Response format:
 ```json
 {"message": "User created successfully"}
 ```
-###Call API
-####Login to obtain token
+### Call API
+#### Login to obtain token
 url:/api/login
 ```json
 {
@@ -117,7 +117,7 @@ Response format:
 {"message": "Invalid credentials"}
 
 ```
-####Obtain speech recognition results (in Chinese)
+#### Obtain speech recognition results (in Chinese)
 method: POST
 url:/api/whisper/transcriptions
 Pass in parameters:
@@ -146,7 +146,7 @@ Response format:
 ```json
 {"text": ""}
 ```
-####Voice translation interface (English)
+#### Voice translation interface (English)
 method: POST
 url:/api/func/translateToEnglish
 Pass in parameters:
@@ -158,7 +158,7 @@ Response format:
 ```json
 {"text": "","translatedText":""}
 ```
-####Register User Interface
+#### Register User Interface
 method: POST
 url:/api/func/translateToOtherLanguage
 Pass in parameters:

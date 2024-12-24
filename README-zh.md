@@ -3,7 +3,7 @@
 
 这是一个调用faster-whisper和libreTranslate的docker服务端程序
 
-既可以配合VoiceLinkVR的其他客户端一起使用，也可以独立作为服务端使用
+既可以配合VoiceLinkVR的其他客户端如VRCHAT-OSC客户端[VRCLS](https://github.com/VoiceLinkVR/VRCLS)一起使用，也可以独立作为服务端使用
 
 集成了一个非常简单的用户控制界面，项目依赖于faster-whisper-server 与libreTranslate
 

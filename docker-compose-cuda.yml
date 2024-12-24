@@ -10,6 +10,8 @@ services:
       watch:
         - path: faster_whisper_server
           action: rebuild
+    environment:
+      - WHISPER__TTL=-1
     deploy:
       resources:
         reservations:

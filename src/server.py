@@ -289,7 +289,7 @@ def init_supportedLanguagesList():
 # 语音识别
 @app.route('/api/whisper/translations', methods=['POST'])
 @jwt_required()
-def whisper_transcriptions():
+def whisper_translations():
     current_user = get_jwt_identity()
     app.logger.info(f"/whisper/translations user:{current_user}")
     file=request.files['file']
@@ -354,7 +354,7 @@ def translate():
 # 多语言翻译
 @app.route('/api/func/translateToOtherLanguage', methods=['POST'])
 @jwt_required()
-def translateDouble():
+def translateToOtherLanguage():
     current_user = get_jwt_identity()
     app.logger.info(f"/func/translateToOtherLanguage user:{current_user}")
     global supportedLanguagesList
@@ -377,7 +377,7 @@ def translateDouble():
 # 多语言翻译
 @app.route('/api/func/multitranslateToOtherLanguage', methods=['POST'])
 @jwt_required()
-def translateDouble():
+def multitranslateToOtherLanguage():
     current_user = get_jwt_identity()
     app.logger.info(f"/func/multitranslateToOtherLanguage user:{current_user}")
     global supportedLanguagesList
@@ -404,7 +404,7 @@ def translateDouble():
 # 多语言翻译
 @app.route('/api/whisper/multitranscription', methods=['POST'])
 @jwt_required()
-def translateDouble():
+def multitranscription():
     current_user = get_jwt_identity()
     app.logger.info(f"/api/whisper/multitranscription user:{current_user}")
     global supportedLanguagesList

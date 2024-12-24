@@ -3,7 +3,7 @@
 
 This is a Docker server program that calls faster whisper and libreTranslation
 
-It can be used together with other clients of VoiceLinkVR or independently as a server
+It can be used together with other clients of VoiceLinkVR, such as [VRCLS](https://github.com/VoiceLinkVR/VRCLS), or independently as a server
 
 Integrated a very simple user control interface, the project relies on faster whisper server and libreTranslation
 

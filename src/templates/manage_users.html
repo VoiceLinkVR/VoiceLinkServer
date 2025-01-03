@@ -8,15 +8,19 @@
   <body>
     <h2>User Management</h2>
     <a href="/ui/logout">Logout</a>
-    <h3>Add New User</h3>
+    <h3>Add/Update User</h3>
     <form method="POST">
       <label for="new_username">Username:</label>
       <input type="text" id="new_username" name="new_username" required><br>
       <label for="new_password">Password:</label>
-      <input type="password" id="new_password" name="new_password" required><br>
+      <input type="password" id="new_password" name="new_password"><br>
       <label for="new_is_admin">Is Admin:</label>
       <input type="checkbox" id="new_is_admin" name="new_is_admin"><br>
-      <button type="submit">Add User</button>
+      <label for="new_limit_rule">limit_rule:</label>
+      <input type="text" id="new_limit_rule" name="new_limit_rule"><br>
+      <label for="is_update">Is Update:</label>
+      <input type="checkbox" id="is_update" name="is_update"><br>
+      <button type="submit">Submit</button>
     </form>
     {% for message in get_flashed_messages() %}
              <div class="alert">{{ message }}</div>
@@ -24,7 +28,7 @@
     <h3>Existing Users</h3>
     <ul>
     {% for user in users %}
-      <li>{{ user.username }} (Admin: {{ user.is_admin }})</li>
+      <li>{{ user.username }} (Admin: {{ user.is_admin }} ,limit_rule:{{user.limit_rule}})</li>
       <form action="{{ url_for('delete_user_ui') }}" method="post" style="display:inline;">
         <input type="hidden" name="id" value="{{user.id}}">
         <button type="submit">Delete</button>

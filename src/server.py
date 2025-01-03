@@ -1,6 +1,9 @@
+import functools
 from flask import Flask,render_template, request, redirect, url_for, flash, session, abort, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity,verify_jwt_in_request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
 from openai import OpenAI
 import requests
@@ -20,7 +23,8 @@ jwt_access_token_expires=os.getenv("JWT_ACCESS_TOKEN_EXPIRES")
 whisper_model=os.getenv("WHISPER_MODEL")
 sqlitePath=os.getenv("SQLITE_PATH")
 filter_web_url=os.getenv("FILTER_WEB_URL")
-
+limit_enable=os.getenv("LIMIT_ENABLE")
+limit_enable= False if  limit_enable is None or limit_enable =="" else True
 # whisper config
 if whisper_host is not None and whisper_prot is not None:whisper_url=f'http://{whisper_host}:{whisper_prot}/v1/'
 else: whisper_url='http://127.0.0.1:8000/v1/'
@@ -48,6 +52,20 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'wVLAF_13N6XL_QmP.DjkKsV' if jwt_secret_key is None else jwt_secret_key  # JWT 秘钥
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 604800 if jwt_access_token_expires is None else int(jwt_access_token_expires)
 app.config['SECRET_KEY'] = 'wVddLAF_13dsdddN6XL_QmP.DjkKsV' if flask_secret_key is None else flask_secret_key
+
+if limit_enable:
+    def limit_key_func():
+        XRealIp = request.headers.get('X-Real-Ip')
+        x_forwarded_for = request.headers.get('X-Forwarded-For')
+        if XRealIp:
+            ip=XRealIp.split(',')[0].strip()
+        elif x_forwarded_for:
+            ip=x_forwarded_for.split(',')[0].strip()
+        else:
+            ip=request.remote_addr
+        app.logger.info(ip)
+        return ip
+    limiter=Limiter(app=app,key_func=limit_key_func,default_limits=["2000 per day", "1000 per hour"])
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
@@ -96,11 +114,37 @@ class User(db.Model):
     username = db.Column(db.String(50), unique=True, nullable=False)
     password = db.Column(db.String(80), nullable=False)
     is_admin = db.Column(db.Boolean, default=False)
+    limit_rule= db.Column(db.String(100), nullable=True)
 
 # 创建数据库
 @app.before_request
 def create_tables():
     db.create_all()
+
+# 动态流量限制装饰器
+def dynamic_limit(fn):
+    @jwt_required()  # 确保 JWT 验证通过
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        
+        if limit_enable:
+            current_user = get_jwt_identity()  # 获取当前用户的身份（通常是用户名）
+            user=User.query.filter_by(username=current_user).first()
+            if user:
+                app.logger.info(f"limit rule,use: {current_user},{user.limit_rule}")
+                # 使用动态限制
+                with limiter.limit(user.limit_rule):
+                    return fn(*args, **kwargs)
+            else:
+                # 使用默认限制（或者返回一个错误）
+                # 这里我们选择使用默认限制，因为 Limiter 会自动处理超出限制的情况
+                app.logger.info("default rule")
+                with limiter.limit(None):  # None 表示使用默认限制
+                    return fn(*args, **kwargs)
+        else:
+            return fn(*args, **kwargs)
+    return wrapper
+
 # 登录表单处理
 @app.route('/ui/login', methods=['GET', 'POST'])
 def login_ui():
@@ -132,13 +176,23 @@ def manage_users_ui():
     if request.method == 'POST':
         new_username = request.form['new_username']
         new_password = request.form['new_password']
-        new_is_admin = request.form.get('new_is_admin', 'false') == 'true'
- 
-        hashed_password = generate_password_hash(new_password)
-        new_user = User(username=new_username, password=hashed_password, is_admin=new_is_admin)
-        db.session.add(new_user)
+        new_is_admin = request.form.get('new_is_admin', 'false') == 'on'
+        is_update = request.form.get('is_update', 'false') == 'on'
+        new_limit_rule = request.form['new_limit_rule']
+        if is_update :
+            user_base=User.query.filter_by(username=new_username).first()
+            user_base.is_admin=new_is_admin
+            if new_password is not None and new_password != "":user_base.password=new_password
+            if new_limit_rule is not None and new_limit_rule != "":user_base.limit_rule=new_limit_rule
+                
+        else:
+            if new_password is None or new_password =="":flash('Please enter password')
+            new_limit_rule = new_limit_rule if new_limit_rule is not None and new_limit_rule != "" else "10000/day;1000/hour"
+            hashed_password = generate_password_hash(new_password)
+            new_user = User(username=new_username, password=hashed_password, is_admin=new_is_admin,limit_rule=new_limit_rule)
+            db.session.add(new_user)
         db.session.commit()
-        flash('User added successfully')
+        flash('User added/updated successfully')
  
     users = User.query.all()
     return render_template('manage_users.html', users=users)
@@ -262,7 +316,7 @@ def login():
 
 # 语音识别
 @app.route('/api/whisper/transcriptions', methods=['POST'])
-@jwt_required()
+@dynamic_limit
 def whisper_transcriptions():
     current_user = get_jwt_identity()
     app.logger.info(f"/whisper/transcriptions user:{current_user}")
@@ -288,7 +342,7 @@ def init_supportedLanguagesList():
 
 # 语音识别
 @app.route('/api/whisper/translations', methods=['POST'])
-@jwt_required()
+@dynamic_limit
 def whisper_translations():
     current_user = get_jwt_identity()
     app.logger.info(f"/whisper/translations user:{current_user}")
@@ -326,7 +380,7 @@ def translate_local(text,source,target)-> str:
         return text  # 如果翻译失败，返回原文
 # 翻译
 @app.route('/api/libreTranslate', methods=['POST'])
-@jwt_required()
+@dynamic_limit
 def libreTranslate():
     current_user = get_jwt_identity()
     app.logger.info(f"/libreTranslate user:{current_user}")
@@ -339,7 +393,7 @@ def libreTranslate():
 
 # 翻译
 @app.route('/api/func/translateToEnglish', methods=['POST'])
-@jwt_required()
+@dynamic_limit
 def translate():
     current_user = get_jwt_identity()
     app.logger.info(f"/func/translateToEnglish user:{current_user}")
@@ -353,7 +407,7 @@ def translate():
 
 # 多语言翻译
 @app.route('/api/func/translateToOtherLanguage', methods=['POST'])
-@jwt_required()
+@dynamic_limit
 def translateToOtherLanguage():
     current_user = get_jwt_identity()
     app.logger.info(f"/func/translateToOtherLanguage user:{current_user}")
@@ -376,7 +430,7 @@ def translateToOtherLanguage():
 
 # 多语言翻译
 @app.route('/api/func/multitranslateToOtherLanguage', methods=['POST'])
-@jwt_required()
+@dynamic_limit
 def multitranslateToOtherLanguage():
     current_user = get_jwt_identity()
     app.logger.info(f"/func/multitranslateToOtherLanguage user:{current_user}")
@@ -403,7 +457,7 @@ def multitranslateToOtherLanguage():
 
 # 多语言翻译
 @app.route('/api/whisper/multitranscription', methods=['POST'])
-@jwt_required()
+@dynamic_limit
 def multitranscription():
     current_user = get_jwt_identity()
     app.logger.info(f"/api/whisper/multitranscription user:{current_user}")

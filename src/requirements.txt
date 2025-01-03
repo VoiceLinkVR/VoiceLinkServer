@@ -4,3 +4,4 @@ flask_jwt_extended
 openai
 requests
 waitress
+Flask-Limiter

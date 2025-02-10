@@ -446,14 +446,37 @@ def multitranslateToOtherLanguage():
     if targetLanguage not in supportedLanguagesList:
         return jsonify({'message':f"targetLanguage error,please use following languages:{str(supportedLanguagesList)}"}), 401
     audiofile=file.stream.read()
-    text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
-    if(text.text in errorFilter["errorResultDict"]) or any(errorKey in text.text for errorKey in errorFilter["errorKeyString"]):
+    filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
+    if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
         return jsonify({'text': "",'message':"filtered"}), 200
+    text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
     translatedText=whisperclient.audio.translations.create(model=model, file=audiofile)
     if targetLanguage =='en':transText=translatedText.text
     else:transText=translate_local(translatedText.text,"en",targetLanguage)
     return jsonify({'text': text.text,'translatedText':transText}), 200
 
+# 多语言翻译
+@app.route('/api/func/doubleTransciption', methods=['POST'])
+@dynamic_limit
+def doubleTransciption():
+    current_user = get_jwt_identity()
+    app.logger.info(f"/func/doubleTranscibe user:{current_user}")
+    file=request.files['file']
+    params=request.form.to_dict()
+    targetLanguage=params["targetLanguage"]
+    sourceLanguage=params["sourceLanguage"]
+    app.logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
+    if sourceLanguage not in whisperSupportedLanguageList:
+         return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
+    if targetLanguage not in whisperSupportedLanguageList:
+        return jsonify({'message':f"targetLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
+    audiofile=file.stream.read()
+    filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
+    if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
+        return jsonify({'text': "",'message':"filtered"}), 200
+    text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
+    transText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=targetLanguage)
+    return jsonify({'text': text.text,'translatedText':transText.text,'zhText':filterText.text}), 200
 
 # 多语言翻译
 @app.route('/api/whisper/multitranscription', methods=['POST'])
@@ -461,8 +484,6 @@ def multitranslateToOtherLanguage():
 def multitranscription():
     current_user = get_jwt_identity()
     app.logger.info(f"/api/whisper/multitranscription user:{current_user}")
-    global supportedLanguagesList
-    init_supportedLanguagesList()
     file=request.files['file']
     params=request.form.to_dict()
     sourceLanguage=params["sourceLanguage"]
@@ -470,9 +491,12 @@ def multitranscription():
     if sourceLanguage not in whisperSupportedLanguageList:
         return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
     audiofile=file.stream.read()
-    text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language='sourceLanguage')
-    if(text.text in errorFilter["errorResultDict"]) or any(errorKey in text.text for errorKey in errorFilter["errorKeyString"]):
+
+    filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
+    if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
         return jsonify({'text': "",'message':"filtered"}), 200
+    if sourceLanguage!='zh':text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
+    else: text=filterText
     return jsonify({'text': text.text}), 200
 
 

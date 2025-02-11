@@ -1,6 +1,6 @@
 services:
   faster-whisper-server-cuda:
-    image: fedirz/faster-whisper-server:latest-cpu
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/faster-whisper-server:latest-cpu
     restart: unless-stopped
     ports:
       - 8000:8000
@@ -12,7 +12,7 @@ services:
           action: rebuild
 
   libretranslate:
-    image: libretranslate/libretranslate
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/libretranslate
     restart: unless-stopped
     ports:
       - 5000:5000
@@ -32,7 +32,7 @@ services:
     #   - libretranslate_api_keys:/app/db
 
   VoiceLinkVR-server:
-    image: boyqiu0010/voice-link-vr-server:latest
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/voice-link-vr-server:latest
     restart: unless-stopped
     ports:
       - 8980:8980

@@ -17,17 +17,19 @@ cd至项目目录中
 
 如果机器的GPU支持cuda12.2以上请运行：
 ```
-docker-compose -f docker-compose-cuda.yml up -d
+docker-compose -f docker-compose-cuda-cn.yml up -d
 ```
-如果仅拥有cpu以上请运行：
+如果仅拥有cpu以上请运行(国内的朋友)：
 ```
-docker-compose -f docker-compose-cpu.yml up -d
+docker-compose -f docker-compose-cpu-cn.yml up -d
 ```
 等待一切运行就绪后请访问：`http://{服务器ip}:8980/ui/login` 
 
 首次登陆时输入的用户名和密码将作为默认管理员的账户和密码，请妥善保管
 
 如果忘记管理员账户和密码请自行修改数据库文件，在docker中该文件位于`/usr/src/app/data/db/users.db`
+
+程序保留了原有两个包的后端，分别在8000端口与5000端口
 
 
 ## 服务接口文档
@@ -172,3 +174,4 @@ data={"targetLanguage":""}
 ```json
 {"text": "","translatedText":""}
 ```
+#### 其他接口iqng查看server.py

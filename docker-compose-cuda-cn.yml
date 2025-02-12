@@ -1,24 +1,18 @@
 services:
-  faster-whisper-server-cpu:
-    image: fedirz/faster-whisper-server:latest-cpu
+  faster-whisper-server-cuda:
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/faster-whisper-server:latest-cuda
     restart: unless-stopped
     ports:
       - 8000:8000
-    volumes:
-      - hugging_face_cache:/root/.cache/huggingface:rw
-    develop:
-      watch:
-        - path: faster_whisper_server
-          action: rebuild
 
-  libretranslate:
-    image: libretranslate/libretranslate
+  libretranslate-cpu:
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/libretranslate
     restart: unless-stopped
     ports:
       - 5000:5000
-    volumes:
-      # Keep the models in a docker volume, to avoid re-downloading on startup
-      - lt-local:/home/libretranslate/.local:rw
+    # volumes:
+    #   # Keep the models in a docker volume, to avoid re-downloading on startup
+    # - lt-local:/home/libretranslate/.local:rw
     ## Uncomment above command and define your args if necessary
     # command: --ssl --ga-id MY-GA-ID --req-limit 100 --char-limit 500
     ## Uncomment this section and the libretranslate_api_keys volume if you want to backup your API keys
@@ -31,15 +25,20 @@ services:
     # volumes:
     #   - libretranslate_api_keys:/app/db
 
-  VoiceLinkVR-server:
-    image: boyqiu0010/voice-link-vr-server:latest
+  VoiceLinkVR-server-cpu:
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/voice-link-vr-server:latest
     restart: unless-stopped
     ports:
       - 8980:8980
     volumes:
       -  voice-link-vr-server-local:/usr/src/app/data:rw
-    
+    environment:
+      - WHISPER_HOST=faster-whisper-server-cuda
+      - WHISPER_PORT=8000
+      - LIBRETRANSLATE_HOST=libretranslate-cpu
+      - LIBRETRANSLATE_PORT=5000
+    depends_on:
+      - libretranslate-cpu
+      - faster-whisper-server-cuda
 volumes:
-  lt-local:
-  hugging_face_cache:
   voice-link-vr-server-local:

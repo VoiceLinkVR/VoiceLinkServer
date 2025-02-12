@@ -81,6 +81,7 @@ try:
     srcConfig2= responce.json()
 except Exception as e:
     app.logger.warning("failed to update filter.json through web || 通过网络获取源过滤配置文件失败,详情："+str(e.strerror))
+    srcConfig2=srcConfig1
 
 
 for srcConfig in [srcConfig1,srcConfig2]:

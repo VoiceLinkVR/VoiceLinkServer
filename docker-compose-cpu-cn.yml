@@ -37,6 +37,7 @@ services:
       - WHISPER_PORT=8000
       - LIBRETRANSLATE_HOST=libretranslate-cpu
       - LIBRETRANSLATE_PORT=5000
+      - FILTER_WEB_URL=https://gitee.com/voice-link-vr/VoiceLinkServer/raw/main/src/filter.json
     depends_on:
       - libretranslate-cpu
       - faster-whisper-server-cpu

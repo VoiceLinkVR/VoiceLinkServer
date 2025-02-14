@@ -15,7 +15,7 @@
 
 cd至项目目录中
 
-如果机器的GPU支持cuda12.2以上请运行：
+如果机器的GPU支持cuda12.2以上请运行(国内的朋友)：
 ```
 docker-compose -f docker-compose-cuda-cn.yml up -d
 ```

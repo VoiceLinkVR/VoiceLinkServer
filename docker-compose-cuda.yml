@@ -51,8 +51,8 @@ services:
       - 8980:8980
     volumes:
       -  voice-link-vr-server-local:/usr/src/app/data:rw
-#    environment:
-#      - LIMIT_ENABLE=True
+    # environment:
+    #   - LIMIT_ENABLE=True
 volumes:
   lt-local:
   hugging_face_cache:

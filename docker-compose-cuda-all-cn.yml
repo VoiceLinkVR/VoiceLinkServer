@@ -14,7 +14,7 @@ services:
             - capabilities: ["gpu"]
               driver: nvidia
 
-  libretranslate:
+  libretranslate-cuda:
     # image: libretranslate/libretranslate
     image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/libretranslate:latest-cuda
     restart: unless-stopped
@@ -33,8 +33,8 @@ services:
     ## Uncomment above command and define your args if necessary
     # command: --ssl --ga-id MY-GA-ID --req-limit 100 --char-limit 500
     ## Uncomment this section and the libretranslate_api_keys volume if you want to backup your API keys
-    environment:
-      - LT_THREADS=10
+    # environment:
+    #   - LT_THREADS=10
     #   - LT_API_KEYS=true
     #   - LT_API_KEYS_DB_PATH=/app/db/api_keys.db # Same result as `db/api_keys.db` or `./db/api_keys.db`
     ## Uncomment these vars and libretranslate_models volume to optimize loading time.
@@ -51,6 +51,11 @@ services:
     volumes:
       - voice-link-vr-server-local:/usr/src/app/data:rw
     environment:
+      - WHISPER_HOST=faster-whisper-server-cuda
+      - WHISPER_PORT=8000
+      - LIBRETRANSLATE_HOST=libretranslate-cuda
+      - LIBRETRANSLATE_PORT=5000
+      - FILTER_WEB_URL=https://gitee.com/voice-link-vr/VoiceLinkServer/raw/main/src/filter.json
       # - THREADS_NUM=16
       # - LIMIT_ENABLE=True
       # - LIMIT_PUBLIC_TEST_USER=testuser

@@ -19,7 +19,7 @@ cd至项目目录中
 ```
 docker-compose -f docker-compose-cuda-cn.yml up -d
 ```
-如果机器的GPU支持cuda12.4.1以上且性能足够请运行(国内的朋友)：
+如果机器的GPU支持cuda12.4.1以上且性能足够(双cuda)请运行(国内的朋友)：
 ```
 docker-compose -f docker-compose-cuda-all-cn.yml up -d
 ```

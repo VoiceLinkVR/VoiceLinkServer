@@ -51,8 +51,8 @@ services:
     volumes:
       - voice-link-vr-server-local:/usr/src/app/data:rw
     environment:
-      - THREADS_NUM=16
-      - LIMIT_ENABLE=True
-      - LIMIT_PUBLIC_TEST_USER=testuser
+      # - THREADS_NUM=16
+      # - LIMIT_ENABLE=True
+      # - LIMIT_PUBLIC_TEST_USER=testuser
 volumes:
   voice-link-vr-server-local:

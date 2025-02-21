@@ -12,6 +12,7 @@ services:
           action: rebuild
     environment:
       - WHISPER__TTL=-1
+      # environment params in:https://github.com/speaches-ai/speaches/blob/v0.5.0/src/faster_whisper_server/config.py
     deploy:
       resources:
         reservations:
@@ -50,9 +51,11 @@ services:
     ports:
       - 8980:8980
     volumes:
-      -  voice-link-vr-server-local:/usr/src/app/data:rw
-    # environment:
-    #   - LIMIT_ENABLE=True
+      - voice-link-vr-server-local:/usr/src/app/data:rw
+    environment:
+      - THREADS_NUM=16
+      - LIMIT_ENABLE=True
+      - LIMIT_PUBLIC_TEST_USER=testuser
 volumes:
   lt-local:
   hugging_face_cache:

@@ -21,9 +21,12 @@ jwt_secret_key=os.getenv("JWT_SECRET_KEY")
 flask_secret_key=os.getenv("FLASK_SECRET_KEY")
 jwt_access_token_expires=os.getenv("JWT_ACCESS_TOKEN_EXPIRES")
 whisper_model=os.getenv("WHISPER_MODEL")
-sqlitePath=os.getenv("SQLITE_PATH")
+sqlitePath=os.getenv("SQL_PATH")
 filter_web_url=os.getenv("FILTER_WEB_URL")
 limit_enable=os.getenv("LIMIT_ENABLE")
+pubilc_test_username=os.getenv("LIMIT_PUBLIC_TEST_USER")
+sqlalchemy_pool_size=os.getenv("SQLALCHEMY_POOL_SIZE")
+sqlalchemy_max_overflow=os.getenv("SQLALCHEMY_MAX_OVERFLOW")
 limit_enable= False if  limit_enable is None or limit_enable =="" else True
 # whisper config
 if whisper_host is not None and whisper_prot is not None:whisper_url=f'http://{whisper_host}:{whisper_prot}/v1/'
@@ -47,13 +50,16 @@ localLanguageUrl=localTransBaseUrl+"languages"
 
 # 应用和数据库配置
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{sqlitePath if sqlitePath is not None else ''}users.db'  # 使用 SQLite 数据库
+app.config['SQLALCHEMY_DATABASE_URI'] = sqlitePath if sqlitePath is not None else 'sqlite:///users.db'  # 使用 SQLite 数据库
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_POOL_SIZE'] = sqlalchemy_pool_size if sqlalchemy_pool_size else 20  # 设置连接池大小
+app.config['SQLALCHEMY_MAX_OVERFLOW'] = sqlalchemy_max_overflow if sqlalchemy_max_overflow else 40  # 设置最大溢出连接数
 app.config['JWT_SECRET_KEY'] = 'wVLAF_13N6XL_QmP.DjkKsV' if jwt_secret_key is None else jwt_secret_key  # JWT 秘钥
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 604800 if jwt_access_token_expires is None else int(jwt_access_token_expires)
 app.config['SECRET_KEY'] = 'wVddLAF_13dsdddN6XL_QmP.DjkKsV' if flask_secret_key is None else flask_secret_key
 
 if limit_enable:
+    SHARED_LIMIT_SCOPE = "shared_limit_scope"
     def limit_key_func():
         XRealIp = request.headers.get('X-Real-Ip')
         x_forwarded_for = request.headers.get('X-Forwarded-For')
@@ -65,7 +71,7 @@ if limit_enable:
             ip=request.remote_addr
         app.logger.info(ip)
         return ip
-    limiter=Limiter(app=app,key_func=limit_key_func,default_limits=["2000 per day", "1000 per hour"])
+    limiter=Limiter(app=app,key_func=limit_key_func,default_limits=["400/hour"])
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
@@ -133,14 +139,18 @@ def dynamic_limit(fn):
             user=User.query.filter_by(username=current_user).first()
             if user:
                 app.logger.info(f"limit rule,use: {current_user},{user.limit_rule}")
-                # 使用动态限制
-                with limiter.limit(user.limit_rule):
-                    return fn(*args, **kwargs)
+                if current_user == pubilc_test_username:
+                    # 使用动态限制
+                    with limiter.limit(user.limit_rule,scope=SHARED_LIMIT_SCOPE):
+                        return fn(*args, **kwargs)
+                else:
+                    with limiter.limit(user.limit_rule,key_func=lambda:current_user,scope=SHARED_LIMIT_SCOPE):
+                        return fn(*args, **kwargs)
             else:
                 # 使用默认限制（或者返回一个错误）
                 # 这里我们选择使用默认限制，因为 Limiter 会自动处理超出限制的情况
                 app.logger.info("default rule")
-                with limiter.limit(None):  # None 表示使用默认限制
+                with limiter.limit("500/day;400/hour",scope=SHARED_LIMIT_SCOPE):  # None 表示使用默认限制
                     return fn(*args, **kwargs)
         else:
             return fn(*args, **kwargs)

@@ -4,6 +4,8 @@ services:
     restart: unless-stopped
     ports:
       - 8000:8000
+       # environment params in:https://github.com/speaches-ai/speaches/blob/v0.5.0/src/faster_whisper_server/config.py
+    
 
   libretranslate-cpu:
     image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/libretranslate

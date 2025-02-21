@@ -8,5 +8,5 @@ ENV WHISPER_HOST=host.docker.internal
 ENV WHISPER_PORT=8000
 ENV LIBRETRANSLATE_HOST=host.docker.internal
 ENV LIBRETRANSLATE_PORT=5000
-ENV SQLITE_PATH=/usr/src/app/data/db/
+ENV SQL_PATH=sqlite:////usr/src/app/data/db/users.db
 CMD [ "python", "serverstart.py" ]

@@ -5,7 +5,7 @@
 
 既可以配合VoiceLinkVR的其他客户端如VRCHAT-OSC客户端[VRCLS](https://github.com/VoiceLinkVR/VRCLS)一起使用，也可以独立作为服务端使用
 
-集成了一个非常简单的用户控制界面，项目依赖于faster-whisper-server 与libreTranslate
+集成了一个非常简单的用户控制界面，项目依赖于[faster-whisper-server（现在叫speeches）](https://github.com/speaches-ai/speaches/tree/v0.6.0-rc.1) 与libreTranslate
 
 ## 部署方式
 
@@ -18,6 +18,10 @@ cd至项目目录中
 如果机器的GPU支持cuda12.2以上请运行(国内的朋友)：
 ```
 docker-compose -f docker-compose-cuda-cn.yml up -d
+```
+如果机器的GPU支持cuda12.4.1以上且性能足够请运行(国内的朋友)：
+```
+docker-compose -f docker-compose-cuda-all-cn.yml up -d
 ```
 如果仅拥有cpu以上请运行(国内的朋友)：
 ```
@@ -103,6 +107,7 @@ url:/manageapi/deleteUser
 {"message": "User created successfully"}
 ```
 ### 调用api
+推荐去server.py中查看
 #### 登陆获取token 
 url:/api/login
 ```json
@@ -174,4 +179,4 @@ data={"targetLanguage":""}
 ```json
 {"text": "","translatedText":""}
 ```
-#### 其他接口iqng查看server.py
+#### 其他接口请查看server.py

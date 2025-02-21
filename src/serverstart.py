@@ -3,6 +3,8 @@ from logging.config import dictConfig
 from datetime import date
 import os
 
+threads_num=os.getenv("THREADS_NUM")
+
 today = date.today()
 formatted_today = today.strftime('%Y-%m-%d')
 checkdirList=['data','data/db','data/filterConfig','data/logs']
@@ -53,4 +55,13 @@ dictConfig({
 )
 
 from server import app
-serve(app, host='0.0.0.0', port=8980)
+if threads_num is None:serve(app, host='0.0.0.0', port=8980)
+else: serve(app, 
+            host='0.0.0.0',
+            port=8980,
+            threads=int(threads_num),
+            connection_limit=1000,  # 最大并发连接数
+            channel_timeout=300,    # 请求处理超时时间（秒）
+            asyncore_loop_timeout=300,  # 事件循环超时
+            clear_untrusted_proxy_headers=True  # 安全优
+        )

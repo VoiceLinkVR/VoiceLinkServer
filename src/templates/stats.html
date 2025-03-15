@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>使用统计</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; margin: 20px 0; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .nav { margin-bottom: 20px; }
+        .nav a { margin-right: 15px; text-decoration: none; color: #333; }
+        .nav a:hover { color: #666; }
+        .hour-selector { margin: 20px 0; padding: 8px; width: 200px; }
+        .total-row { font-weight: bold; background-color: #f9f9f9; }
+    </style>
+    <script>
+        function loadStats(hour) {
+            window.location.href = "{{ url_for('stats_ui') }}?hour=" + encodeURIComponent(hour);
+        }
+    </script>
+</head>
+<body>
+    <div class="nav">
+        <a href="{{ url_for('manage_users_ui') }}">用户管理</a>
+        <a href="{{ url_for('stats_ui') }}">使用统计</a>
+        <a href="{{ url_for('logout_ui') }}">退出登录</a>
+    </div>
+    <!-- 添加自动刷新选项 -->
+    <div class="auto-refresh">
+        <label>
+            <input type="checkbox" id="autoRefresh"> 每60秒自动刷新
+        </label>
+    </div>
+    <h2>时间段选择</h2>
+    <select class="hour-selector" onchange="loadStats(this.value)">
+        {% for hour in hours %}
+        <option value="{{ hour }}" {% if hour == selected_hour %}selected{% endif %}>
+            {{ hour }}
+        </option>
+        {% endfor %}
+    </select>
+
+    <h2>接口调用统计（{{ selected_hour }}）</h2>
+    <table>
+        <tr>
+            <th>用户</th>
+            <th>IP地址</th>
+            <th>接口</th>
+            <th>调用次数</th>
+        </tr>
+        {% for stat in hourly_stats %}
+        <tr>
+            <td>{{ stat.username or '匿名' }}</td>
+            <td>{{ stat.ip }}</td>
+            <td>{{ stat.endpoint }}</td>
+            <td>{{ stat.count }}</td>
+        </tr>
+        {% else %}
+        <tr>
+            <td colspan="4">暂无数据</td>
+        </tr>
+        {% endfor %}
+        <!-- 总计行 -->
+        <tr class="total-row">
+            <td colspan="3">总计</td>
+            <td>{{ total_count }}</td>
+        </tr>
+    </table>
+
+    <h2>任务耗时分布（{{ selected_hour }}）</h2>
+    <table>
+        <tr>
+            <th>耗时区间</th>
+            <th>任务数量</th>
+        </tr>
+        {% for stat in duration_stats %}
+        <tr>
+            <td>{{ stat.duration_range }}</td>
+            <td>{{ stat.count }}</td>
+        </tr>
+        {% else %}
+        <tr>
+            <td colspan="2">暂无数据</td>
+        </tr>
+        {% endfor %}
+    </table>
+</body>
+<script>
+    // 自动刷新逻辑
+    setInterval(() => {
+        if(document.getElementById('autoRefresh').checked) {
+            loadStats(document.querySelector('.hour-selector').value);
+        }
+    }, 60000);
+</script>
+</html>

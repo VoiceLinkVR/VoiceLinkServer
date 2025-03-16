@@ -1,39 +1,239 @@
 <!doctype html>
 <html lang="en">
-  <head>
+<head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>User Management</title>
-  </head>
-  <body>
-    <h2>User Management</h2>
-    <a href="/ui/logout">Logout</a>
-    <h3>Add/Update User</h3>
-    <form method="POST">
-      <label for="new_username">Username:</label>
-      <input type="text" id="new_username" name="new_username" required><br>
-      <label for="new_password">Password:</label>
-      <input type="password" id="new_password" name="new_password"><br>
-      <label for="new_is_admin">Is Admin:</label>
-      <input type="checkbox" id="new_is_admin" name="new_is_admin"><br>
-      <label for="new_limit_rule">limit_rule:</label>
-      <input type="text" id="new_limit_rule" name="new_limit_rule"><br>
-      <label for="is_update">Is Update:</label>
-      <input type="checkbox" id="is_update" name="is_update"><br>
-      <button type="submit">Submit</button>
-    </form>
-    {% for message in get_flashed_messages() %}
-             <div class="alert">{{ message }}</div>
-    {% endfor %}
-    <h3>Existing Users</h3>
-    <ul>
-    {% for user in users %}
-      <li>{{ user.username }} (Admin: {{ user.is_admin }} ,limit_rule:{{user.limit_rule}})</li>
-      <form action="{{ url_for('delete_user_ui') }}" method="post" style="display:inline;">
-        <input type="hidden" name="id" value="{{user.id}}">
-        <button type="submit">Delete</button>
-      </form>
-    {% endfor %}
-    </ul>
-  </body>
+    <style>
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        /* 新增导航栏样式 */
+        .nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: white;
+            padding: 15px 30px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            z-index: 1000;
+            display: flex;
+            gap: 25px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .nav a {
+            text-decoration: none;
+            color: #333;
+            font-weight: 500;
+            transition: color 0.3s ease;
+            padding: 5px 10px;
+            border-radius: 4px;
+        }
+
+        .nav a:hover {
+            color: #007bff;
+            background: #f8f9fa;
+        }
+
+        /* 调整原有布局 */
+        body {
+            font-family: Arial, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            background: #f0f2f5;
+            padding-top: 60px; /* 为导航栏留出空间 */
+        }
+
+        .sidebar {
+            width: 350px;
+            background: white;
+            padding: 20px;
+            height: calc(100vh - 60px); /* 计算高度 */
+            overflow-y: auto;
+            position: fixed;
+            left: 0;
+            top: 60px; /* 下移导航栏高度 */
+        }
+
+        .main-content {
+            flex: 1;
+            margin-left: 350px;
+            padding: 30px;
+            background: #f8f9fa;
+            min-height: calc(100vh - 60px);
+            margin-top: 60px; /* 保持主内容对齐 */
+        }
+
+        /* 右侧内容区域 */
+        .main-content {
+            flex: 1;
+            margin-left: 350px;
+            padding: 30px;
+            background: #f8f9fa;
+            min-height: 100vh;
+        }
+
+        /* 表单样式 */
+        .form-group {
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .form-group label {
+            width: 120px;
+            text-align: right;
+        }
+
+        input[type="text"],
+        input[type="password"],
+        input[type="date"] {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        /* 用户列表样式 */
+        .user-list {
+            list-style: none;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            padding: 20px;
+        }
+
+        .user-item {
+            padding: 15px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .alert {
+            padding: 10px;
+            background: #e3f4ff;
+            border-radius: 4px;
+            margin: 15px 0;
+        }
+
+        button {
+            padding: 6px 12px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #0056b3;
+        }
+
+        /* 响应式设计 */
+        @media (max-width: 768px) {
+            .sidebar {
+                width: 100%;
+                position: static;
+                height: auto;
+            }
+            
+            .main-content {
+                margin-left: 0;
+            }
+            
+            body {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+ <!-- 新增导航栏 -->
+  <nav class="nav">
+    <a href="{{ url_for('manage_users_ui') }}">用户管理</a>
+    <a href="{{ url_for('stats_ui') }}">使用统计</a>
+    <a href="{{ url_for('logout_ui') }}">退出登录</a>
+  </nav>
+
+    <!-- 左侧表单区 -->
+    <div class="sidebar">
+        <h2>User Management</h2>
+
+        <h3 style="margin: 0 0 15px;">Add/Update User</h3>
+        <form method="POST">
+            <div class="form-group">
+                <label for="new_username">Username:</label>
+                <input type="text" id="new_username" name="new_username" required>
+            </div>
+
+            <div class="form-group">
+                <label for="new_password">Password:</label>
+                <input type="password" id="new_password" name="new_password">
+            </div>
+
+            <div class="form-group">
+                <label for="new_is_admin">Is Admin:</label>
+                <input type="checkbox" id="new_is_admin" name="new_is_admin">
+            </div>
+
+            <div class="form-group">
+                <label for="new_limit_rule">Limit Rule:</label>
+                <input type="text" id="new_limit_rule" name="new_limit_rule">
+            </div>
+
+            <div class="form-group">
+                <label for="expiration_date">Expiration Date:</label>
+                <input type="date" id="expiration_date" name="expiration_date">
+            </div>
+
+            <div class="form-group">
+                <label for="is_active">Active:</label>
+                <input type="checkbox" id="is_active" name="is_active" checked>
+            </div>
+
+            <div class="form-group">
+                <label for="is_update">Is Update:</label>
+                <input type="checkbox" id="is_update" name="is_update">
+            </div>
+
+            <button type="submit" style="width: 100%;margin-top: 15px;">Submit</button>
+        </form>
+
+        {% for message in get_flashed_messages() %}
+            <div class="alert">{{ message }}</div>
+        {% endfor %}
+    </div>
+
+    <!-- 右侧用户列表 -->
+    <div class="main-content">
+        <h3>Existing Users</h3>
+        <ul class="user-list">
+            {% for user in users %}
+                <li class="user-item">
+                    <div>
+                        <strong>{{ user.username }}</strong>
+                        <div style="color: #666; font-size: 0.9em; margin-top: 5px;">
+                            Admin: {{ user.is_admin }} | 
+                            Limit: {{ user.limit_rule }} | 
+                            Status: <span style="color: {{ 'green' if user.is_active else 'red' }}">{{ 'Active' if user.is_active else 'Inactive' }}</span> | 
+                            Expires: {{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else 'Never' }}
+                        </div>
+                    </div>
+                    <form action="{{ url_for('delete_user_ui') }}" method="post">
+                        <input type="hidden" name="id" value="{{user.id}}">
+                        <button type="submit" style="background: #dc3545;">Delete</button>
+                    </form>
+                </li>
+            {% endfor %}
+        </ul>
+    </div>
+</body>
 </html>

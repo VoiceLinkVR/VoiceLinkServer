@@ -18,6 +18,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 from io import BytesIO
 import wave
+
 whisper_to_baidu = {
     'af': 'afr',       # 阿非利堪斯语
     'am': 'amh',       # 阿姆哈拉语
@@ -190,6 +191,7 @@ pubilc_test_username=os.getenv("LIMIT_PUBLIC_TEST_USER")
 sqlalchemy_pool_size=os.getenv("SQLALCHEMY_POOL_SIZE")
 sqlalchemy_max_overflow=os.getenv("SQLALCHEMY_MAX_OVERFLOW")
 enable_baiduapi=os.getenv("ENABLE_BAIDU_API")
+redisUrl=os.getenv("LIMITER_REDIS_URL")
 
 limit_enable= False if  limit_enable is None or limit_enable =="" else True
 # whisper config
@@ -244,7 +246,11 @@ if limit_enable:
             ip=request.remote_addr
         app.logger.info(ip)
         return ip
-    limiter=Limiter(app=app,key_func=limit_key_func,default_limits=["400/hour"],storage_uri="memory://")
+    limiter=Limiter(
+        app=app,
+        key_func=limit_key_func,
+        default_limits=["400/hour"],
+        storage_uri="memory://" if redisUrl is None else redisUrl)
     # 自定义错误处理器
     @app.errorhandler(RateLimitExceeded)
     def handle_rate_limit_exceeded(e):
@@ -295,20 +301,69 @@ for srcConfig in [srcConfig1,srcConfig2]:
                 file.write(json.dumps(destConfig,ensure_ascii=False, indent=4))
 errorFilter=destConfig
 from sqlalchemy import text
+from sqlalchemy import inspect
+
 def check_and_update_db():
     with app.app_context():
         try:
-            # 检查字段是否存在
-            db.session.execute(text("SELECT status FROM request_log LIMIT 1"))
+            inspector = inspect(db.engine)
+            # 检查User表
+            if 'user' in inspector.get_table_names():
+                user_columns = [col['name'] for col in inspector.get_columns('user')]
+                # 添加缺失字段
+                if 'expiration_date' not in user_columns:
+                    db.session.execute(text('ALTER TABLE user ADD COLUMN expiration_date DATETIME'))
+                    app.logger.info("Added expiration_date to user table")
+                if 'is_active' not in user_columns:
+                    db.session.execute(text('ALTER TABLE user ADD COLUMN is_active BOOLEAN DEFAULT 1'))
+                    app.logger.info("Added is_active to user table")
+
+            # 检查request_log表
+            if 'request_log' in inspector.get_table_names():
+                log_columns = [col['name'] for col in inspector.get_columns('request_log')]
+                if 'status' not in log_columns:
+                    db.session.execute(text('ALTER TABLE request_log ADD COLUMN status VARCHAR(20) DEFAULT "pending"'))
+                    app.session.execute(text('UPDATE request_log SET status = "success" WHERE status IS NULL'))
+                    app.logger.info("Added status to request_log table")
+
+            db.session.commit()
+            
         except Exception as e:
-            if 'no such column' in str(e):
-                app.logger.info("检测到缺失字段，开始执行数据库升级...")
-                db.session.execute(text("ALTER TABLE request_log ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'pending'"))
-                db.session.commit()
-                app.logger.info("数据库升级完成")
+            db.session.rollback()
+            app.logger.error(f"数据库升级失败: {str(e)}")
+        finally:
+            db.session.close()
 
 # 在应用初始化后调用
 check_and_update_db()
+
+
+# 在应用初始化后调用
+check_and_update_db()
+def check_user_expiration():
+    with app.app_context():
+        now = datetime.now(pytz.utc)
+        expired_users = User.query.filter(
+            User.expiration_date <= now,
+            User.is_active == True
+        ).all()
+        
+        for user in expired_users:
+            user.is_active = False
+            app.logger.info(f"用户 {user.username} 已过期，自动禁用")
+        
+        db.session.commit()
+
+# 配置定时任务
+scheduler = BackgroundScheduler(timezone=pytz.utc)
+scheduler.add_job(
+    func=check_user_expiration,
+    trigger='cron',
+    hour=0,  # 每天UTC时间0点执行
+    minute=0,
+    second=0
+)
+scheduler.start()
 # 用户模型
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -316,6 +371,8 @@ class User(db.Model):
     password = db.Column(db.String(80), nullable=False)
     is_admin = db.Column(db.Boolean, default=False)
     limit_rule= db.Column(db.String(100), nullable=True)
+    expiration_date = db.Column(db.DateTime, nullable=True)  # 新增有效期字段
+    is_active = db.Column(db.Boolean, default=True)  # 新增激活状态字段
 class RequestLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(50), nullable=True)
@@ -607,9 +664,13 @@ def manage_users_ui():
         new_is_admin = request.form.get('new_is_admin', 'false') == 'on'
         is_update = request.form.get('is_update', 'false') == 'on'
         new_limit_rule = request.form['new_limit_rule']
+        expiration_date = datetime.strptime(request.form['expiration_date'], '%Y-%m-%d') if request.form['expiration_date'] else None
+        is_active = request.form.get('is_active', 'false') == 'on'
         if is_update :
             user_base=User.query.filter_by(username=new_username).first()
             user_base.is_admin=new_is_admin
+            if expiration_date is not None and expiration_date != "":user_base.expiration_date = expiration_date
+            user_base.is_active = is_active
             if new_password is not None and new_password != "":user_base.password=new_password
             if new_limit_rule is not None and new_limit_rule != "":user_base.limit_rule=new_limit_rule
                 
@@ -617,7 +678,14 @@ def manage_users_ui():
             if new_password is None or new_password =="":flash('Please enter password')
             new_limit_rule = new_limit_rule if new_limit_rule is not None and new_limit_rule != "" else "10000/day;1000/hour"
             hashed_password = generate_password_hash(new_password)
-            new_user = User(username=new_username, password=hashed_password, is_admin=new_is_admin,limit_rule=new_limit_rule)
+            new_user = User(
+                username=new_username, 
+                password=hashed_password, 
+                is_admin=new_is_admin,
+                limit_rule=new_limit_rule,
+                expiration_date=expiration_date,
+                is_active=is_active
+                )
             db.session.add(new_user)
         db.session.commit()
         flash('User added/updated successfully')
@@ -736,6 +804,8 @@ def login():
 
     user = User.query.filter_by(username=username).first()
     if user and check_password_hash(user.password, password):
+        if not user.is_active:
+            return jsonify({'message': '用户已被禁用'}), 403
         access_token = create_access_token(identity=username)
         return jsonify({'message': 'Login successful', 'access_token': access_token}), 200
     else:

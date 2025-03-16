@@ -8,3 +8,4 @@ Flask-Limiter
 baidu-translate-api
 pytz
 apscheduler
+redis

@@ -1,4 +1,16 @@
 services:
+  redis:
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/redis:latest
+    container_name: redis
+    restart: always
+    ports:
+      - 6379:6379
+    volumes:
+      - ./redisFiles/data:/data
+      - ./redisFiles/redis.conf:/usr/local/etc/redis/redis.conf
+      # - ./redisFiles/logs:/logs
+    #配置文件启动
+    command: redis-server /usr/local/etc/redis/redis.conf
   faster-whisper-server-cuda:
     image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/faster-whisper-server:latest-cuda
     restart: unless-stopped
@@ -84,5 +96,10 @@ services:
       - LIMIT_PUBLIC_TEST_USER=testuser
       - SQLALCHEMY_POOL_SIZE=0
       - ENABLE_BAIDU_API=True
+      - LIMITER_REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - libretranslate-cuda
+      - faster-whisper-server-cuda
+      - redis
 volumes:
   voice-link-vr-server-local:

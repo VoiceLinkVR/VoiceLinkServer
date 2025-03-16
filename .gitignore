@@ -2,6 +2,8 @@ build-parent-docker
 build-parent-libre-docker
 data/db/test.db
 *.log
+redisFiles/data
+redisFiles/logs
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

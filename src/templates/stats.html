@@ -12,6 +12,32 @@
         .nav a:hover { color: #666; }
         .hour-selector { margin: 20px 0; padding: 8px; width: 200px; }
         .total-row { font-weight: bold; background-color: #f9f9f9; }
+        /* 状态列宽度优化 */
+th:nth-child(4), th:nth-child(5), th:nth-child(6), th:nth-child(7),
+td:nth-child(4), td:nth-child(5), td:nth-child(6), td:nth-child(7) {
+    text-align: right;
+    min-width: 70px;
+}
+
+/* 突出显示限流数据 */
+td:nth-child(6) {
+    color: #d32f2f;
+    font-weight: 500;
+}
+/* 在原有样式后添加 */
+.date-range {
+    font-size: 0.9em;
+    color: #666;
+    margin: 5px 0 15px;
+}
+
+.date-error {
+    color: #d32f2f;
+    padding: 10px;
+    border: 1px solid #ffcdd2;
+    background-color: #ffebee;
+    margin: 10px 0;
+}
     </style>
     <script>
         function loadStats(hour) {
@@ -39,34 +65,79 @@
         </option>
         {% endfor %}
     </select>
-
-    <h2>接口调用统计（{{ selected_hour }}）</h2>
-    <table>
-        <tr>
-            <th>用户</th>
-            <th>IP地址</th>
-            <th>接口</th>
-            <th>调用次数</th>
-        </tr>
-        {% for stat in hourly_stats %}
-        <tr>
-            <td>{{ stat.username or '匿名' }}</td>
-            <td>{{ stat.ip }}</td>
-            <td>{{ stat.endpoint }}</td>
-            <td>{{ stat.count }}</td>
-        </tr>
-        {% else %}
-        <tr>
-            <td colspan="4">暂无数据</td>
-        </tr>
-        {% endfor %}
-        <!-- 总计行 -->
-        <tr class="total-row">
-            <td colspan="3">总计</td>
-            <td>{{ total_count }}</td>
-        </tr>
-    </table>
-
+<!-- 每日统计表格 -->
+<h2>七日请求统计
+    {% if not date_filter_info.error and date_filter_info.start_date %}
+    （{{ date_filter_info.start_date }} 至 {{ date_filter_info.end_date }}）
+    {% endif %}
+</h2>
+<table>
+    <tr>
+        <th>日期</th>
+        <th>成功</th>
+        <th>失败</th>
+        <th>限流</th>
+        <th>总计</th>
+    </tr>
+    {% for day in daily_stats %}
+    <tr>
+        <td>{{ day.day }}</td>
+        <td>{{ day.daily_success }}</td>
+        <td>{{ day.daily_fail }}</td>
+        <td>{{ day.daily_rate_limited }}</td>
+        <td>{{ day.daily_total }}</td>
+    </tr>
+    {% else %}
+    <tr>
+        <td colspan="5">暂无数据</td>
+    </tr>
+    {% endfor %}
+</table>
+{% if date_filter_info.error %}
+<div class="date-error">
+    日期过滤条件无效，显示最近7天数据
+</div>
+{% elif date_filter_info.start_date %}
+<div class="date-range">
+    当前显示 {{ date_filter_info.start_date }} 至 {{ date_filter_info.end_date }} 的统计数据
+</div>
+{% endif %}
+<!-- 修改小时统计表格 -->
+<h2>接口调用统计（{{ selected_hour }}）</h2>
+<table>
+    <tr>
+        <th>用户</th>
+        <th>IP地址</th>
+        <th>接口</th>
+        <th>成功</th>
+        <th>失败</th>
+        <th>限流</th>
+        <th>总计</th>
+    </tr>
+    {% for stat in hourly_stats %}
+    <tr>
+        <td>{{ stat.username or '匿名' }}</td>
+        <td>{{ stat.ip }}</td>
+        <td>{{ stat.endpoint }}</td>
+        <td>{{ stat.success_count }}</td>
+        <td>{{ stat.fail_count }}</td>
+        <td>{{ stat.rate_limited_count }}</td>
+        <td>{{ stat.total_count }}</td>
+    </tr>
+    {% else %}
+    <tr>
+        <td colspan="7">暂无数据</td>
+    </tr>
+    {% endfor %}
+    <tr class="total-row">
+        <td colspan="3">总计</td>
+        <td>{{ total_success }}</td>
+        <td>{{ total_fail }}</td>
+        <td>{{ total_rate_limited }}</td>
+        <td>{{ total_count }}</td>
+    </tr>
+</table>
+    
     <h2>任务耗时分布（{{ selected_hour }}）</h2>
     <table>
         <tr>

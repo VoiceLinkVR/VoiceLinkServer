@@ -5,7 +5,7 @@ openai
 requests
 waitress
 Flask-Limiter
-baidu-translate-api
+translators
 pytz
 apscheduler
 redis

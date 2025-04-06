@@ -95,8 +95,11 @@ services:
       - LIMIT_ENABLE=True
       - LIMIT_PUBLIC_TEST_USER=testuser
       - SQLALCHEMY_POOL_SIZE=0
-      - ENABLE_BAIDU_API=True
+      # - ENABLE_BAIDU_API=True
       - LIMITER_REDIS_URL=redis://redis:6379/0
+      - TTS_TOKEN=
+      - TTS_URL=
+      - ENABLE_WEB_TRANSLATORS=True
     depends_on:
       - libretranslate-cuda
       - faster-whisper-server-cuda

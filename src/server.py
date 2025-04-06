@@ -1,5 +1,5 @@
 import functools
-from flask import Flask, make_response,render_template, request, redirect, url_for, flash, session, abort, jsonify
+from flask import Flask, make_response,render_template, request, redirect, url_for, flash, session, abort, jsonify, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity,verify_jwt_in_request
 from flask_limiter import Limiter
@@ -12,166 +12,14 @@ import json
 import os
 import uuid
 import time
-from datetime import datetime
-import baidu_translate as fanyi
+from datetime import datetime,timedelta
+import translators
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 from io import BytesIO
 import wave
-
-whisper_to_baidu = {
-    'af': 'afr',       # 阿非利堪斯语
-    'am': 'amh',       # 阿姆哈拉语
-    'ar': 'ara',       # 阿拉伯语
-    'as': 'asm',       # 阿萨姆语
-    'az': 'aze',       # 阿塞拜疆语
-    'ba': 'bak',       # 巴什基尔语
-    'be': 'bel',       # 白俄罗斯语
-    'bg': 'bul',       # 保加利亚语
-    'bn': 'ben',       # 孟加拉语
-    'bo': None,       # 藏语（百度 API 中没有对应的代码）
-    'br': 'bre',       # 布列塔尼语
-    'bs': 'bos',       # 波斯尼亚语
-    'ca': 'cat',       # 加泰罗尼亚语
-    'cs': 'cs',        # 捷克语
-    'cy': 'gle',       # 威尔士语
-    'da': 'dan',       # 丹麦语
-    'de': 'de',        # 德语
-    'el': 'el',        # 希腊语
-    'en': 'en',        # 英语
-    'es': 'spa',       # 西班牙语
-    'et': 'est',       # 爱沙尼亚语
-    'eu': 'baq',       # 巴斯克语
-    'fa': 'per',       # 波斯语
-    'fi': 'fin',       # 芬兰语
-    'fo': 'fao',       # 法罗语
-    'fr': 'fra',       # 法语
-    'gl': 'glg',       # 加利西亚语
-    'gu': 'guj',       # 古吉拉特语
-    'ha': 'hau',       # 豪萨语
-    'haw': 'haw',      # 夏威夷语
-    'he': 'heb',       # 希伯来语
-    'hi': 'hi',        # 印地语
-    'hr': 'hrv',       # 克罗地亚语
-    'ht': 'hat',       # 海地克里奥尔语
-    'hu': 'hu',        # 匈牙利语
-    'hy': 'arm',       # 亚美尼亚语
-    'id': 'id',        # 印尼语
-    'is': 'ice',       # 冰岛语
-    'it': 'it',        # 意大利语
-    'ja': 'jp',        # 日语
-    'jw': 'jav',       # 爪哇语
-    'ka': 'geo',       # 格鲁吉亚语
-    'kk': None,       # 哈萨克语（百度 API 中没有对应的代码）
-    'km': 'hkm',       # 高棉语
-    'kn': 'kan',       # 卡纳达语
-    'ko': 'kor',       # 韩语
-    'la': 'lat',       # 拉丁语
-    'lb': 'ltz',       # 卢森堡语
-    'ln': 'lin',       # 林加拉语
-    'lo': 'lao',       # 老挝语
-    'lt': 'lit',       # 立陶宛语
-    'lv': 'lav',       # 拉脱维亚语
-    'mg': 'mg',        # 马达加斯加语
-    'mi': None,       # 毛利语（百度 API 中没有对应的代码）
-    'mk': 'mac',       # 马其顿语
-    'ml': 'mal',       # 马拉雅拉姆语
-    'mn': None,       # 蒙古语（百度 API 中没有对应的代码）
-    'mr': 'mar',       # 马拉地语
-    'ms': 'may',       # 马来语
-    'mt': 'mlt',       # 马耳他语
-    'my': 'bur',       # 缅甸语
-    'ne': 'nep',       # 尼泊尔语
-    'nl': 'nl',        # 荷兰语
-    'nn': 'nno',       # 新挪威语
-    'no': 'nor',       # 挪威语
-    'oc': 'oci',       # 奥克语
-    'pa': 'pan',       # 旁遮普语
-    'pl': 'pl',        # 波兰语
-    'ps': 'pus',       # 普什图语
-    'pt': 'pt',        # 葡萄牙语
-    'ro': 'rom',       # 罗马尼亚语
-    'ru': 'ru',        # 俄语
-    'sa': 'san',       # 梵语
-    'sd': 'snd',       # 信德语
-    'si': 'sin',       # 僧伽罗语
-    'sk': 'sk',        # 斯洛伐克语
-    'sl': 'slo',       # 斯洛文尼亚语
-    'sn': 'sna',       # 修纳语
-    'so': 'som',       # 索马里语
-    'sq': 'alb',       # 阿尔巴尼亚语
-    'sr': 'srp',       # 塞尔维亚语
-    'su': 'sun',       # 巽他语
-    'sv': 'swe',       # 瑞典语
-    'sw': 'swa',       # 斯瓦希里语
-    'ta': 'tam',       # 泰米尔语
-    'te': 'tel',       # 泰卢固语
-    'tg': 'tgk',       # 塔吉克语
-    'th': 'th',        # 泰语
-    'tk': 'tuk',       # 土库曼语
-    'tl': 'tgl',       # 他加禄语
-    'tr': 'tr',        # 土耳其语
-    'tt': 'tat',       # 鞑靼语
-    'uk': 'ukr',       # 乌克兰语
-    'ur': 'urd',       # 乌尔都语
-    'uz': None,       # 乌兹别克语（百度 API 中没有对应的代码）
-    'vi': 'vie',       # 越南语
-    'yi': 'yid',       # 意第绪语
-    'yo': 'yor',       # 约鲁巴语
-    'yue': 'yue',     # 粤语
-    'zh': 'zh',        # 简体中文
-    'zt': 'cht'        # 繁体中文
-}
-libretranslate_to_baidu = {
-    'ar': 'ara',       # 阿拉伯语
-    'az': 'aze',       # 阿塞拜疆语
-    'bg': 'bul',       # 保加利亚语
-    'bn': 'ben',       # 孟加拉语
-    'ca': 'cat',       # 加泰罗尼亚语
-    'cs': 'cs',        # 捷克语
-    'da': 'dan',       # 丹麦语
-    'de': 'de',        # 德语
-    'el': 'el',        # 希腊语
-    'en': 'en',        # 英语
-    'eo': None,       # 世界语（百度 API 中没有对应的代码）
-    'es': 'spa',       # 西班牙语
-    'et': 'est',       # 爱沙尼亚语
-    'eu': 'baq',       # 巴斯克语
-    'fa': 'per',       # 波斯语
-    'fi': 'fin',       # 芬兰语
-    'fr': 'fra',       # 法语
-    'ga': 'gle',       # 爱尔兰语
-    'gl': 'glg',       # 加利西亚语
-    'he': 'heb',       # 希伯来语
-    'hi': 'hi',        # 印地语
-    'hu': 'hu',        # 匈牙利语
-    'id': 'id',        # 印尼语
-    'it': 'it',        # 意大利语
-    'ja': 'jp',        # 日语
-    'ko': 'kor',       # 韩语
-    'lt': 'lit',       # 立陶宛语
-    'lv': 'lav',       # 拉脱维亚语
-    'ms': 'may',       # 马来语
-    'nb': 'nob',       # 挪威语（书面挪威语）
-    'nl': 'nl',        # 荷兰语
-    'pl': 'pl',        # 波兰语
-    'pt': 'pt',        # 葡萄牙语
-    'ro': 'rom',       # 罗马尼亚语
-    'ru': 'ru',        # 俄语
-    'sk': 'sk',        # 斯洛伐克语
-    'sl': 'slo',       # 斯洛文尼亚语
-    'sq': 'alb',       # 阿尔巴尼亚语
-    'sr': 'srp',       # 塞尔维亚语
-    'sv': 'swe',       # 瑞典语
-    'th': 'th',        # 泰语
-    'tl': 'tgl',       # 塔加洛语
-    'tr': 'tr',        # 土耳其语
-    'uk': 'ukr',       # 乌克兰语
-    'ur': 'urd',       # 乌尔都语
-    'vi': 'vie',       # 越南语
-    'zh': 'zh',        # 中文
-    'zt': 'cht'        # 繁体中文
-}
+import html
+import traceback
 
 # 获取环境参数
 whisper_host=os.getenv("WHISPER_HOST")
@@ -190,8 +38,11 @@ limit_enable=os.getenv("LIMIT_ENABLE")
 pubilc_test_username=os.getenv("LIMIT_PUBLIC_TEST_USER")
 sqlalchemy_pool_size=os.getenv("SQLALCHEMY_POOL_SIZE")
 sqlalchemy_max_overflow=os.getenv("SQLALCHEMY_MAX_OVERFLOW")
-enable_baiduapi=os.getenv("ENABLE_BAIDU_API")
+enable_web_translators=os.getenv("ENABLE_WEB_TRANSLATORS")
+translator_Service=os.getenv("TRANSLATOR_SERVICE")
 redisUrl=os.getenv("LIMITER_REDIS_URL")
+ttsUrl=os.getenv("TTS_URL")
+ttsToken=os.getenv("TTS_TOKEN")
 
 limit_enable= False if  limit_enable is None or limit_enable =="" else True
 # whisper config
@@ -260,6 +111,11 @@ if limit_enable:
     }), 430 # 返回 403 状态码
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
+
+
+def do_translate(text,from_,to):
+    return html.unescape(translators.translate_text(text,translator=translator_Service,from_language=from_,to_language=to))
+    
 
 with open('filter.json', 'r',encoding='utf-8') as src:
     try:
@@ -363,7 +219,7 @@ scheduler.add_job(
     minute=0,
     second=0
 )
-scheduler.start()
+# scheduler.start()
 # 用户模型
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -438,11 +294,13 @@ def dynamic_limit(fn):
     def wrapper(*args, **kwargs):
         
         if not limit_enable:return fn(*args, **kwargs)
-        audio_file = request.files['file']
-        try:
-            duration = get_wav_duration_from_filestorage(audio_file)
-        except wave.Error:
-            app.logger.info("Invalid WAV file")
+        duration=9999
+        if request.path!="/api/func/tts" and request.path!="/api/func/webtranslate":
+            audio_file = request.files['file']
+            try:
+                duration = get_wav_duration_from_filestorage(audio_file)
+            except wave.Error:
+                app.logger.info("Invalid WAV file")
         current_user = get_jwt_identity()  # 获取当前用户的身份（通常是用户名）
         user=User.query.filter_by(username=current_user).first()
         if user:
@@ -534,23 +392,21 @@ def log_request(func):
 
     return wrapper
 
-def reset_limits():
-    """每天北京时间8点重置内存计数器"""
-    with app.app_context():
-        # 通过私有方法重置存储（注意：这是基于当前实现细节）
-        limiter.storage.reset()
-        print("计数器已重置于北京时间8点")
+# def reset_limits():
+#     """每天北京时间8点重置内存计数器"""
+#     with app.app_context():
+#         # 通过私有方法重置存储（注意：这是基于当前实现细节）
+#         limiter.storage.reset()
+#         app.logger.info("计数器已重置于北京时间8点")
 
-# # 配置定时任务
-# scheduler = BackgroundScheduler(timezone=pytz.timezone('Asia/Shanghai'))
 # scheduler.add_job(
 #     func=reset_limits,
 #     trigger='cron',
-#     hour=8,
+#     hour=0,
 #     minute=0,
 #     second=0
 # )
-# scheduler.start()
+scheduler.start()
 
 # 登录表单处理
 @app.route('/ui/login', methods=['GET', 'POST'])
@@ -593,7 +449,7 @@ def stats_ui():
     # 获取选中小时（默认为最新小时）
     selected_hour = request.args.get('hour', hours[0].hour if hours else None)
 
-    # 小时统计查询
+    # 修改小时统计查询（三个状态）
     hourly_query = db.session.query(
         db.func.strftime('%Y-%m-%d %H:00', 
                         db.func.datetime(RequestLog.timestamp, '+8 hours')
@@ -601,7 +457,10 @@ def stats_ui():
         RequestLog.username,
         RequestLog.ip,
         RequestLog.endpoint,
-        db.func.count().label('count')
+        db.func.sum(db.case((RequestLog.status == 'success', 1), else_=0)).label('success_count'),
+        db.func.sum(db.case((RequestLog.status == 'failed', 1), else_=0)).label('fail_count'),
+        db.func.sum(db.case((RequestLog.status == 'rate_limited', 1), else_=0)).label('rate_limited_count'),
+        db.func.count().label('total_count')
     )
 
     if selected_hour:
@@ -613,9 +472,7 @@ def stats_ui():
 
     hourly_stats = hourly_query.group_by('hour', RequestLog.username, RequestLog.ip, RequestLog.endpoint).all()
 
-    # 计算调用次数总和
-    total_count = sum(stat.count for stat in hourly_stats)
-
+    
     # 耗时分布统计
     duration_query = db.session.query(
         db.case(
@@ -629,7 +486,7 @@ def stats_ui():
         ).label('duration_range'),
         db.func.count().label('count')
     )
-
+    
     if selected_hour:
         duration_query = duration_query.filter(
             db.func.strftime('%Y-%m-%d %H:00', 
@@ -643,8 +500,70 @@ def stats_ui():
     sorted_duration_stats = sorted(duration_stats, key=lambda x: (
         int(x.duration_range.split('-')[0].rstrip('s')) if x.duration_range != '90s+' else 90
     ))
+    # 新増日期处理逻辑
+    date_filter_info = {
+        'start_date': None,
+        'end_date': None,
+        'error': False
+    }
 
+    if selected_hour:
+        try:
+            # 解析选中小时的日期部分（格式：YYYY-MM-DD）
+            end_date_str = selected_hour.split()[0]
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+            start_date = end_date - timedelta(days=6)  # 包含7天数据
+            
+            # 转换为字符串格式
+            date_filter_info['start_date'] = start_date.strftime("%Y-%m-%d")
+            date_filter_info['end_date'] = end_date_str
+        except Exception as e:
+            date_filter_info['error'] = True
+            print(f"日期解析错误: {str(e)}")
+
+    # 修改每日统计查询
+    daily_query = db.session.query(
+        db.func.strftime('%Y-%m-%d', 
+                        db.func.datetime(RequestLog.timestamp, '+8 hours')
+                        ).label('day'),
+        db.func.sum(db.case((RequestLog.status == 'success', 1), else_=0)).label('daily_success'),
+        db.func.sum(db.case((RequestLog.status == 'failed', 1), else_=0)).label('daily_fail'),
+        db.func.sum(db.case((RequestLog.status == 'rate_limited', 1), else_=0)).label('daily_rate_limited'),
+        db.func.count().label('daily_total')
+    )
+
+    # 添加日期过滤条件（当有有效日期时）
+    if not date_filter_info['error'] and date_filter_info['start_date']:
+        daily_query = daily_query.filter(
+            db.func.date(db.func.datetime(RequestLog.timestamp, '+8 hours')).between(
+                date_filter_info['start_date'],
+                date_filter_info['end_date']
+            )
+        )
+    else:  # 默认显示最近7天
+        default_end = datetime.now()
+        default_start = default_end - timedelta(days=6)
+        daily_query = daily_query.filter(
+            db.func.date(db.func.datetime(RequestLog.timestamp, '+8 hours')).between(
+                default_start.strftime("%Y-%m-%d"),
+                default_end.strftime("%Y-%m-%d")
+            )
+        )
+
+    daily_query = daily_query.group_by('day').order_by(db.desc('day'))
+    daily_stats = daily_query.all()
+
+    # 计算各维度总数
+    total_success = sum(stat.success_count for stat in hourly_stats)
+    total_fail = sum(stat.fail_count for stat in hourly_stats)
+    total_rate_limited = sum(stat.rate_limited_count for stat in hourly_stats)
+    total_count = total_success + total_fail + total_rate_limited
     return render_template('stats.html',
+                         date_filter_info=date_filter_info,
+                         daily_stats=daily_stats,
+                         total_success=total_success,
+                         total_fail=total_fail,
+                         total_rate_limited=total_rate_limited,
                          hours=[h.hour for h in hours],
                          selected_hour=selected_hour,
                          hourly_stats=hourly_stats,
@@ -862,6 +781,9 @@ def whisper_translations():
         return jsonify({'text': "",'message':"filtered"}), 200
     return jsonify({'text': text}), 200
 
+
+
+
 def translate_local(text,source,target)-> str: 
     url = localTransUrl
     params = {
@@ -920,11 +842,11 @@ def translate():
     app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
     if(text.text in errorFilter["errorResultDict"]) or any(errorKey in text.text for errorKey in errorFilter["errorKeyString"]):
         return jsonify({'text': "",'message':"filtered"}), 200
-    if enable_baiduapi :
-        translatedText=fanyi.translate_text(text.text, from_=fanyi.Lang.ZH,to=fanyi.Lang.EN)
+    if enable_web_translators :
+        translatedText=do_translate(text.text, from_='zh',to="en")
     else:
         translatedText=whisperclient.audio.translations.create(model=model, file=audiofile)
-    return jsonify({'text': text.text,'translatedText': translatedText if enable_baiduapi else translatedText.text}), 200
+    return jsonify({'text': text.text,'translatedText': translatedText if enable_web_translators else translatedText.text}), 200
 
 # 多语言翻译
 @app.route('/api/func/translateToOtherLanguage', methods=['POST'])
@@ -948,8 +870,8 @@ def translateToOtherLanguage():
     if(text.text in errorFilter["errorResultDict"]) or any(errorKey in text.text for errorKey in errorFilter["errorKeyString"]):
         return jsonify({'text': "",'message':"filtered"}), 200
     
-    if enable_baiduapi and libretranslate_to_baidu[targetLanguage]:
-        transText=fanyi.translate_text(text.text, from_=fanyi.Lang.ZH,to=libretranslate_to_baidu[targetLanguage])
+    if enable_web_translators and libretranslate_to_baidu[targetLanguage]:
+        transText=do_translate(text.text, from_='zh',to=targetLanguage)
     else:
         translatedText=whisperclient.audio.translations.create(model=model, file=audiofile)
         if targetLanguage =='en':transText=translatedText.text
@@ -983,8 +905,12 @@ def multitranslateToOtherLanguage():
     if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
         return jsonify({'text': "",'message':"filtered"}), 200
     text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
-    if enable_baiduapi and whisper_to_baidu[sourceLanguage] and libretranslate_to_baidu[targetLanguage]:
-         transText=fanyi.translate_text(text.text, from_=whisper_to_baidu[sourceLanguage],to=libretranslate_to_baidu[targetLanguage])
+   
+    if enable_web_translators:
+        try:
+            transText=do_translate(text.text, from_=sourceLanguage,to=targetLanguage)
+        except Exception as e:
+            app.logger.error(f"error:{traceback.format_exc()}")
     else:
         translatedText=whisperclient.audio.translations.create(model=model, file=audiofile)
         if targetLanguage =='en':transText=translatedText.text
@@ -1021,6 +947,7 @@ def doubleTransciption():
     app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
     return jsonify({'text': text.text,'translatedText':transText.text,'zhText':filterText.text}), 200
 
+
 # 多语言翻译
 @app.route('/api/whisper/multitranscription', methods=['POST'])
 @log_request
@@ -1048,7 +975,238 @@ def multitranscription():
     return jsonify({'text': text.text}), 200
 
 
+@app.route('/api/func/tts', methods=['POST'])
+@log_request
+@dynamic_limit
+def tts_proxy():
+    current_user = get_jwt_identity()
+    id=str(uuid.uuid4())
+    st=time.time()
+    app.logger.info(f"/api/func/tts user:{current_user} id:{id}")
+    try:
+        # 获取请求参数
+        data = request.get_json()
+        text = data.get('input')
+        voice = data.get('voice')
+        speed = data.get('speed')
+        app.logger.info(f"{text},{voice},{speed}")
+        # 验证必要参数
+        if not text or not voice or not speed:
+            
+            return jsonify({"error": "Missing required parameters: input or voice or speed"}), 400
+        # if not voice:return jsonify({"error": "Unsupported language"}), 400
 
+        # 构造请求参数
+        payload = {
+            "model": "tts-1",
+            "input": text,
+            "voice": voice,
+            "speed": speed
+        }
+        app.logger.info(f"{ttsUrl}:{ttsToken}")
+        # 发起转发请求
+        response = requests.post(
+            ttsUrl,
+            json=payload,
+            headers={ 
+                "Authorization": f"Bearer {ttsToken}"
+            },
+            stream=True
+        )
+
+        # 流式返回响应
+        def generate():
+            for chunk in response.iter_content(chunk_size=1024):
+                if chunk:
+                    yield chunk
+        et=time.time()
+        app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+        return Response(
+            generate(),
+            content_type=response.headers['Content-Type'],
+            status=response.status_code
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/func/webtranslate', methods=['POST'])
+@log_request
+@dynamic_limit
+def web_translate():
+    current_user = get_jwt_identity()
+    id=str(uuid.uuid4())
+    st=time.time()
+    app.logger.info(f"/api/func/web_translate user:{current_user} id:{id}")
+    # 获取请求参数
+    data = request.get_json()
+    text = data.get('text')
+    targetLanguage=data.get("targetLanguage")
+    sourceLanguage=data.get("sourceLanguage")
+    # 验证必要参数
+    if not text or not targetLanguage or not sourceLanguage:
+        
+        return jsonify({"error": "Missing required parameters: input or voice or speed"}), 400
+    # if not voice:return jsonify({"error": "Unsupported language"}), 400
+    et=time.time()
+    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    return jsonify({'text':text,'translatedText':do_translate(text,sourceLanguage,targetLanguage)}),200
+
+
+
+whisper_to_baidu = {
+    'af': 'afr',       # 阿非利堪斯语
+    'am': 'amh',       # 阿姆哈拉语
+    'ar': 'ara',       # 阿拉伯语
+    'as': 'asm',       # 阿萨姆语
+    'az': 'aze',       # 阿塞拜疆语
+    'ba': 'bak',       # 巴什基尔语
+    'be': 'bel',       # 白俄罗斯语
+    'bg': 'bul',       # 保加利亚语
+    'bn': 'ben',       # 孟加拉语
+    'bo': None,       # 藏语（百度 API 中没有对应的代码）
+    'br': 'bre',       # 布列塔尼语
+    'bs': 'bos',       # 波斯尼亚语
+    'ca': 'cat',       # 加泰罗尼亚语
+    'cs': 'cs',        # 捷克语
+    'cy': 'gle',       # 威尔士语
+    'da': 'dan',       # 丹麦语
+    'de': 'de',        # 德语
+    'el': 'el',        # 希腊语
+    'en': 'en',        # 英语
+    'es': 'spa',       # 西班牙语
+    'et': 'est',       # 爱沙尼亚语
+    'eu': 'baq',       # 巴斯克语
+    'fa': 'per',       # 波斯语
+    'fi': 'fin',       # 芬兰语
+    'fo': 'fao',       # 法罗语
+    'fr': 'fra',       # 法语
+    'gl': 'glg',       # 加利西亚语
+    'gu': 'guj',       # 古吉拉特语
+    'ha': 'hau',       # 豪萨语
+    'haw': 'haw',      # 夏威夷语
+    'he': 'heb',       # 希伯来语
+    'hi': 'hi',        # 印地语
+    'hr': 'hrv',       # 克罗地亚语
+    'ht': 'hat',       # 海地克里奥尔语
+    'hu': 'hu',        # 匈牙利语
+    'hy': 'arm',       # 亚美尼亚语
+    'id': 'id',        # 印尼语
+    'is': 'ice',       # 冰岛语
+    'it': 'it',        # 意大利语
+    'ja': 'jp',        # 日语
+    'jw': 'jav',       # 爪哇语
+    'ka': 'geo',       # 格鲁吉亚语
+    'kk': None,       # 哈萨克语（百度 API 中没有对应的代码）
+    'km': 'hkm',       # 高棉语
+    'kn': 'kan',       # 卡纳达语
+    'ko': 'kor',       # 韩语
+    'la': 'lat',       # 拉丁语
+    'lb': 'ltz',       # 卢森堡语
+    'ln': 'lin',       # 林加拉语
+    'lo': 'lao',       # 老挝语
+    'lt': 'lit',       # 立陶宛语
+    'lv': 'lav',       # 拉脱维亚语
+    'mg': 'mg',        # 马达加斯加语
+    'mi': None,       # 毛利语（百度 API 中没有对应的代码）
+    'mk': 'mac',       # 马其顿语
+    'ml': 'mal',       # 马拉雅拉姆语
+    'mn': None,       # 蒙古语（百度 API 中没有对应的代码）
+    'mr': 'mar',       # 马拉地语
+    'ms': 'may',       # 马来语
+    'mt': 'mlt',       # 马耳他语
+    'my': 'bur',       # 缅甸语
+    'ne': 'nep',       # 尼泊尔语
+    'nl': 'nl',        # 荷兰语
+    'nn': 'nno',       # 新挪威语
+    'no': 'nor',       # 挪威语
+    'oc': 'oci',       # 奥克语
+    'pa': 'pan',       # 旁遮普语
+    'pl': 'pl',        # 波兰语
+    'ps': 'pus',       # 普什图语
+    'pt': 'pt',        # 葡萄牙语
+    'ro': 'rom',       # 罗马尼亚语
+    'ru': 'ru',        # 俄语
+    'sa': 'san',       # 梵语
+    'sd': 'snd',       # 信德语
+    'si': 'sin',       # 僧伽罗语
+    'sk': 'sk',        # 斯洛伐克语
+    'sl': 'slo',       # 斯洛文尼亚语
+    'sn': 'sna',       # 修纳语
+    'so': 'som',       # 索马里语
+    'sq': 'alb',       # 阿尔巴尼亚语
+    'sr': 'srp',       # 塞尔维亚语
+    'su': 'sun',       # 巽他语
+    'sv': 'swe',       # 瑞典语
+    'sw': 'swa',       # 斯瓦希里语
+    'ta': 'tam',       # 泰米尔语
+    'te': 'tel',       # 泰卢固语
+    'tg': 'tgk',       # 塔吉克语
+    'th': 'th',        # 泰语
+    'tk': 'tuk',       # 土库曼语
+    'tl': 'tgl',       # 他加禄语
+    'tr': 'tr',        # 土耳其语
+    'tt': 'tat',       # 鞑靼语
+    'uk': 'ukr',       # 乌克兰语
+    'ur': 'urd',       # 乌尔都语
+    'uz': None,       # 乌兹别克语（百度 API 中没有对应的代码）
+    'vi': 'vie',       # 越南语
+    'yi': 'yid',       # 意第绪语
+    'yo': 'yor',       # 约鲁巴语
+    'yue': 'yue',     # 粤语
+    'zh': 'zh',        # 简体中文
+    'zt': 'cht'        # 繁体中文
+}
+libretranslate_to_baidu = {
+    'ar': 'ara',       # 阿拉伯语
+    'az': 'aze',       # 阿塞拜疆语
+    'bg': 'bul',       # 保加利亚语
+    'bn': 'ben',       # 孟加拉语
+    'ca': 'cat',       # 加泰罗尼亚语
+    'cs': 'cs',        # 捷克语
+    'da': 'dan',       # 丹麦语
+    'de': 'de',        # 德语
+    'el': 'el',        # 希腊语
+    'en': 'en',        # 英语
+    'eo': None,       # 世界语（百度 API 中没有对应的代码）
+    'es': 'spa',       # 西班牙语
+    'et': 'est',       # 爱沙尼亚语
+    'eu': 'baq',       # 巴斯克语
+    'fa': 'per',       # 波斯语
+    'fi': 'fin',       # 芬兰语
+    'fr': 'fra',       # 法语
+    'ga': 'gle',       # 爱尔兰语
+    'gl': 'glg',       # 加利西亚语
+    'he': 'heb',       # 希伯来语
+    'hi': 'hi',        # 印地语
+    'hu': 'hu',        # 匈牙利语
+    'id': 'id',        # 印尼语
+    'it': 'it',        # 意大利语
+    'ja': 'jp',        # 日语
+    'ko': 'kor',       # 韩语
+    'lt': 'lit',       # 立陶宛语
+    'lv': 'lav',       # 拉脱维亚语
+    'ms': 'may',       # 马来语
+    'nb': 'nob',       # 挪威语（书面挪威语）
+    'nl': 'nl',        # 荷兰语
+    'pl': 'pl',        # 波兰语
+    'pt': 'pt',        # 葡萄牙语
+    'ro': 'rom',       # 罗马尼亚语
+    'ru': 'ru',        # 俄语
+    'sk': 'sk',        # 斯洛伐克语
+    'sl': 'slo',       # 斯洛文尼亚语
+    'sq': 'alb',       # 阿尔巴尼亚语
+    'sr': 'srp',       # 塞尔维亚语
+    'sv': 'swe',       # 瑞典语
+    'th': 'th',        # 泰语
+    'tl': 'tgl',       # 塔加洛语
+    'tr': 'tr',        # 土耳其语
+    'uk': 'ukr',       # 乌克兰语
+    'ur': 'urd',       # 乌尔都语
+    'vi': 'vie',       # 越南语
+    'zh': 'zh',        # 中文
+    'zt': 'cht'        # 繁体中文
+}
 if __name__ == '__main__':
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///test.db'
     app.run(debug=True,host='0.0.0.0',port=8980)

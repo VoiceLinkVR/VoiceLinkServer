@@ -20,10 +20,16 @@ from io import BytesIO
 import wave
 import html
 import traceback
-
+import base64
+from pydantic import BaseModel
+import re
+import struct
+import opuslib
 # 获取环境参数
 whisper_host=os.getenv("WHISPER_HOST")
 whisper_prot=os.getenv("WHISPER_PORT")
+sensevoice_host=os.getenv("SENSEVOICE_HOST")
+sensevoice_prot=os.getenv("SENSEVOICE_PORT")
 whisper_apiKey=os.getenv("WHISPER_APIKEY") #当前faster-whisper-server/latest中无效
 libreTranslate_host=os.getenv("LIBRETRANSLATE_HOST")
 libreTranslate_port=os.getenv("LIBRETRANSLATE_PORT")
@@ -37,17 +43,21 @@ filter_web_url=os.getenv("FILTER_WEB_URL")
 limit_enable=os.getenv("LIMIT_ENABLE")
 pubilc_test_username=os.getenv("LIMIT_PUBLIC_TEST_USER")
 sqlalchemy_pool_size=os.getenv("SQLALCHEMY_POOL_SIZE")
-sqlalchemy_max_overflow=os.getenv("SQLALCHEMY_MAX_OVERFLOW")
+sqlalchemy_max_overflow=os.getenv("SQLALCHEMY_MAX_OVERFLOW") 
 enable_web_translators=os.getenv("ENABLE_WEB_TRANSLATORS")
 translator_Service=os.getenv("TRANSLATOR_SERVICE")
 redisUrl=os.getenv("LIMITER_REDIS_URL")
 ttsUrl=os.getenv("TTS_URL")
 ttsToken=os.getenv("TTS_TOKEN")
+latestVersion=os.getenv("LATEST_VERSION")
+packageBaseURL=os.getenv("PACKAGE_BASE_URL")
 
 limit_enable= False if  limit_enable is None or limit_enable =="" else True
 # whisper config
 if whisper_host is not None and whisper_prot is not None:whisper_url=f'http://{whisper_host}:{whisper_prot}/v1/'
 else: whisper_url='http://127.0.0.1:8000/v1/'
+if sensevoice_host is not None and sensevoice_prot is not None:sensevoice_url=f'http://{sensevoice_host}:{sensevoice_prot}/v1/audio/transcriptions'
+else: sensevoice_url='http://127.0.0.1:8800/v1/audio/transcriptions'
 whisper_apiKey= "something" if  whisper_apiKey is None else whisper_apiKey
 model="Systran/faster-whisper-large-v3"if whisper_model is None else whisper_model
 whisperclient = OpenAI(api_key=whisper_apiKey, base_url=whisper_url)
@@ -318,7 +328,7 @@ def dynamic_limit(fn):
                 limit_key_func()
                 with limiter.limit(
                     user.limit_rule,
-                    key_func=lambda:current_user,
+                    key_func=lambda:current_user+time.strftime("%Y-%m-%d", time.localtime()),
                     scope=f"user:{current_user}",
                     deduct_when=lambda r: (
                         r.status_code == 200 
@@ -729,6 +739,14 @@ def login():
         return jsonify({'message': 'Login successful', 'access_token': access_token}), 200
     else:
         return jsonify({'message': 'Invalid credentials'}), 401
+# 登录接口
+@app.route('/api/latestVersionInfo', methods=['GET'])
+def latestVersionInfo():
+    app.logger.info(f"/latestVersionInfo")
+    if latestVersion and packageBaseURL:
+        return jsonify({'version': latestVersion, 'packgeURL': packageBaseURL+latestVersion+'.zip'}), 200
+    else:
+        return jsonify({'message': 'version not defined'}),460
 
 # 语音识别
 @app.route('/api/whisper/transcriptions', methods=['POST'])
@@ -895,30 +913,220 @@ def multitranslateToOtherLanguage():
     params=request.form.to_dict()
     targetLanguage=params["targetLanguage"]
     sourceLanguage=params["sourceLanguage"]
+    targetLanguage2=params.get("targetLanguage2","none")
+    targetLanguage3=params.get("targetLanguage3","none")
+    transText=''
+    transText2=''
+    transText3=''
     app.logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
     if sourceLanguage not in whisperSupportedLanguageList:
-         return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
+        return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
     if targetLanguage not in supportedLanguagesList:
         return jsonify({'message':f"targetLanguage error,please use following languages:{str(supportedLanguagesList)}"}), 401
+    
+    if file.mimetype not in ['audio/wav','audio/opus']:
+        return jsonify({'error': f'非法文件类型: {audio_file.mimetype}'}), 400
     audiofile=file.stream.read()
-    filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
-    if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
-        return jsonify({'text': "",'message':"filtered"}), 200
-    text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
-   
+    if file.mimetype=='audio/opus':
+        audiofile=packaged_opus_stream_to_wav_bytes(audiofile,16000)
+    if sourceLanguage=='zh':
+        response=requests.post(url=sensevoice_url,files={'file':audiofile})
+        text = response.json()
+        
+    else:
+        filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
+        if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
+            return jsonify({'text': "",'message':"filtered"}), 200
+        text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
+    stext=text.text if sourceLanguage!='zh' else text['text']
+    app.logger.info(id+': '+stext)
+    
     if enable_web_translators:
         try:
-            transText=do_translate(text.text, from_=sourceLanguage,to=targetLanguage)
+            translateSourceLanguage='auto'if sourceLanguage=='zh'else sourceLanguage
+            transText=do_translate(stext, from_=translateSourceLanguage,to=targetLanguage)
+            if targetLanguage2 != "none": transText2=do_translate(stext, from_=translateSourceLanguage,to=targetLanguage2)
+            if targetLanguage3 != "none": transText3=do_translate(stext, from_=translateSourceLanguage,to=targetLanguage3)
         except Exception as e:
             app.logger.error(f"error:{traceback.format_exc()}")
     else:
         translatedText=whisperclient.audio.translations.create(model=model, file=audiofile)
         if targetLanguage =='en':transText=translatedText.text
-        else:transText=translate_local(translatedText.text,"en",targetLanguage)
+        else:
+            transText=translate_local(translatedText.text,"en",targetLanguage)
+        if targetLanguage2 != "none": transText2=translate_local(translatedText.text,'en',targetLanguage2)
+        if targetLanguage3 != "none": transText3=translate_local(translatedText.text,'en',targetLanguage3)
     et=time.time()
     app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
-    return jsonify({'text': text.text,'translatedText':transText}), 200
+    return jsonify({'text':stext,'translatedText':transText,'translatedText2':transText2,'translatedText3':transText3}), 200
 
+
+
+
+# 多语言翻译
+
+VLLM_SERVER_URL = "http://192.168.2.104:8005" # Or your vLLM server address
+VLLMMODEL_NAME = "qwenOmni7" # Replace with your actual model name if different
+VLLMAPI_KEY = "sk-VkxlIMJf6KLHpI8MN"
+
+
+class TranslateTexts(BaseModel):
+    text: str
+    translatedText: str
+    translatedText2: str
+    translatedText3: str
+
+json_schema = TranslateTexts.model_json_schema()
+@app.route('/api/func/vllmTest', methods=['POST'])
+@log_request
+@dynamic_limit
+def vllmTest():
+    result=None
+    current_user = get_jwt_identity()
+    id=str(uuid.uuid4())
+    st=time.time()
+    app.logger.info(f"/func/vllmTest user:{current_user} id:{id}")
+    global supportedLanguagesList
+    init_supportedLanguagesList()
+    file=request.files['file']
+    params=request.form.to_dict()
+    targetLanguage=params["targetLanguage"]
+    sourceLanguage=params["sourceLanguage"]
+    targetLanguage2=params.get("targetLanguage2", 'none')
+    targetLanguage3=params.get("targetLanguage3",'none')
+    system_prompt_content = f"""你是一个高级的语音处理助手。你的任务是：
+1.首先将音频内容转录成其原始语言的文本。
+2. 将转录的文本翻译成{codeTochinese[sourceLanguage]}。
+3. 将转录的文本翻译成{codeTochinese[targetLanguage]}。
+"""
+    seps=[codeTochinese[sourceLanguage]+':',codeTochinese[targetLanguage]+':']
+    if targetLanguage2!= 'none':
+        seps.append(codeTochinese[targetLanguage2]+':')
+        system_prompt_content+=f"4. 将转录的文本翻译成{codeTochinese[targetLanguage2]}\n"
+    if targetLanguage3!='none':
+        seps.append(codeTochinese[targetLanguage3]+':')
+        system_prompt_content+=f"5. 将转录的文本翻译成{codeTochinese[targetLanguage3]}\n"
+    system_prompt_content+="请按照以下格式清晰地组织你的输出：\n"
+    system_prompt_content+='{"原文":"原始语言文本",'
+    system_prompt_content+=f'"{codeTochinese[sourceLanguage]}":"{codeTochinese[sourceLanguage]}文本",'
+    system_prompt_content+=f'"{codeTochinese[targetLanguage]}":"{codeTochinese[targetLanguage]}文本"'
+    if targetLanguage2!= 'none':system_prompt_content+=f',"{codeTochinese[targetLanguage2]}":"{codeTochinese[targetLanguage2]}文本"'
+    if targetLanguage3!= 'none':system_prompt_content+=f',"{codeTochinese[targetLanguage3]}":"{codeTochinese[targetLanguage3]}文本"'
+    system_prompt_content+='}\n'
+    app.logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
+
+    binary_data=file.stream.read()
+    base64_encoded_data = base64.b64encode(binary_data)
+    base64_string = base64_encoded_data.decode('utf-8')
+
+    try:
+        client = OpenAI(
+            api_key=VLLMAPI_KEY,
+            base_url=f"{VLLM_SERVER_URL}/v1"
+        )
+
+        messages = []
+        messages.append({"role": "system", "content": system_prompt_content})
+
+        user_content = []
+        user_content.append({"type": "text", "text": "请处理下面的音频。"})
+
+        user_content.append({
+            "type": "input_audio",
+            "input_audio": {
+                "data": base64_string,
+                "format": 'wav'
+            },
+        })
+        messages.append({"role": "user", "content": user_content})
+
+        print(f"\nSending request to: {client.base_url}chat/completions")
+
+        print("\nSending API request...")
+        start_time = time.monotonic()
+
+        chat_completion = client.chat.completions.create(
+            model=VLLMMODEL_NAME,
+            messages=messages, # Send the original, unmodified messages
+            max_tokens=500,
+            temperature=0,
+        )
+
+        end_time = time.monotonic()
+        duration = end_time - start_time
+        app.logger.info(f"API call completed in {duration:.2f} seconds.")
+
+        # print("\n--- Model Response ---")
+        message_content = None
+        if chat_completion.choices and len(chat_completion.choices) > 0:
+            message_content = chat_completion.choices[0].message.content
+            remaining=message_content
+            app.logger.info(message_content)
+            try:
+                datattt=json.loads(remaining)
+                result={
+                'text':datattt[codeTochinese[sourceLanguage]],
+                'translatedText':datattt[codeTochinese[targetLanguage]],
+                'translatedText2':datattt[codeTochinese[targetLanguage2]] if targetLanguage2!= 'none' else '',
+                'translatedText3':datattt[codeTochinese[targetLanguage3]] if targetLanguage3!= 'none' else ''
+                }
+            except :
+                result={
+                'text':'',
+                'translatedText':'',
+                'translatedText2':'',
+                'translatedText3':''
+                }
+
+            # text1=message_content.split()
+            # values = ['']*4
+            # lang_dict = {}
+            # translations_map = {}
+            # for line in remaining.splitlines():
+            #     if ':' in line:  #确保行中有冒号可以分割
+            #         # split(':', 1) 只在第一个冒号处分割
+            #         parts = line.split(':', 1)
+            #         key_from_s = parts[0].strip() # 提取键并去除首尾空格
+            #         value_from_s = parts[1]       # 提取值，保留冒号后的所有内容（包括潜在的前导空格）
+            #         translations_map[key_from_s] = value_from_s
+
+            # 2. 按 keys 列表顺序提取值
+            # ordered_translations = []
+            # for key in keys:
+            #     if key in translations_map:
+            #         ordered_translations.append(translations_map[key])
+            #     else:
+                    # 如果某个key在s中找不到，可以根据需要决定如何处理
+                    # 例如，添加一个None或者空字符串，或者抛出错误
+                    # print(f"警告: 未在字符串s中找到键 '{key}'")
+                    # pass # 当前需求下，假设keys中的键都能在s中找到
+
+            et=time.time()
+        else:
+            print("No valid choice found in response:")
+            print(chat_completion)
+            return jsonify({'text':"server Error: No valid choice found in response:"}), 501
+        
+       
+
+    except Exception as e:
+        print(f"\n--- Error ---")
+        error_message = f"An API call error occurred: {e}"
+        print(error_message)
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response status code: {e.response.status_code}")
+            try:
+                error_message += f" - Response: {e.response.json()}"
+                print(f"Response content: {e.response.json()}")
+            except ValueError: # If response content is not JSON
+                error_message += f" - Response: {e.response.text}"
+                print(f"Response content: {e.response.text}")
+        return jsonify({"duration": time.monotonic() - start_time if 'start_time' in locals() else 0, "content": None, "error": error_message}),500
+    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    return jsonify({'text': result.get("text"),
+    'translatedText':result.get("translatedText"),
+    'translatedText2':result.get("translatedText2",''),
+    'translatedText3':result.get("translatedText3",'')}), 200
 # 多语言翻译
 @app.route('/api/func/doubleTransciption', methods=['POST'])
 @log_request
@@ -964,15 +1172,18 @@ def multitranscription():
     if sourceLanguage not in whisperSupportedLanguageList:
         return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
     audiofile=file.stream.read()
+    if sourceLanguage!='zh':
+        filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
+        if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
+            return jsonify({'text': "",'message':"filtered"}), 200
+        text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
+    else:
+        response=requests.post(url=sensevoice_url,files={'file':audiofile})
+        text = response.json()
 
-    filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
-    if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
-        return jsonify({'text': "",'message':"filtered"}), 200
-    if sourceLanguage!='zh':text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
-    else: text=filterText
     et=time.time()
     app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
-    return jsonify({'text': text.text}), 200
+    return jsonify({'text': text['text'] if sourceLanguage=='zh' else text.text}), 200
 
 
 @app.route('/api/func/tts', methods=['POST'])
@@ -1043,16 +1254,118 @@ def web_translate():
     text = data.get('text')
     targetLanguage=data.get("targetLanguage")
     sourceLanguage=data.get("sourceLanguage")
+    targetLanguage2=data.get("targetLanguage2","none")
+    targetLanguage3=data.get("targetLanguage3","none")
+    transText=''
+    transText2=''
+    transText3=''
     # 验证必要参数
     if not text or not targetLanguage or not sourceLanguage:
         
         return jsonify({"error": "Missing required parameters: input or voice or speed"}), 400
     # if not voice:return jsonify({"error": "Unsupported language"}), 400
+    transText=do_translate(text,sourceLanguage,targetLanguage)
+    if targetLanguage2 != "none": transText2=do_translate(text, from_=sourceLanguage,to=targetLanguage2)
+    if targetLanguage3 != "none": transText3=do_translate(text, from_=sourceLanguage,to=targetLanguage3)
+        
     et=time.time()
     app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
-    return jsonify({'text':text,'translatedText':do_translate(text,sourceLanguage,targetLanguage)}),200
+    return jsonify({'text':text,'translatedText':transText,'translatedText2':transText2,'translatedText3':transText3}), 200
+
+def packaged_opus_stream_to_wav_bytes(
+    packaged_opus_data: bytes,
+    sample_rate: int,
+    channels: int,
+    frame_duration: int = 20, # 必须与编码时使用的帧时长匹配
+    sample_width: int = 2     # WAV 文件中每个样本的字节数 (例如 2 对应 16-bit)
+) -> bytes:
+    """
+    将带长度前缀的 Opus 包字节流解码为 WAV 音频数据字节流。
+
+    参数:
+        packaged_opus_data (bytes): 包含多个[长度+Opus包]序列的单一字节流。
+        sample_rate (int): Opus 数据的采样率。
+        channels (int): Opus 数据的通道数。
+        frame_duration (int): Opus 编码时使用的帧时长，单位毫秒。
+                                此参数用于计算解码器期望的每帧样本数。
+        sample_width (int): WAV 文件中每个样本的字节数 (通常为 2)。
+
+    返回:
+        bytes: WAV 格式的音频数据。如果解码失败或无有效数据，可能返回空字节串或部分解码数据。
+    """
+    if not packaged_opus_data:
+        return b''
+    if channels not in [1, 2]:
+        raise ValueError("通道数必须是 1 或 2")
+    if sample_rate not in [8000, 12000, 16000, 24000, 48000]:
+        raise ValueError("不支持的采样率。")
+
+    try:
+        decoder = opuslib.Decoder(sample_rate, channels)
+    except opuslib.OpusError as e:
+        raise RuntimeError(f"创建 Opus 解码器失败: {e}")
+
+    # 解码器期望的每帧（每个Opus包解码后）的每通道样本数
+    samples_per_packet_frame = int(sample_rate * frame_duration / 1000)
+
+    all_decoded_pcm = bytearray()
+    offset = 0
+    while offset < len(packaged_opus_data):
+        if offset + 4 > len(packaged_opus_data):
+            print(f"警告: 数据不足以读取包长度，剩余字节: {len(packaged_opus_data) - offset}")
+            break
+        
+        try:
+            packet_len = struct.unpack('>I', packaged_opus_data[offset:offset+4])[0]
+        except struct.error as e:
+            print(f"警告: 解析包长度失败: {e}. 偏移量: {offset}")
+            break # 无法继续解析
+            
+        offset += 4
+
+        if offset + packet_len > len(packaged_opus_data):
+            print(f"警告: 数据不足以读取完整的 Opus 包。期望长度: {packet_len}, 剩余字节: {len(packaged_opus_data) - offset}")
+            break
+        
+        opus_packet = packaged_opus_data[offset:offset+packet_len]
+        offset += packet_len
+
+        if not opus_packet:
+            print("警告: 读取到一个空的 Opus 包，跳过。")
+            continue
+
+        try:
+            # samples_per_packet_frame 是解码器从这个包期望解码出的每通道样本数
+            decoded_pcm = decoder.decode(opus_packet, samples_per_packet_frame)
+            all_decoded_pcm.extend(decoded_pcm)
+        except opuslib.OpusError as e:
+            print(f"警告: Opus 解码错误 (跳过包): {e}. 包长度: {len(opus_packet)}")
+            # 可以选择插入静音等错误隐藏策略
+            # num_silent_samples = samples_per_packet_frame * channels
+            # silent_frame = b'\x00' * (num_silent_samples * sample_width)
+            # all_decoded_pcm.extend(silent_frame)
+        except Exception as e:
+            print(f"警告: 解码过程中发生未知错误 (跳过包): {e}")
 
 
+    if not all_decoded_pcm:
+        return b''
+
+    # 创建 WAV 文件头并写入数据
+    wav_buffer = BytesIO()
+    try:
+        with wave.open(wav_buffer, 'wb') as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(sample_width) # 通常是 2 (16-bit)
+            wf.setframerate(sample_rate)
+            wf.writeframes(bytes(all_decoded_pcm)) # [10]
+    except wave.Error as e:
+        raise RuntimeError(f"创建 WAV 文件失败: {e}")
+    except Exception as e:
+        raise RuntimeError(f"写入 WAV 数据时发生未知错误: {e}")
+
+
+    return wav_buffer.getvalue()
 
 whisper_to_baidu = {
     'af': 'afr',       # 阿非利堪斯语
@@ -1207,6 +1520,206 @@ libretranslate_to_baidu = {
     'zh': 'zh',        # 中文
     'zt': 'cht'        # 繁体中文
 }
+codeTochinese={
+    'af': '阿非利堪斯语',
+    'am': '阿姆哈拉语',
+    'ar': '阿拉伯语',
+    'as': '阿萨姆语',
+    'az': '阿塞拜疆语',
+    'ba': '巴什基尔语',
+    'be': '白俄罗斯语',
+    'bg': '保加利亚语',
+    'bn': '孟加拉语',
+    'bo': '藏语',
+    'br': '布列塔尼语',
+    'bs': '波斯尼亚语',
+    'ca': '加泰罗尼亚语',
+    'cs': '捷克语',
+    'cy': '威尔士语',
+    'da': '丹麦语',
+    'de': '德语',
+    'el': '希腊语',
+    'en': '英语',
+    'es': '西班牙语',
+    'et': '爱沙尼亚语',
+    'eu': '巴斯克语',
+    'fa': '波斯语',
+    'fi': '芬兰语',
+    'fo': '法罗语',
+    'fr': '法语',
+    'gl': '加利西亚语',
+    'gu': '古吉拉特语',
+    'ha': '豪萨语',
+    'haw': '夏威夷语',
+    'he': '希伯来语',
+    'hi': '印地语',
+    'hr': '克罗地亚语',
+    'ht': '海地克里奥尔语',
+    'hu': '匈牙利语',
+    'hy': '亚美尼亚语',
+    'id': '印尼语',
+    'is': '冰岛语',
+    'it': '意大利语',
+    'ja': '日语',
+    'jw': '爪哇语',
+    'ka': '格鲁吉亚语',
+    'kk': '哈萨克语',
+    'km': '高棉语',
+    'kn': '卡纳达语',
+    'ko': '韩语',
+    'la': '拉丁语',
+    'lb': '卢森堡语',
+    'ln': '林加拉语',
+    'lo': '老挝语',
+    'lt': '立陶宛语',
+    'lv': '拉脱维亚语',
+    'mg': '马达加斯加语',
+    'mi': '毛利语',
+    'mk': '马其顿语',
+    'ml': '马拉雅拉姆语',
+    'mn': '蒙古语',
+    'mr': '马拉地语',
+    'ms': '马来语',
+    'mt': '马耳他语',
+    'my': '缅甸语',
+    'ne': '尼泊尔语',
+    'nl': '荷兰语',
+    'nn': '新挪威语',
+    'no': '挪威语',
+    'oc': '奥克语',
+    'pa': '旁遮普语',
+    'pl': '波兰语',
+    'ps': '普什图语',
+    'pt': '葡萄牙语',
+    'ro': '罗马尼亚语',
+    'ru': '俄语',
+    'sa': '梵语',
+    'sd': '信德语',
+    'si': '僧伽罗语',
+    'sk': '斯洛伐克语',
+    'sl': '斯洛文尼亚语',
+    'sn': '修纳语',
+    'so': '索马里语',
+    'sq': '阿尔巴尼亚语',
+    'sr': '塞尔维亚语',
+    'su': '巽他语',
+    'sv': '瑞典语',
+    'sw': '斯瓦希里语',
+    'ta': '泰米尔语',
+    'te': '泰卢固语',
+    'tg': '塔吉克语',
+    'th': '泰语',
+    'tk': '土库曼语',
+    'tl': '他加禄语',
+    'tr': '土耳其语',
+    'tt': '鞑靼语',
+    'uk': '乌克兰语',
+    'ur': '乌尔都语',
+    'uz': '乌兹别克语',
+    'vi': '越南语',
+    'yi': '意第绪语',
+    'yo': '约鲁巴语',
+    'yue': '粤语',
+    'zh': '简体中文',
+    'zt': '繁体中文',
+    'eo': '世界语',  # 来自libretranslate
+    'ga': '爱尔兰语',  # 来自libretranslate
+    'nb': '挪威语'  # 来自libretranslate
+}
+def packaged_opus_stream_to_wav_bytes(
+    packaged_opus_data: bytes,
+    sample_rate: int,
+    channels: int =1,
+    frame_duration: int = 20, # 必须与编码时使用的帧时长匹配
+    sample_width: int = 2     # WAV 文件中每个样本的字节数 (例如 2 对应 16-bit)
+) -> bytes:
+    """
+    将带长度前缀的 Opus 包字节流解码为 WAV 音频数据字节流。
+
+    参数:
+        packaged_opus_data (bytes): 包含多个[长度+Opus包]序列的单一字节流。
+        sample_rate (int): Opus 数据的采样率。
+        channels (int): Opus 数据的通道数。
+        frame_duration (int): Opus 编码时使用的帧时长，单位毫秒。
+                                此参数用于计算解码器期望的每帧样本数。
+        sample_width (int): WAV 文件中每个样本的字节数 (通常为 2)。
+
+    返回:
+        bytes: WAV 格式的音频数据。如果解码失败或无有效数据，可能返回空字节串或部分解码数据。
+    """
+    if not packaged_opus_data:
+        return b''
+    if channels not in [1, 2]:
+        raise ValueError("通道数必须是 1 或 2")
+    if sample_rate not in [8000, 12000, 16000, 24000, 48000]:
+        raise ValueError("不支持的采样率。")
+
+    try:
+        decoder = opuslib.Decoder(sample_rate, channels)
+    except opuslib.OpusError as e:
+        raise RuntimeError(f"创建 Opus 解码器失败: {e}")
+
+    # 解码器期望的每帧（每个Opus包解码后）的每通道样本数
+    samples_per_packet_frame = int(sample_rate * frame_duration / 1000)
+
+    all_decoded_pcm = bytearray()
+    offset = 0
+    while offset < len(packaged_opus_data):
+        if offset + 4 > len(packaged_opus_data):
+            print(f"警告: 数据不足以读取包长度，剩余字节: {len(packaged_opus_data) - offset}")
+            break
+        
+        try:
+            packet_len = struct.unpack('>I', packaged_opus_data[offset:offset+4])[0]
+        except struct.error as e:
+            print(f"警告: 解析包长度失败: {e}. 偏移量: {offset}")
+            break # 无法继续解析
+            
+        offset += 4
+
+        if offset + packet_len > len(packaged_opus_data):
+            print(f"警告: 数据不足以读取完整的 Opus 包。期望长度: {packet_len}, 剩余字节: {len(packaged_opus_data) - offset}")
+            break
+        
+        opus_packet = packaged_opus_data[offset:offset+packet_len]
+        offset += packet_len
+
+        if not opus_packet:
+            print("警告: 读取到一个空的 Opus 包，跳过。")
+            continue
+
+        try:
+            # samples_per_packet_frame 是解码器从这个包期望解码出的每通道样本数
+            decoded_pcm = decoder.decode(opus_packet, samples_per_packet_frame)
+            all_decoded_pcm.extend(decoded_pcm)
+        except opuslib.OpusError as e:
+            print(f"警告: Opus 解码错误 (跳过包): {e}. 包长度: {len(opus_packet)}")
+            # 可以选择插入静音等错误隐藏策略
+            # num_silent_samples = samples_per_packet_frame * channels
+            # silent_frame = b'\x00' * (num_silent_samples * sample_width)
+            # all_decoded_pcm.extend(silent_frame)
+        except Exception as e:
+            print(f"警告: 解码过程中发生未知错误 (跳过包): {e}")
+
+
+    if not all_decoded_pcm:
+        return b''
+
+    # 创建 WAV 文件头并写入数据
+    wav_buffer = BytesIO()
+    try:
+        with wave.open(wav_buffer, 'wb') as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(sample_width) # 通常是 2 (16-bit)
+            wf.setframerate(sample_rate)
+            wf.writeframes(bytes(all_decoded_pcm)) # [10]
+    except wave.Error as e:
+        raise RuntimeError(f"创建 WAV 文件失败: {e}")
+    except Exception as e:
+        raise RuntimeError(f"写入 WAV 数据时发生未知错误: {e}")
+
+
+    return wav_buffer.getvalue()
 if __name__ == '__main__':
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///test.db'
     app.run(debug=True,host='0.0.0.0',port=8980)

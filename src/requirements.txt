@@ -1,3 +1,4 @@
+urllib3==2.3.0
 flask
 flask_sqlalchemy
 flask_jwt_extended
@@ -9,3 +10,4 @@ translators
 pytz
 apscheduler
 redis
+opuslib

@@ -43,7 +43,6 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-
     # volumes:
       # Keep the models in a docker volume, to avoid re-downloading on startup
       # - lt-local:/home/libretranslate/.local:rw
@@ -59,24 +58,52 @@ services:
     #   - LT_LOAD_ONLY=en,fr
     # volumes:
     #   - libretranslate_api_keys:/app/db
-
-  # VoiceLinkVR-serve-test2:
-  #   image: voice-link-vr-server-test2
+  sensevoice:
+    # image: registry.cn-hangzhou.aliyuncs.com/lucklittleboy/sensevoice-oneapi:1.0
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/sensevoice-oneapi:latest
+    restart: unless-stopped
+    ports:
+      - 8800:8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - DEVICE_TYPE=cuda:0
+      - ncpu=10
+  # VoiceLinkVR-server-2:
+  #   image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/voice-link-vr-server:v1.8
   #   restart: unless-stopped
   #   ports:
-  #     - 8982:8980
+  #     - 8981:8980
   #   volumes:
   #     - voice-link-vr-server-local:/usr/src/app/data:rw
   #   environment:
+  #     - SENSEVOICE_HOST=sensevoice
+  #     - SENSEVOICE_PORT=8000
   #     - WHISPER_HOST=faster-whisper-server-cuda
   #     - WHISPER_PORT=8000
   #     - LIBRETRANSLATE_HOST=libretranslate-cuda
   #     - LIBRETRANSLATE_PORT=5000
   #     - FILTER_WEB_URL=https://gitee.com/voice-link-vr/VoiceLinkServer/raw/main/src/filter.json
-  #     - THREADS_NUM=16
+  #     - THREADS_NUM=50
   #     - LIMIT_ENABLE=True
   #     - LIMIT_PUBLIC_TEST_USER=testuser
-  #     - ENABLE_BAIDU_API=True
+  #     - SQLALCHEMY_POOL_SIZE=0
+  #     - TRANSLATOR_SERVICE=bing
+  #     - LIMITER_REDIS_URL=redis://redis:6379/0
+  #     - TTS_TOKEN=NfuWNpnr64KWB0KHyMRejWbS0wiMujyvJ9t4caaxPTKvPc5PSM
+  #     - TTS_URL=https://tts-test.boyqiu001.top/v1/audio/speech
+  #     - ENABLE_WEB_TRANSLATORS=True
+  #     - LATEST_VERSION=v0.5.2
+  #     - PACKAGE_BASE_URL=https://cloudflarestorage.boyqiu001.top/VRCLS-windwos-
+  #   depends_on:
+  #     - libretranslate-cuda
+  #     - faster-whisper-server-cuda
+  #     - redis
   VoiceLinkVR-server:
     # image: voice-link-vr-server-test1
     image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/voice-link-vr-server:latest
@@ -86,6 +113,8 @@ services:
     volumes:
       - voice-link-vr-server-local:/usr/src/app/data:rw
     environment:
+      - SENSEVOICE_HOST=sensevoice
+      - SENSEVOICE_PORT=8000
       - WHISPER_HOST=faster-whisper-server-cuda
       - WHISPER_PORT=8000
       - LIBRETRANSLATE_HOST=libretranslate-cuda
@@ -95,12 +124,15 @@ services:
       - LIMIT_ENABLE=True
       - LIMIT_PUBLIC_TEST_USER=testuser
       - SQLALCHEMY_POOL_SIZE=0
-      # - ENABLE_BAIDU_API=True
+      - TRANSLATOR_SERVICE=bing
       - LIMITER_REDIS_URL=redis://redis:6379/0
       - TTS_TOKEN=
       - TTS_URL=
       - ENABLE_WEB_TRANSLATORS=True
+      - LATEST_VERSION=v0.5.8
+      - PACKAGE_BASE_URL=https://cloudflarestorage.boyqiu001.top/VRCLS-windwos-
     depends_on:
+      - sensevoice
       - libretranslate-cuda
       - faster-whisper-server-cuda
       - redis

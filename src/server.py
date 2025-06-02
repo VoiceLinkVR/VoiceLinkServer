@@ -314,10 +314,10 @@ def dynamic_limit(fn):
         current_user = get_jwt_identity()  # 获取当前用户的身份（通常是用户名）
         user=User.query.filter_by(username=current_user).first()
         if user:
-            if duration <6:
-                rule=str(user.limit_rule).replace("8/minute","16/minute").replace("4/minute","8/minute")
-            else:
-                rule=user.limit_rule
+            # if duration <6:
+            #     rule=str(user.limit_rule).replace("8/minute","16/minute").replace("4/minute","8/minute")
+            # else:
+            rule=user.limit_rule
             app.logger.info(f"limit rule,use: {current_user},{rule}")
             
             if current_user == pubilc_test_username:
@@ -1145,7 +1145,11 @@ def doubleTransciption():
          return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
     if targetLanguage not in whisperSupportedLanguageList:
         return jsonify({'message':f"targetLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
+    if file.mimetype not in ['audio/wav','audio/opus']:
+        return jsonify({'error': f'非法文件类型: {audio_file.mimetype}'}), 400
     audiofile=file.stream.read()
+    if file.mimetype=='audio/opus':
+        audiofile=packaged_opus_stream_to_wav_bytes(audiofile,16000)
     filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
     if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
         return jsonify({'text': "",'message':"filtered"}), 200
@@ -1171,7 +1175,11 @@ def multitranscription():
     app.logger.info(f"sourceLanguage:{sourceLanguage}")
     if sourceLanguage not in whisperSupportedLanguageList:
         return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
+    if file.mimetype not in ['audio/wav','audio/opus']:
+        return jsonify({'error': f'非法文件类型: {audio_file.mimetype}'}), 400
     audiofile=file.stream.read()
+    if file.mimetype=='audio/opus':
+        audiofile=packaged_opus_stream_to_wav_bytes(audiofile,16000)
     if sourceLanguage!='zh':
         filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
         if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):

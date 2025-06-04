@@ -11,3 +11,4 @@ pytz
 apscheduler
 redis
 opuslib
+emoji

@@ -73,7 +73,6 @@ services:
               capabilities: [gpu]
     environment:
       - DEVICE_TYPE=cuda:0
-      - ncpu=10
   # VoiceLinkVR-server-2:
   #   image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/voice-link-vr-server:v1.8
   #   restart: unless-stopped

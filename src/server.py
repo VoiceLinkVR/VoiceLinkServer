@@ -25,6 +25,7 @@ from pydantic import BaseModel
 import re
 import struct
 import opuslib
+import emoji
 # 获取环境参数
 whisper_host=os.getenv("WHISPER_HOST")
 whisper_prot=os.getenv("WHISPER_PORT")
@@ -304,13 +305,13 @@ def dynamic_limit(fn):
     def wrapper(*args, **kwargs):
         
         if not limit_enable:return fn(*args, **kwargs)
-        duration=9999
-        if request.path!="/api/func/tts" and request.path!="/api/func/webtranslate":
-            audio_file = request.files['file']
-            try:
-                duration = get_wav_duration_from_filestorage(audio_file)
-            except wave.Error:
-                app.logger.info("Invalid WAV file")
+        # duration=9999
+        # if request.path!="/api/func/tts" and request.path!="/api/func/webtranslate":
+        #     audio_file = request.files['file']
+        #     try:
+        #         duration = get_wav_duration_from_filestorage(audio_file)
+        #     except wave.Error:
+        #         app.logger.info("Invalid WAV file")
         current_user = get_jwt_identity()  # 获取当前用户的身份（通常是用户名）
         user=User.query.filter_by(username=current_user).first()
         if user:
@@ -915,6 +916,7 @@ def multitranslateToOtherLanguage():
     sourceLanguage=params["sourceLanguage"]
     targetLanguage2=params.get("targetLanguage2","none")
     targetLanguage3=params.get("targetLanguage3","none")
+    emojiOutput=params.get("emojiOutput",'true')
     transText=''
     transText2=''
     transText3=''
@@ -932,6 +934,7 @@ def multitranslateToOtherLanguage():
     if sourceLanguage=='zh':
         response=requests.post(url=sensevoice_url,files={'file':audiofile})
         text = response.json()
+        if emojiOutput=='true': text['text']=emoji.replace_emoji(text['text'], replace='')
         
     else:
         filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
@@ -1172,6 +1175,7 @@ def multitranscription():
     file=request.files['file']
     params=request.form.to_dict()
     sourceLanguage=params["sourceLanguage"]
+    emojiOutput=params.get("emojiOutput",'true')
     app.logger.info(f"sourceLanguage:{sourceLanguage}")
     if sourceLanguage not in whisperSupportedLanguageList:
         return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
@@ -1188,6 +1192,7 @@ def multitranscription():
     else:
         response=requests.post(url=sensevoice_url,files={'file':audiofile})
         text = response.json()
+        if emojiOutput=='true': text['text']=emoji.replace_emoji(text['text'], replace='')
 
     et=time.time()
     app.logger.info(f"user:{current_user} id:{id} time:{et-st}")

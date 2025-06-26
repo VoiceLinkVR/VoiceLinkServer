@@ -1,4 +1,5 @@
 import functools
+import pymysql
 from flask import Flask, make_response,render_template, request, redirect, url_for, flash, session, abort, jsonify, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity,verify_jwt_in_request
@@ -26,6 +27,7 @@ import re
 import struct
 import opuslib
 import emoji
+
 # 获取环境参数
 whisper_host=os.getenv("WHISPER_HOST")
 whisper_prot=os.getenv("WHISPER_PORT")
@@ -52,7 +54,6 @@ ttsUrl=os.getenv("TTS_URL")
 ttsToken=os.getenv("TTS_TOKEN")
 latestVersion=os.getenv("LATEST_VERSION")
 packageBaseURL=os.getenv("PACKAGE_BASE_URL")
-
 limit_enable= False if  limit_enable is None or limit_enable =="" else True
 # whisper config
 if whisper_host is not None and whisper_prot is not None:whisper_url=f'http://{whisper_host}:{whisper_prot}/v1/'
@@ -125,8 +126,40 @@ jwt = JWTManager(app)
 
 
 def do_translate(text,from_,to):
-    return html.unescape(translators.translate_text(text,translator=translator_Service,from_language=from_,to_language=to))
-    
+    tol=transalte_zt.get(translator_Service,'zt') if to=='zt' else to
+    return html.unescape(translators.translate_text(text,translator=translator_Service,from_language=from_,to_language=tol))
+
+glm_client = OpenAI(
+    api_key="4c3d963619884fc69e3a02c581925691.mgFDmvFyfDWmGvub",
+    base_url="https://open.bigmodel.cn/api/paas/v4/"
+) 
+def openai_translate(text,t1,t2,t3):
+    c1=f'2. 将收到的文字翻译成{codeTochinese[t2]}。' if t2!="none" else ''
+    c2=f'3. 将收到的文字翻译成{codeTochinese[t3]}。' if t3!="none" else ''
+    o1=f',"translatedText2":{codeTochinese[t2]}译文' if t2!="none" else ''
+    o2=f',"translatedText3":{codeTochinese[t3]}译文' if t3!="none" else ''
+    contenttext=f'''你是翻译助手。你的任务是：
+1. 将收到的文字翻译成{codeTochinese[t1]}。
+{c1}
+{c2}
+
+请严格按照如下格式仅输出JSON，不要输出Python代码或其他信息，JSON字段使用顿号【、】区隔：'''+'{'+f'"text":收到的文字,"translatedText":{codeTochinese[t1]}译文{o1}{o2}'+'}'
+    app.logger.info("llm send:"+contenttext)
+
+    completion = glm_client.chat.completions.create(
+        model="glm-4-flash-250414",  
+        messages=[    
+            {"role": "system", "content":contenttext},    
+            {"role": "user", "content": text} 
+        ],
+        top_p=0.7,
+        temperature=0.9,
+        response_format = {'type': 'json_object'},
+    ) 
+    data=completion.choices[0].message.content
+    app.logger.info("llm return:"+data)
+    return data
+
 
 with open('filter.json', 'r',encoding='utf-8') as src:
     try:
@@ -441,6 +474,7 @@ def login_ui():
             flash('Invalid username or password')
     return render_template('login.html')
 
+
 @app.route('/ui/stats')
 def stats_ui():
     if 'user_id' not in session:
@@ -450,21 +484,49 @@ def stats_ui():
     if not user or not user.is_admin:
         return redirect(url_for('logout_ui'))
 
-    # 获取所有可用小时选项
-    hours = db.session.query(
-        db.func.strftime('%Y-%m-%d %H:00', 
-                        db.func.datetime(RequestLog.timestamp, '+8 hours')
-                        ).label('hour')
-    ).distinct().order_by(db.desc('hour')).all()
+    # --- 兼容性修改 ---
+    
+    dialect_name = db.engine.dialect.name
 
-    # 获取选中小时（默认为最新小时）
+    if dialect_name == 'sqlite':
+        timestamp_to_hour_str = db.func.strftime(
+            '%Y-%m-%d %H:00', 
+            db.func.datetime(RequestLog.timestamp, '+8 hours')
+        )
+    elif dialect_name == 'mysql':
+        timestamp_with_tz = db.func.date_add(RequestLog.timestamp, text('INTERVAL 8 HOUR'))
+        timestamp_to_hour_str = db.func.date_format(timestamp_with_tz, '%Y-%m-%d %H:00')
+    else:
+        timestamp_to_hour_str = db.func.strftime(
+            '%Y-%m-%d %H:00', 
+            db.func.datetime(RequestLog.timestamp, '+8 hours')
+        )
+
+    if dialect_name == 'sqlite':
+        timestamp_to_date_obj = db.func.date(
+            db.func.datetime(RequestLog.timestamp, '+8 hours')
+        )
+    elif dialect_name == 'mysql':
+        timestamp_with_tz = db.func.date_add(RequestLog.timestamp, text('INTERVAL 8 HOUR'))
+        timestamp_to_date_obj = db.func.date(timestamp_with_tz)
+    else:
+        timestamp_to_date_obj = db.func.date(
+            db.func.datetime(RequestLog.timestamp, '+8 hours')
+        )
+
+    # --- 兼容性修改结束 ---
+
+
+    hours_query = db.session.query(
+        timestamp_to_hour_str.label('hour')
+    ).distinct().order_by(db.desc('hour'))
+    
+    hours = hours_query.all()
+
     selected_hour = request.args.get('hour', hours[0].hour if hours else None)
 
-    # 修改小时统计查询（三个状态）
     hourly_query = db.session.query(
-        db.func.strftime('%Y-%m-%d %H:00', 
-                        db.func.datetime(RequestLog.timestamp, '+8 hours')
-                        ).label('hour'),
+        timestamp_to_hour_str.label('hour'),
         RequestLog.username,
         RequestLog.ip,
         RequestLog.endpoint,
@@ -474,17 +536,17 @@ def stats_ui():
         db.func.count().label('total_count')
     )
 
+    # **********************************************************
+    # *********** 这里是关键的修复 ***********
+    # 将过滤条件从 HAVING 移至 WHERE (filter)
     if selected_hour:
-        hourly_query = hourly_query.having(
-            db.func.strftime('%Y-%m-%d %H:00', 
-                           db.func.datetime(RequestLog.timestamp, '+8 hours')
-                           ) == selected_hour
+        hourly_query = hourly_query.filter(
+            timestamp_to_hour_str == selected_hour
         )
+    # **********************************************************
 
     hourly_stats = hourly_query.group_by('hour', RequestLog.username, RequestLog.ip, RequestLog.endpoint).all()
-
     
-    # 耗时分布统计
     duration_query = db.session.query(
         db.case(
             (RequestLog.duration < 3, '0-3s'),
@@ -500,18 +562,15 @@ def stats_ui():
     
     if selected_hour:
         duration_query = duration_query.filter(
-            db.func.strftime('%Y-%m-%d %H:00', 
-                           db.func.datetime(RequestLog.timestamp, '+8 hours')
-                           ) == selected_hour
+            timestamp_to_hour_str == selected_hour
         )
 
     duration_stats = duration_query.group_by('duration_range').all()
 
-    # 对耗时区间进行排序
     sorted_duration_stats = sorted(duration_stats, key=lambda x: (
         int(x.duration_range.split('-')[0].rstrip('s')) if x.duration_range != '90s+' else 90
     ))
-    # 新増日期处理逻辑
+
     date_filter_info = {
         'start_date': None,
         'end_date': None,
@@ -520,42 +579,36 @@ def stats_ui():
 
     if selected_hour:
         try:
-            # 解析选中小时的日期部分（格式：YYYY-MM-DD）
             end_date_str = selected_hour.split()[0]
             end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
-            start_date = end_date - timedelta(days=6)  # 包含7天数据
+            start_date = end_date - timedelta(days=6)
             
-            # 转换为字符串格式
             date_filter_info['start_date'] = start_date.strftime("%Y-%m-%d")
             date_filter_info['end_date'] = end_date_str
         except Exception as e:
             date_filter_info['error'] = True
             print(f"日期解析错误: {str(e)}")
 
-    # 修改每日统计查询
     daily_query = db.session.query(
-        db.func.strftime('%Y-%m-%d', 
-                        db.func.datetime(RequestLog.timestamp, '+8 hours')
-                        ).label('day'),
+        timestamp_to_date_obj.label('day'),
         db.func.sum(db.case((RequestLog.status == 'success', 1), else_=0)).label('daily_success'),
         db.func.sum(db.case((RequestLog.status == 'failed', 1), else_=0)).label('daily_fail'),
         db.func.sum(db.case((RequestLog.status == 'rate_limited', 1), else_=0)).label('daily_rate_limited'),
         db.func.count().label('daily_total')
     )
 
-    # 添加日期过滤条件（当有有效日期时）
     if not date_filter_info['error'] and date_filter_info['start_date']:
         daily_query = daily_query.filter(
-            db.func.date(db.func.datetime(RequestLog.timestamp, '+8 hours')).between(
+            timestamp_to_date_obj.between(
                 date_filter_info['start_date'],
                 date_filter_info['end_date']
             )
         )
-    else:  # 默认显示最近7天
+    else:
         default_end = datetime.now()
         default_start = default_end - timedelta(days=6)
         daily_query = daily_query.filter(
-            db.func.date(db.func.datetime(RequestLog.timestamp, '+8 hours')).between(
+            timestamp_to_date_obj.between(
                 default_start.strftime("%Y-%m-%d"),
                 default_end.strftime("%Y-%m-%d")
             )
@@ -564,11 +617,11 @@ def stats_ui():
     daily_query = daily_query.group_by('day').order_by(db.desc('day'))
     daily_stats = daily_query.all()
 
-    # 计算各维度总数
     total_success = sum(stat.success_count for stat in hourly_stats)
     total_fail = sum(stat.fail_count for stat in hourly_stats)
     total_rate_limited = sum(stat.rate_limited_count for stat in hourly_stats)
     total_count = total_success + total_fail + total_rate_limited
+    
     return render_template('stats.html',
                          date_filter_info=date_filter_info,
                          daily_stats=daily_stats,
@@ -580,7 +633,6 @@ def stats_ui():
                          hourly_stats=hourly_stats,
                          duration_stats=sorted_duration_stats,
                          total_count=total_count)
-
 
 # 用户管理页面
 @app.route('/ui/manage_users', methods=['GET', 'POST'])
@@ -934,7 +986,9 @@ def multitranslateToOtherLanguage():
     if sourceLanguage=='zh':
         response=requests.post(url=sensevoice_url,files={'file':audiofile})
         text = response.json()
+        
         if emojiOutput=='true': text['text']=emoji.replace_emoji(text['text'], replace='')
+        if  text['text']=='。' or text['text']=='': return jsonify({'text': "",'message':"filtered"}), 200
         
     else:
         filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
@@ -952,6 +1006,7 @@ def multitranslateToOtherLanguage():
             if targetLanguage3 != "none": transText3=do_translate(stext, from_=translateSourceLanguage,to=targetLanguage3)
         except Exception as e:
             app.logger.error(f"error:{traceback.format_exc()}")
+        # return openai_translate(stext,targetLanguage,targetLanguage2,targetLanguage3), 200
     else:
         translatedText=whisperclient.audio.translations.create(model=model, file=audiofile)
         if targetLanguage =='en':transText=translatedText.text
@@ -1193,6 +1248,7 @@ def multitranscription():
         response=requests.post(url=sensevoice_url,files={'file':audiofile})
         text = response.json()
         if emojiOutput=='true': text['text']=emoji.replace_emoji(text['text'], replace='')
+        if  text['text']=='。' or text['text']=='': return jsonify({'text': "",'message':"filtered"}), 200
 
     et=time.time()
     app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
@@ -1638,6 +1694,15 @@ codeTochinese={
     'eo': '世界语',  # 来自libretranslate
     'ga': '爱尔兰语',  # 来自libretranslate
     'nb': '挪威语'  # 来自libretranslate
+}
+transalte_zt={
+    'bing':'zh-Hant',
+    'baidu':'cht',
+    'alibaba':'zh-TW',
+    'sogou':'zh-CHT',
+    'iciba':'cnt',
+    'itranslate':'zh-TW',
+    'papago':'zh-TW'
 }
 def packaged_opus_stream_to_wav_bytes(
     packaged_opus_data: bytes,

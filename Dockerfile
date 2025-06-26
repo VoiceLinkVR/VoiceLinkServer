@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /usr/src/app
 COPY ./src/requirements.txt ./
+# 设置清华大学镜像源
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 RUN pip install --no-cache-dir -r requirements.txt
 COPY ./src .
 EXPOSE 8980

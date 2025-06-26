@@ -73,6 +73,10 @@ services:
               capabilities: [gpu]
     environment:
       - DEVICE_TYPE=cuda:0
+      - use_itn=True
+      - ncpu=8
+      - VAD_ENABLE=False
+
   # VoiceLinkVR-server-2:
   #   image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/voice-link-vr-server:v1.8
   #   restart: unless-stopped
@@ -130,6 +134,8 @@ services:
       - ENABLE_WEB_TRANSLATORS=True
       - LATEST_VERSION=v0.5.8
       - PACKAGE_BASE_URL=https://cloudflarestorage.boyqiu001.top/VRCLS-windwos-
+      # 可以使用mysql
+      # - SQL_PATH=mysql+pymysql://voicelinkvr:voicelinkabc123%40@192.168.2.198:3306/voicelinkvr_server_test?charset=utf8
     depends_on:
       - sensevoice
       - libretranslate-cuda

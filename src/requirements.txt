@@ -12,3 +12,4 @@ apscheduler
 redis
 opuslib
 emoji
+pymysql

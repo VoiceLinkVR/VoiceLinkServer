@@ -54,6 +54,7 @@ ttsUrl=os.getenv("TTS_URL")
 ttsToken=os.getenv("TTS_TOKEN")
 latestVersion=os.getenv("LATEST_VERSION")
 packageBaseURL=os.getenv("PACKAGE_BASE_URL")
+packageType=os.getenv("PACKAGE_TYPE")
 limit_enable= False if  limit_enable is None or limit_enable =="" else True
 # whisper config
 if whisper_host is not None and whisper_prot is not None:whisper_url=f'http://{whisper_host}:{whisper_prot}/v1/'
@@ -655,7 +656,7 @@ def manage_users_ui():
             user_base.is_active = is_active
             if new_password is not None and new_password != "":user_base.password=new_password
             if new_limit_rule is not None and new_limit_rule != "":user_base.limit_rule=new_limit_rule
-                
+            app.logger.info(f"user update: {new_username}|{new_limit_rule}|{expiration_date}")  
         else:
             if new_password is None or new_password =="":flash('Please enter password')
             new_limit_rule = new_limit_rule if new_limit_rule is not None and new_limit_rule != "" else "10000/day;1000/hour"
@@ -668,10 +669,10 @@ def manage_users_ui():
                 expiration_date=expiration_date,
                 is_active=is_active
                 )
+            app.logger.info(f"user edit: {new_username}|{new_limit_rule}|{expiration_date}")
             db.session.add(new_user)
         db.session.commit()
         flash('User added/updated successfully')
- 
     users = User.query.all()
     return render_template('manage_users.html', users=users)
 
@@ -797,7 +798,7 @@ def login():
 def latestVersionInfo():
     app.logger.info(f"/latestVersionInfo")
     if latestVersion and packageBaseURL:
-        return jsonify({'version': latestVersion, 'packgeURL': packageBaseURL+latestVersion+'.zip'}), 200
+        return jsonify({'version': latestVersion, 'packgeURL': packageBaseURL+latestVersion+packageType}), 200
     else:
         return jsonify({'message': 'version not defined'}),460
 

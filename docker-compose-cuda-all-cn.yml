@@ -132,8 +132,9 @@ services:
       - TTS_TOKEN=
       - TTS_URL=
       - ENABLE_WEB_TRANSLATORS=True
-      - LATEST_VERSION=v0.5.8
-      - PACKAGE_BASE_URL=https://cloudflarestorage.boyqiu001.top/VRCLS-windwos-
+      - LATEST_VERSION=v0.6.0-fix1
+      - PACKAGE_BASE_URL=https://cloudflarestorage.boyqiu001.top/VRCLS-windows-
+      - PACKAGE_TYPE=.exe
       # 可以使用mysql
       # - SQL_PATH=mysql+pymysql://voicelinkvr:voicelinkabc123%40@192.168.2.198:3306/voicelinkvr_server_test?charset=utf8
     depends_on:

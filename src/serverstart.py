@@ -38,7 +38,7 @@ dictConfig({
             },
             "log_file": {
                 "class": "logging.handlers.RotatingFileHandler",
-                "level": "INFO",
+                "level": "DEBUG",
                 "formatter": "default",   # 日志输出样式对应formatters
                 "filename": f"./data/logs/server.log",  # 指定log文件目录
                 "maxBytes": 20*1024*1024,   # 文件最大20M

@@ -1,15 +1,44 @@
-urllib3==2.3.0
-flask
-flask_sqlalchemy
-flask_jwt_extended
-openai
-requests
-waitress
-Flask-Limiter
+# FastAPI and Server
+fastapi
+uvicorn[standard]
+
+# Database
+sqlalchemy
+pymysql
+
+# Authentication & Security
+python-jose[cryptography]
+passlib[bcrypt]
+
+# Rate Limiting
+slowapi
+
+# Async HTTP Client (替代 requests)
+httpx
+
+# Web Translators
 translators
 pytz
+
+# Background Tasks
 apscheduler
-redis
+
+# Audio Processing
 opuslib
 emoji
-pymysql
+
+# OpenAI Client
+openai
+
+# Templating
+jinja2
+
+# Form & File Uploads
+python-multipart
+
+# Redis client for rate limiter
+redis
+
+itsdangerous
+
+pydantic-settings

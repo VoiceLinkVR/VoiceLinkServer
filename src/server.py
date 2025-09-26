@@ -1,5 +1,7 @@
 import functools
 import pymysql
+import logging
+import logging.handlers
 from flask import Flask, make_response,render_template, request, redirect, url_for, flash, session, abort, jsonify, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity,verify_jwt_in_request
@@ -78,6 +80,65 @@ else: localTransBaseUrl="http://127.0.0.1:5000/"
 localTransUrl=localTransBaseUrl+"translate"
 localLanguageUrl=localTransBaseUrl+"languages"
 
+# 配置详细日志系统
+def setup_logging():
+    """配置详细日志系统"""
+    # 创建logs目录（如果不存在）
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # 配置日志格式
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    detailed_format = '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName)s() - %(message)s'
+    
+    # 创建logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter(log_format)
+    console_handler.setFormatter(console_formatter)
+    
+    # 文件处理器 - 主要日志
+    main_log_file = os.path.join(log_dir, 'server.log')
+    main_handler = logging.handlers.RotatingFileHandler(
+        main_log_file, maxBytes=50*1024*1024, backupCount=10, encoding='utf-8'
+    )
+    main_handler.setLevel(logging.INFO)
+    main_formatter = logging.Formatter(detailed_format)
+    main_handler.setFormatter(main_formatter)
+    
+    # 文件处理器 - Debug日志
+    debug_log_file = os.path.join(log_dir, 'debug.log')
+    debug_handler = logging.handlers.RotatingFileHandler(
+        debug_log_file, maxBytes=50*1024*1024, backupCount=5, encoding='utf-8'
+    )
+    debug_handler.setLevel(logging.DEBUG)
+    debug_formatter = logging.Formatter(detailed_format)
+    debug_handler.setFormatter(debug_formatter)
+    
+    # 错误日志处理器
+    error_log_file = os.path.join(log_dir, 'error.log')
+    error_handler = logging.handlers.RotatingFileHandler(
+        error_log_file, maxBytes=20*1024*1024, backupCount=5, encoding='utf-8'
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_formatter = logging.Formatter(detailed_format)
+    error_handler.setFormatter(error_formatter)
+    
+    # 添加处理器到logger
+    logger.addHandler(console_handler)
+    logger.addHandler(main_handler)
+    logger.addHandler(debug_handler)
+    logger.addHandler(error_handler)
+    
+    return logger
+
+# 初始化日志系统
+logger = setup_logging()
+
 # 应用和数据库配置
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = sqlitePath if sqlitePath is not None else 'sqlite:///users.db'  # 使用 SQLite 数据库
@@ -108,7 +169,7 @@ if limit_enable:
             ip=x_forwarded_for.split(',')[0].strip()
         else:
             ip=request.remote_addr
-        app.logger.info(ip)
+        logger.info(ip)
         return ip
     limiter=Limiter(
         app=app,
@@ -145,7 +206,7 @@ def openai_translate(text,t1,t2,t3):
 {c2}
 
 请严格按照如下格式仅输出JSON，不要输出Python代码或其他信息，JSON字段使用顿号【、】区隔：'''+'{'+f'"text":收到的文字,"translatedText":{codeTochinese[t1]}译文{o1}{o2}'+'}'
-    app.logger.info("llm send:"+contenttext)
+    logger.info("llm send:"+contenttext)
 
     completion = glm_client.chat.completions.create(
         model="glm-4-flash-250414",  
@@ -158,7 +219,7 @@ def openai_translate(text,t1,t2,t3):
         response_format = {'type': 'json_object'},
     ) 
     data=completion.choices[0].message.content
-    app.logger.info("llm return:"+data)
+    logger.info("llm return:"+data)
     return data
 
 
@@ -166,14 +227,14 @@ with open('filter.json', 'r',encoding='utf-8') as src:
     try:
         srcConfig1=json.load(src)  
     except requests.exceptions.JSONDecodeError as e:
-        app.logger.warning("local filter.json error||源过滤配置文件异常,详情："+str(e.strerror))
+        logger.warning("local filter.json error||源过滤配置文件异常,详情："+str(e.strerror))
         exit(1)
 
 try:
     responce= requests.get("https://raw.githubusercontent.com/VoiceLinkVR/VoiceLinkServer/refs/heads/main/src/filter.json" if filter_web_url is None else filter_web_url) 
     srcConfig2= responce.json()
 except Exception as e:
-    app.logger.warning("failed to update filter.json through web || 通过网络获取源过滤配置文件失败,详情："+str(e.strerror))
+    logger.warning("failed to update filter.json through web || 通过网络获取源过滤配置文件失败,详情："+str(e.strerror))
     srcConfig2=srcConfig1
 
 
@@ -183,11 +244,11 @@ for srcConfig in [srcConfig1,srcConfig2]:
         try:
             destConfig=json.load(dest)
         except requests.exceptions.JSONDecodeError as e:
-            app.logger.warning("过滤配置文件异常,详情："+str(e.strerror))
+            logger.warning("过滤配置文件异常,详情："+str(e.strerror))
             exit(1)
     configDiff=list(set(srcConfig.keys())-set(destConfig.keys()))
     if configDiff != [] :
-        app.logger.info(" filter in filter.json updated ||filter.json文件更新 :"+str(configDiff))
+        logger.info(" filter in filter.json updated ||filter.json文件更新 :"+str(configDiff))
         for newConfig in configDiff:
             destConfig[newConfig]=srcConfig[newConfig]
         with open('data/filterConfig/filter.json', 'w', encoding="utf-8") as file:
@@ -195,7 +256,7 @@ for srcConfig in [srcConfig1,srcConfig2]:
     for filter in srcConfig.keys():
         filterDiff=[rule for rule in srcConfig[filter] if rule not in destConfig[filter]]
         if filterDiff != []:
-            app.logger.info("rules in filter.json column updated ||filter.json文件更新 规则更新,增加："+str(filterDiff))
+            logger.info("rules in filter.json column updated ||filter.json文件更新 规则更新,增加："+str(filterDiff))
             for newFilter in filterDiff:
                 destConfig[filter].append(newFilter)
             with open('data/filterConfig/filter.json', 'w', encoding="utf-8") as file:
@@ -214,10 +275,10 @@ def check_and_update_db():
                 # 添加缺失字段
                 if 'expiration_date' not in user_columns:
                     db.session.execute(text('ALTER TABLE user ADD COLUMN expiration_date DATETIME'))
-                    app.logger.info("Added expiration_date to user table")
+                    logger.info("Added expiration_date to user table")
                 if 'is_active' not in user_columns:
                     db.session.execute(text('ALTER TABLE user ADD COLUMN is_active BOOLEAN DEFAULT 1'))
-                    app.logger.info("Added is_active to user table")
+                    logger.info("Added is_active to user table")
 
             # 检查request_log表
             if 'request_log' in inspector.get_table_names():
@@ -225,24 +286,59 @@ def check_and_update_db():
                 if 'status' not in log_columns:
                     db.session.execute(text('ALTER TABLE request_log ADD COLUMN status VARCHAR(20) DEFAULT "pending"'))
                     app.session.execute(text('UPDATE request_log SET status = "success" WHERE status IS NULL'))
-                    app.logger.info("Added status to request_log table")
+                    logger.info("Added status to request_log table")
 
             db.session.commit()
             
         except Exception as e:
             db.session.rollback()
-            app.logger.error(f"数据库升级失败: {str(e)}")
+            logger.error(f"数据库升级失败: {str(e)}")
         finally:
             db.session.close()
 
 # 在应用初始化后调用
 check_and_update_db()
 
+# 数据库操作日志装饰器
+def log_db_operation(operation_type):
+    """数据库操作日志装饰器"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            start_time = time.time()
+            logger.debug(f"[DB-{operation_type}] 开始操作: {func.__name__} 参数: {str(args)[:200]}...")
+            try:
+                result = func(*args, **kwargs)
+                duration = time.time() - start_time
+                logger.debug(f"[DB-{operation_type}] 成功: {func.__name__} 耗时: {duration:.3f}s")
+                return result
+            except Exception as e:
+                duration = time.time() - start_time
+                logger.error(f"[DB-{operation_type}] 失败: {func.__name__} 耗时: {duration:.3f}s 错误: {str(e)}")
+                logger.exception("数据库操作异常:")
+                raise
+        return wrapper
+    return decorator
+
+# 扩展SQLAlchemy查询类以添加日志
+class LoggingSQLAlchemy(SQLAlchemy):
+    def apply_pool_defaults(self, app, options):
+        super().apply_pool_defaults(app, options)
+        # 添加连接池日志
+        options['echo'] = True  # 启用SQL日志
+        options['echo_pool'] = True  # 启用连接池日志
+
+# 使用带日志的SQLAlchemy
+db = LoggingSQLAlchemy(app)
+jwt = JWTManager(app)
 
 # 在应用初始化后调用
 check_and_update_db()
+logger.info("数据库初始化完成")
+
 def check_user_expiration():
     with app.app_context():
+        logger.info("开始检查用户过期状态...")
         now = datetime.now(pytz.utc)
         expired_users = User.query.filter(
             User.expiration_date <= now,
@@ -251,9 +347,10 @@ def check_user_expiration():
         
         for user in expired_users:
             user.is_active = False
-            app.logger.info(f"用户 {user.username} 已过期，自动禁用")
+            logger.info(f"用户 {user.username} 已过期，自动禁用")
         
         db.session.commit()
+        logger.info(f"用户过期检查完成，共处理 {len(expired_users)} 个过期用户")
 
 # 配置定时任务
 scheduler = BackgroundScheduler(timezone=pytz.utc)
@@ -289,8 +386,8 @@ class RequestLog(db.Model):
 # 删除@app.before_request装饰器，改为在应用启动时调用
 with app.app_context():
     db.create_all()
-# app.logger.info(f"SQLALCHEMY_POOL_SIZE: {app.config['SQLALCHEMY_POOL_SIZE']}")
-# app.logger.info(f"SQLALCHEMY_MAX_OVERFLOW: {app.config['SQLALCHEMY_MAX_OVERFLOW']}")
+# logger.info(f"SQLALCHEMY_POOL_SIZE: {app.config['SQLALCHEMY_POOL_SIZE']}")
+# logger.info(f"SQLALCHEMY_MAX_OVERFLOW: {app.config['SQLALCHEMY_MAX_OVERFLOW']}")
 # 动态流量限制装饰器
 # def dynamic_limit(fn):
 #     @jwt_required()  # 确保 JWT 验证通过
@@ -302,7 +399,7 @@ with app.app_context():
 #             user=User.query.filter_by(username=current_user).first()
 #             if user:
 #                 ip=limit_key_func()
-#                 app.logger.info(f"limit rule,use: {current_user},{user.limit_rule},ip:{ip}")
+#                 logger.info(f"limit rule,use: {current_user},{user.limit_rule},ip:{ip}")
                 
 #                 if current_user == pubilc_test_username:
 #                     # 使用动态限制
@@ -314,7 +411,7 @@ with app.app_context():
 #             else:
 #                 # 使用默认限制（或者返回一个错误）
 #                 # 这里我们选择使用默认限制，因为 Limiter 会自动处理超出限制的情况
-#                 app.logger.info("default rule")
+#                 logger.info("default rule")
 #                 with limiter.limit("500/day;400/hour",scope=SHARED_LIMIT_SCOPE):  # None 表示使用默认限制
 #                     return fn(*args, **kwargs)
 #         else:
@@ -345,7 +442,7 @@ def dynamic_limit(fn):
         #     try:
         #         duration = get_wav_duration_from_filestorage(audio_file)
         #     except wave.Error:
-        #         app.logger.info("Invalid WAV file")
+        #         logger.info("Invalid WAV file")
         current_user = get_jwt_identity()  # 获取当前用户的身份（通常是用户名）
         user=User.query.filter_by(username=current_user).first()
         if user:
@@ -353,7 +450,7 @@ def dynamic_limit(fn):
             #     rule=str(user.limit_rule).replace("8/minute","16/minute").replace("4/minute","8/minute")
             # else:
             rule=user.limit_rule
-            app.logger.info(f"limit rule,use: {current_user},{rule}")
+            logger.info(f"[LIMIT] 用户: {current_user}, 限制规则: {rule}")
             
             if current_user == pubilc_test_username:
                 # 使用动态限制
@@ -375,7 +472,7 @@ def dynamic_limit(fn):
         else:
             # 使用默认限制（或者返回一个错误）
             # 这里我们选择使用默认限制，因为 Limiter 会自动处理超出限制的情况
-            app.logger.info("default rule")
+            logger.info("[LIMIT] 使用默认限流规则")
             with limiter.limit("500/day;400/hour",scope=SHARED_LIMIT_SCOPE):  # None 表示使用默认限制
                 return fn(*args, **kwargs)
 
@@ -397,7 +494,19 @@ def log_request(func):
             ip=request.remote_addr
         log_data = {'status': 'failed'}
         
+        # 记录请求开始
+        logger.info(f"[API-START] 用户: {current_user}, IP: {ip}, 接口: {request.path}, 方法: {request.method}")
+        
         try:
+            # 记录请求参数
+            if request.method == 'POST':
+                if request.files:
+                    logger.debug(f"[API-PARAMS] 文件参数: {list(request.files.keys())}")
+                if request.form:
+                    logger.debug(f"[API-PARAMS] 表单参数: {dict(request.form)}")
+                if request.json:
+                    logger.debug(f"[API-PARAMS] JSON参数: {request.json}")
+            
             # 统一返回值处理
             result = func(*args, **kwargs)
             response = make_response(result)
@@ -407,17 +516,24 @@ def log_request(func):
             try:
                 status_code = getattr(response, 'status_code', 500)
                 log_data['status'] = 'success' if 200 <= status_code < 400 else 'failed'
+                logger.info(f"[API-END] 用户: {current_user}, 接口: {request.path}, 状态码: {status_code}, 耗时: {log_data['duration']:.3f}s")
             except Exception as e:
-                app.logger.error(f"状态码获取失败: {str(e)}")
+                logger.error(f"[API-ERROR] 状态码获取失败: {str(e)}")
 
             return response
         except RateLimitExceeded as e:
-            jsonify(), 430 
             # 构建标准限流响应
             response = jsonify({"error": "Too many request","limit": str(e.limit.limit),})
             response.status_code = 430
             log_data['status'] = 'rate_limited'
+            logger.warning(f"[API-LIMIT] 用户: {current_user} 触发限流, IP: {ip}, 限制: {str(e.limit.limit)}")
             return response
+        except Exception as e:
+            log_data['duration'] = time.time() - st
+            log_data['status'] = 'error'
+            logger.error(f"[API-ERROR] 用户: {current_user}, 接口: {request.path}, 错误: {str(e)}")
+            logger.exception("API处理异常:")
+            raise
         finally:
             # 字段容错处理
             log = RequestLog(
@@ -430,9 +546,10 @@ def log_request(func):
             try:
                 db.session.add(log)
                 db.session.commit()
+                logger.debug(f"[DB-LOG] 请求日志记录成功: 用户={current_user}, 接口={request.path}")
             except Exception as e:
                 db.session.rollback()
-                app.logger.error(f"日志提交失败: {str(e)}")
+                logger.error(f"[DB-ERROR] 日志提交失败: {str(e)}")
 
 
     return wrapper
@@ -442,7 +559,7 @@ def log_request(func):
 #     with app.app_context():
 #         # 通过私有方法重置存储（注意：这是基于当前实现细节）
 #         limiter.storage.reset()
-#         app.logger.info("计数器已重置于北京时间8点")
+#         logger.info("计数器已重置于北京时间8点")
 
 # scheduler.add_job(
 #     func=reset_limits,
@@ -465,13 +582,16 @@ def login_ui():
             db.session.add(new_user)
             db.session.commit()
             session['user_id'] = new_user.id
+            logger.info(f"[ADMIN] 创建管理员用户: {username}")
             return redirect(url_for('manage_users_ui'))
         user = User.query.filter_by(username=username).first()
         if user and check_password_hash(user.password, password) and user.is_admin:
             session['user_id'] = user.id
+            logger.info(f"[ADMIN] 管理员登录: {username}")
             return redirect(url_for('manage_users_ui'))
         
         else:
+            logger.warning(f"[AUTH] 管理员登录失败: {username}")
             flash('Invalid username or password')
     return render_template('login.html')
 
@@ -656,7 +776,7 @@ def manage_users_ui():
             user_base.is_active = is_active
             if new_password is not None and new_password != "":user_base.password=new_password
             if new_limit_rule is not None and new_limit_rule != "":user_base.limit_rule=new_limit_rule
-            app.logger.info(f"user update: {new_username}|{new_limit_rule}|{expiration_date}")  
+            logger.info(f"user update: {new_username}|{new_limit_rule}|{expiration_date}")  
         else:
             if new_password is None or new_password =="":flash('Please enter password')
             new_limit_rule = new_limit_rule if new_limit_rule is not None and new_limit_rule != "" else "10000/day;1000/hour"
@@ -669,7 +789,7 @@ def manage_users_ui():
                 expiration_date=expiration_date,
                 is_active=is_active
                 )
-            app.logger.info(f"user edit: {new_username}|{new_limit_rule}|{expiration_date}")
+            logger.info(f"user edit: {new_username}|{new_limit_rule}|{expiration_date}")
             db.session.add(new_user)
         db.session.commit()
         flash('User added/updated successfully')
@@ -685,7 +805,7 @@ def logout_ui():
 def delete_user_ui():
     if 'user_id' not in session:
         return redirect(url_for('logout_ui'))
-    app.logger.info(request.form['id'])
+    logger.info(request.form['id'])
     db.session.delete(User.query.filter_by(id= int(request.form['id'])).first())
     db.session.commit()
     return redirect(url_for('manage_users_ui'))
@@ -741,7 +861,7 @@ def register():
     username = data.get('username')
     password = data.get('password')
     current_user = get_jwt_identity()
-    app.logger.info(f"/register {username},damin: {current_user}")
+    logger.info(f"/register {username},damin: {current_user}")
     if not username or not password:
         return jsonify({'message': 'Missing username or password'}), 400
     if not User.query.filter_by(username=current_user,is_admin=True).first():
@@ -764,7 +884,7 @@ def deleteUser():
     data = request.get_json()
     username = data.get('username')
     current_user = get_jwt_identity()
-    app.logger.info(f"/register {username},damin: {current_user}")
+    logger.info(f"/register {username},damin: {current_user}")
     if not username :
         return jsonify({'message': 'Missing username or password'}), 400
 
@@ -781,7 +901,7 @@ def login():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-    app.logger.info(f"/login {username}")
+    logger.info(f"/login {username}")
     if not username or not password:
         return jsonify({'message': 'Missing username or password'}), 400
 
@@ -796,7 +916,7 @@ def login():
 # 登录接口
 @app.route('/api/latestVersionInfo', methods=['GET'])
 def latestVersionInfo():
-    app.logger.info(f"/latestVersionInfo")
+    logger.info(f"/latestVersionInfo")
     if latestVersion and packageBaseURL:
         return jsonify({'version': latestVersion, 'packgeURL': packageBaseURL+latestVersion+packageType}), 200
     else:
@@ -810,14 +930,14 @@ def whisper_transcriptions():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/whisper/transcriptions user:{current_user} id:{id}")
+    logger.info(f"/whisper/transcriptions user:{current_user} id:{id}")
     file=request.files['file']
 
     audiofile=file.stream.read()
     res=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language='zh')
     text=res.text
     et=time.time()
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     if(text in errorFilter["errorResultDict"]) or any(errorKey in text for errorKey in errorFilter["errorKeyString"]):
         return jsonify({'text': "",'message':"filtered"}), 200
     return jsonify({'text': text}), 200
@@ -841,14 +961,14 @@ def whisper_translations():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/whisper/translations user:{current_user} id:{id}")
+    logger.info(f"/whisper/translations user:{current_user} id:{id}")
     file=request.files['file']
 
     audiofile=file.stream.read()
     res=whisperclient.audio.translations.create(model=model, file=audiofile,language='zh')
     text=res.text
     et=time.time()
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     if(text in errorFilter["errorResultDict"]) or any(errorKey in text for errorKey in errorFilter["errorKeyString"]):
         return jsonify({'text': "",'message':"filtered"}), 200
     return jsonify({'text': text}), 200
@@ -870,14 +990,14 @@ def translate_local(text,source,target)-> str:
         response = requests.post(url, params=params)
         result = response.json()
     except Exception as e:
-         app.logger.info(f"翻译API响应错误: {str(e)}")
+         logger.info(f"翻译API响应错误: {str(e)}")
  
     # 添加错误处理和日志记录
     if 'translatedText' in result:
         return result['translatedText']
     else:
         # 打印错误信息和完整的API响应
-        app.logger.info(f"翻译API响应错误: {result}")
+        logger.info(f"翻译API响应错误: {result}")
         return text  # 如果翻译失败，返回原文
 # 翻译
 @app.route('/api/libreTranslate', methods=['POST'])
@@ -887,14 +1007,14 @@ def libreTranslate():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/libreTranslate user:{current_user} id:{id}")
+    logger.info(f"/libreTranslate user:{current_user} id:{id}")
     data = request.get_json()
     source = data.get('source')
     target = data.get('target')
     text = data.get('text')
     res=translate_local(text,source,target)
     et=time.time()
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     return jsonify({'text': res}), 200
 
 # 翻译
@@ -905,13 +1025,13 @@ def translate():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/func/translateToEnglish user:{current_user} id:{id}")
+    logger.info(f"/func/translateToEnglish user:{current_user} id:{id}")
     file=request.files['file']
     audiofile=file.stream.read()
 
     text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language='zh')
     et=time.time()
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     if(text.text in errorFilter["errorResultDict"]) or any(errorKey in text.text for errorKey in errorFilter["errorKeyString"]):
         return jsonify({'text': "",'message':"filtered"}), 200
     if enable_web_translators :
@@ -928,13 +1048,13 @@ def translateToOtherLanguage():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/func/translateToOtherLanguage user:{current_user} id:{id}")
+    logger.info(f"/func/translateToOtherLanguage user:{current_user} id:{id}")
     global supportedLanguagesList
     init_supportedLanguagesList()
     file=request.files['file']
     params=request.form.to_dict()
     targetLanguage=params["targetLanguage"]
-    app.logger.info(f"targetLanguage:{targetLanguage}")
+    logger.info(f"targetLanguage:{targetLanguage}")
     if targetLanguage not in supportedLanguagesList:
         return jsonify({'message':f"targetLanguage error,please use following languages:{str(supportedLanguagesList)}"}), 401
     audiofile=file.stream.read()
@@ -949,7 +1069,7 @@ def translateToOtherLanguage():
         if targetLanguage =='en':transText=translatedText.text
         else:transText=translate_local(translatedText.text,"en",targetLanguage)
     et=time.time()
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     return jsonify({'text': text.text,'translatedText':transText}), 200
 
 # 多语言翻译
@@ -960,7 +1080,7 @@ def multitranslateToOtherLanguage():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/func/multitranslateToOtherLanguage user:{current_user} id:{id}")
+    logger.info(f"/func/multitranslateToOtherLanguage user:{current_user} id:{id}")
     global supportedLanguagesList
     init_supportedLanguagesList()
     file=request.files['file']
@@ -973,7 +1093,7 @@ def multitranslateToOtherLanguage():
     transText=''
     transText2=''
     transText3=''
-    app.logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
+    logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
     if sourceLanguage not in whisperSupportedLanguageList:
         return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
     if targetLanguage not in supportedLanguagesList:
@@ -997,7 +1117,7 @@ def multitranslateToOtherLanguage():
             return jsonify({'text': "",'message':"filtered"}), 200
         text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
     stext=text.text if sourceLanguage!='zh' else text['text']
-    app.logger.info(id+': '+stext)
+    logger.info(id+': '+stext)
     
     if enable_web_translators:
         try:
@@ -1006,7 +1126,7 @@ def multitranslateToOtherLanguage():
             if targetLanguage2 != "none": transText2=do_translate(stext, from_=translateSourceLanguage,to=targetLanguage2)
             if targetLanguage3 != "none": transText3=do_translate(stext, from_=translateSourceLanguage,to=targetLanguage3)
         except Exception as e:
-            app.logger.error(f"error:{traceback.format_exc()}")
+            logger.error(f"error:{traceback.format_exc()}")
         # return openai_translate(stext,targetLanguage,targetLanguage2,targetLanguage3), 200
     else:
         translatedText=whisperclient.audio.translations.create(model=model, file=audiofile)
@@ -1016,7 +1136,7 @@ def multitranslateToOtherLanguage():
         if targetLanguage2 != "none": transText2=translate_local(translatedText.text,'en',targetLanguage2)
         if targetLanguage3 != "none": transText3=translate_local(translatedText.text,'en',targetLanguage3)
     et=time.time()
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     return jsonify({'text':stext,'translatedText':transText,'translatedText2':transText2,'translatedText3':transText3}), 200
 
 
@@ -1044,7 +1164,7 @@ def vllmTest():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/func/vllmTest user:{current_user} id:{id}")
+    logger.info(f"/func/vllmTest user:{current_user} id:{id}")
     global supportedLanguagesList
     init_supportedLanguagesList()
     file=request.files['file']
@@ -1072,7 +1192,7 @@ def vllmTest():
     if targetLanguage2!= 'none':system_prompt_content+=f',"{codeTochinese[targetLanguage2]}":"{codeTochinese[targetLanguage2]}文本"'
     if targetLanguage3!= 'none':system_prompt_content+=f',"{codeTochinese[targetLanguage3]}":"{codeTochinese[targetLanguage3]}文本"'
     system_prompt_content+='}\n'
-    app.logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
+    logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
 
     binary_data=file.stream.read()
     base64_encoded_data = base64.b64encode(binary_data)
@@ -1113,14 +1233,14 @@ def vllmTest():
 
         end_time = time.monotonic()
         duration = end_time - start_time
-        app.logger.info(f"API call completed in {duration:.2f} seconds.")
+        logger.info(f"API call completed in {duration:.2f} seconds.")
 
         # print("\n--- Model Response ---")
         message_content = None
         if chat_completion.choices and len(chat_completion.choices) > 0:
             message_content = chat_completion.choices[0].message.content
             remaining=message_content
-            app.logger.info(message_content)
+            logger.info(message_content)
             try:
                 datattt=json.loads(remaining)
                 result={
@@ -1181,7 +1301,7 @@ def vllmTest():
                 error_message += f" - Response: {e.response.text}"
                 print(f"Response content: {e.response.text}")
         return jsonify({"duration": time.monotonic() - start_time if 'start_time' in locals() else 0, "content": None, "error": error_message}),500
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     return jsonify({'text': result.get("text"),
     'translatedText':result.get("translatedText"),
     'translatedText2':result.get("translatedText2",''),
@@ -1194,12 +1314,12 @@ def doubleTransciption():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/func/doubleTranscibe user:{current_user} id:{id}")
+    logger.info(f"/func/doubleTranscibe user:{current_user} id:{id}")
     file=request.files['file']
     params=request.form.to_dict()
     targetLanguage=params["targetLanguage"]
     sourceLanguage=params["sourceLanguage"]
-    app.logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
+    logger.info(f"targetLanguage:{targetLanguage}, sourceLanguage:{sourceLanguage}")
     if sourceLanguage not in whisperSupportedLanguageList:
          return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
     if targetLanguage not in whisperSupportedLanguageList:
@@ -1215,7 +1335,7 @@ def doubleTransciption():
     text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)
     transText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=targetLanguage)
     et=time.time()
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     return jsonify({'text': text.text,'translatedText':transText.text,'zhText':filterText.text}), 200
 
 
@@ -1227,12 +1347,12 @@ def multitranscription():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/api/whisper/multitranscription user:{current_user} id:{id}")
+    logger.info(f"/api/whisper/multitranscription user:{current_user} id:{id}")
     file=request.files['file']
     params=request.form.to_dict()
     sourceLanguage=params["sourceLanguage"]
     emojiOutput=params.get("emojiOutput",'true')
-    app.logger.info(f"sourceLanguage:{sourceLanguage}")
+    logger.info(f"sourceLanguage:{sourceLanguage}")
     if sourceLanguage not in whisperSupportedLanguageList:
         return jsonify({'message':f"sourceLanguage error,please use following languages:{str(whisperSupportedLanguageList)}"}), 401
     if file.mimetype not in ['audio/wav','audio/opus']:
@@ -1252,7 +1372,7 @@ def multitranscription():
         if  text['text']=='。' or text['text']=='': return jsonify({'text': "",'message':"filtered"}), 200
 
     et=time.time()
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     return jsonify({'text': text['text'] if sourceLanguage=='zh' else text.text}), 200
 
 
@@ -1263,14 +1383,14 @@ def tts_proxy():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/api/func/tts user:{current_user} id:{id}")
+    logger.info(f"/api/func/tts user:{current_user} id:{id}")
     try:
         # 获取请求参数
         data = request.get_json()
         text = data.get('input')
         voice = data.get('voice')
         speed = data.get('speed')
-        app.logger.info(f"{text},{voice},{speed}")
+        logger.info(f"{text},{voice},{speed}")
         # 验证必要参数
         if not text or not voice or not speed:
             
@@ -1284,7 +1404,7 @@ def tts_proxy():
             "voice": voice,
             "speed": speed
         }
-        app.logger.info(f"{ttsUrl}:{ttsToken}")
+        logger.info(f"{ttsUrl}:{ttsToken}")
         # 发起转发请求
         response = requests.post(
             ttsUrl,
@@ -1301,7 +1421,7 @@ def tts_proxy():
                 if chunk:
                     yield chunk
         et=time.time()
-        app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+        logger.info(f"user:{current_user} id:{id} time:{et-st}")
         return Response(
             generate(),
             content_type=response.headers['Content-Type'],
@@ -1318,7 +1438,7 @@ def web_translate():
     current_user = get_jwt_identity()
     id=str(uuid.uuid4())
     st=time.time()
-    app.logger.info(f"/api/func/web_translate user:{current_user} id:{id}")
+    logger.info(f"/api/func/web_translate user:{current_user} id:{id}")
     # 获取请求参数
     data = request.get_json()
     text = data.get('text')
@@ -1339,7 +1459,7 @@ def web_translate():
     if targetLanguage3 != "none": transText3=do_translate(text, from_=sourceLanguage,to=targetLanguage3)
         
     et=time.time()
-    app.logger.info(f"user:{current_user} id:{id} time:{et-st}")
+    logger.info(f"user:{current_user} id:{id} time:{et-st}")
     return jsonify({'text':text,'translatedText':transText,'translatedText2':transText2,'translatedText3':transText3}), 200
 
 def packaged_opus_stream_to_wav_bytes(

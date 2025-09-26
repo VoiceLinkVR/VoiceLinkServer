@@ -22,18 +22,23 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     WHISPER_MODEL: str = "Systran/faster-whisper-large-v3"
     SQL_PATH: str = f"sqlite:///{project_root}/data/db/users.db"
+    SQL_POOL_SIZE: int = 50
+    SQL_MAX_OVERFLOW: int = 150
+    SQL_POOL_RECYCLE: int = 3600
     FILTER_WEB_URL: Optional[str] = "https://raw.githubusercontent.com/VoiceLinkVR/VoiceLinkServer/refs/heads/main/src/filter.json"
     LIMIT_ENABLE: bool = True
     LIMIT_PUBLIC_TEST_USER: Optional[str] = None
-    SQLALCHEMY_DATABASE_URL: str = SQL_PATH
     ENABLE_WEB_TRANSLATORS: bool = False
     TRANSLATOR_SERVICE: str = "alibaba"
+    TRANSLATOR_SERVICES_LIST: str = "bing,iciba,alibaba,MyMemory,google"  # 翻译供应商列表，按优先级排序
+    TRANSLATION_TIMEOUT: int = 1  # 翻译请求超时时间（秒）
     LIMITER_REDIS_URL: Optional[str] = "redis://localhost:6379/0"
     TTS_URL: Optional[str] = None
     TTS_TOKEN: Optional[str] = None
     LATEST_VERSION: Optional[str] = None
     PACKAGE_BASE_URL: Optional[str] = None
     PACKAGE_TYPE: Optional[str] = None
+    
 
     class Config:
         env_file = ".env"

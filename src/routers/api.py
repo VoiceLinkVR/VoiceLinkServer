@@ -233,8 +233,8 @@ async def multitranslate_to_other_language(
             transText3 = await translate_local(translated_res.text, 'en', targetLanguage3)
             logger.info(f"[MULTITRANSLATE] 第三目标语言翻译完成: '{transText3}'")
 
-    logger.info(f"[MULTITRANSLATE] 翻译流程完成 - 原文: '{stext}', 主译文: '{transText}', 第二译文: '{transText2}', 第三译文: '{transText3}'")
-    logger.info(f"[MULTITRANSLATE] 多语言翻译请求处理完成 - 用户: {current_user.username}")
+    logger.info(f"[MULTITRANSLATE] 多语言翻译请求处理完成 - 用户: {current_user.username}  原文: '{stext}', 主译文: '{transText}', 第二译文: '{transText2}', 第三译文: '{transText3}'")
+    
     return {'text': stext, 'translatedText': transText, 'translatedText2': transText2, 'translatedText3': transText3}
 
 @router.post("/whisper/multitranscription")

@@ -5,6 +5,7 @@ import html
 import traceback
 import struct
 import wave
+
 from io import BytesIO
 from openai import OpenAI
 import opuslib
@@ -76,9 +77,55 @@ def init_supported_languages():
 # --- 业务逻辑函数 ---
 
 def do_translate(text: str, from_: str, to: str):
-    tol = transalte_zt.get(settings.TRANSLATOR_SERVICE, 'zt') if to == 'zt' else to
+    """
+    多供应商翻译函数，支持故障转移和超时控制
+    使用translator库的timeout参数实现超时控制
+    """
+    # 获取供应商列表
+    services_list = [s.strip() for s in settings.TRANSLATOR_SERVICES_LIST.split(',')]
+
     translators_module = get_translators()
-    return html.unescape(translators_module.translate_text(text, translator=settings.TRANSLATOR_SERVICE, from_language=from_, to_language=tol))
+
+    # 记录开始翻译
+    logger.info(f"[TRANSLATE] 开始翻译 - 原文: '{text[:50]}...', 源语言: {from_}, 目标语言: {to}")
+    logger.debug(f"[TRANSLATE] 供应商列表: {services_list}, 超时时间: {settings.TRANSLATION_TIMEOUT}秒")
+
+    # 依次尝试每个供应商
+    for i, service in enumerate(services_list):
+        try:
+            logger.info(f"[TRANSLATE] 尝试供应商 {i+1}/{len(services_list)}: {service}")
+
+            # 处理繁体中文映射
+            to_language = transalte_zt.get(service, 'zt') if to == 'zt' else to
+
+            # 执行翻译，使用内置timeout参数
+            result = translators_module.translate_text(
+                text,
+                translator=service,
+                from_language=from_,
+                to_language=to_language,
+                timeout=settings.TRANSLATION_TIMEOUT  # 使用内置超时参数
+            )
+
+            result = html.unescape(result)
+            logger.info(f"[TRANSLATE] 翻译成功 - 供应商: {service}, 结果: '{result[:50]}...'")
+            return result
+
+        except Exception as e:
+            logger.warning(f"[TRANSLATE] 供应商 {service} 失败: {type(e).__name__}: {e}")
+
+            # 如果是最后一个供应商，记录错误并返回原文
+            if i == len(services_list) - 1:
+                logger.error(f"[TRANSLATE] 所有供应商都失败，返回原文 - 已尝试: {services_list}")
+                return text
+
+            # 继续尝试下一个供应商
+            logger.info(f"[TRANSLATE] 切换到下一个供应商")
+            continue
+
+    # 所有供应商都失败，返回原文
+    logger.error(f"[TRANSLATE] 翻译失败，所有供应商不可用 - 返回原文")
+    return text
 
 async def translate_local(text: str, source: str, target: str) -> str:
     params = {

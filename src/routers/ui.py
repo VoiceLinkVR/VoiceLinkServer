@@ -11,7 +11,7 @@ from db.models import User, RequestLog
 from core.logging_config import logger
 
 router = APIRouter()
-templates = Jinja2Templates(directory="src/templates")
+templates = Jinja2Templates(directory="templates")
 
 @router.get("/login", response_class=HTMLResponse)
 async def login_ui_get(request: Request):

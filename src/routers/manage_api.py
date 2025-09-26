@@ -1,88 +1,68 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.orm import Session
-from core.dependencies import get_db, get_current_user
+from pydantic import BaseModel
+from typing import Dict
+
+from core.dependencies import get_db, get_current_user, get_current_admin_user, hash_password
 from db.models import User
 
 router = APIRouter()
 
-@router.get("/users")
-async def get_users(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # 检查是否为管理员
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
+class UserCredentials(BaseModel):
+    username: str
+    password: str
 
-    users = db.query(User).all()
-    return {"users": users}
+class UserDelete(BaseModel):
+    username: str
 
-@router.post("/users")
-async def create_user(
-    username: str,
-    password: str,
-    is_admin: bool = False,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
+@router.post("/registerAdmin")
+async def register_admin(creds: UserCredentials, db: Session = Depends(get_db)):
+    admin_count = db.query(User).filter_by(is_admin=True).count()
+    if admin_count != 0:
+        # 如果已有管理员，需要管理员权限来创建新管理员
+        # 此处简化为直接调用 get_current_admin_user，它会进行JWT验证和权限检查
+        # 注意：这需要客户端在请求头中提供一个已存在的管理员的JWT
+        try:
+            await get_current_admin_user(await get_current_user(db=db))
+        except HTTPException:
+             raise HTTPException(status_code=403, detail="An admin already exists. Admin rights required to create another.")
 
-    # 检查用户是否已存在
-    existing_user = db.query(User).filter(User.username == username).first()
-    if existing_user:
+    if db.query(User).filter_by(username=creds.username).first():
         raise HTTPException(status_code=400, detail="Username already exists")
 
-    # 创建新用户
-    from core.dependencies import pwd_context
-    new_user = User(
-        username=username,
-        password=pwd_context.hash(password),
-        is_admin=is_admin,
-        is_active=True
-    )
+    hashed_password = hash_password(creds.password)
+    new_admin = User(username=creds.username, password=hashed_password, is_admin=True, is_active=True)
+    db.add(new_admin)
+    db.commit()
+    return {"message": "AdminUser created successfully"}
+
+@router.post("/changePassword")
+async def change_password(creds: UserCredentials, admin: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    user_to_change = db.query(User).filter_by(username=creds.username).first()
+    if not user_to_change:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_to_change.password = hash_password(creds.password)
+    db.commit()
+    return {"message": f"user:{creds.username}, Password changed successfully"}
+
+@router.post("/register")
+async def register(creds: UserCredentials, admin: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    if db.query(User).filter_by(username=creds.username).first():
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    hashed_password = hash_password(creds.password)
+    new_user = User(username=creds.username, password=hashed_password, is_admin=False, is_active=True)
     db.add(new_user)
     db.commit()
-    db.refresh(new_user)
+    return {"message": "User created successfully"}
 
-    return {"message": "User created successfully", "user_id": new_user.id}
+@router.post("/deleteUser")
+async def delete_user(user_data: UserDelete, admin: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    user_to_delete = db.query(User).filter_by(username=user_data.username).first()
+    if not user_to_delete:
+        raise HTTPException(status_code=400, detail="Username not exist")
 
-@router.put("/users/{user_id}")
-async def update_user(
-    user_id: int,
-    is_active: bool = None,
-    is_admin: bool = None,
-    limit_rule: str = None,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    if is_active is not None:
-        user.is_active = is_active
-    if is_admin is not None:
-        user.is_admin = is_admin
-    if limit_rule is not None:
-        user.limit_rule = limit_rule
-
-    db.commit()
-    return {"message": "User updated successfully"}
-
-@router.delete("/users/{user_id}")
-async def delete_user(
-    user_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    db.delete(user)
+    db.delete(user_to_delete)
     db.commit()
     return {"message": "User deleted successfully"}

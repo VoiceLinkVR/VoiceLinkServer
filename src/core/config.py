@@ -1,5 +1,6 @@
 import os
 from pydantic_settings import BaseSettings
+from typing import Optional
 
 # 获取当前文件的目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,23 +17,23 @@ class Settings(BaseSettings):
     LIBRETRANSLATE_PORT: int = 5000
     LIBRETRANSLATE_APIKEY: str = ""
     JWT_SECRET_KEY: str = "wVLAF_13N6XL_QmP.DjkKsV"
-    FLASK_SECRET_KEY: str = "wVddLAF_13dsdddN6XL_QmP.DjkKsV"  # For session middleware
+    SESSION_SECRET_KEY: str = "wVddLAF_13dsdddN6XL_QmP.DjkKsV"
     JWT_ACCESS_TOKEN_EXPIRES_MINUTES: int = 10080  # 7 days
     JWT_ALGORITHM: str = "HS256"
     WHISPER_MODEL: str = "Systran/faster-whisper-large-v3"
     SQL_PATH: str = f"sqlite:///{project_root}/data/db/users.db"
-    FILTER_WEB_URL: str | None = "https://raw.githubusercontent.com/VoiceLinkVR/VoiceLinkServer/refs/heads/main/src/filter.json"
+    FILTER_WEB_URL: Optional[str] = "https://raw.githubusercontent.com/VoiceLinkVR/VoiceLinkServer/refs/heads/main/src/filter.json"
     LIMIT_ENABLE: bool = True
-    LIMIT_PUBLIC_TEST_USER: str | None = None
+    LIMIT_PUBLIC_TEST_USER: Optional[str] = None
     SQLALCHEMY_DATABASE_URL: str = SQL_PATH
     ENABLE_WEB_TRANSLATORS: bool = False
     TRANSLATOR_SERVICE: str = "alibaba"
-    LIMITER_REDIS_URL: str | None = "redis://localhost:6379/0"
-    TTS_URL: str | None = None
-    TTS_TOKEN: str | None = None
-    LATEST_VERSION: str | None = None
-    PACKAGE_BASE_URL: str | None = None
-    PACKAGE_TYPE: str | None = None
+    LIMITER_REDIS_URL: Optional[str] = "redis://localhost:6379/0"
+    TTS_URL: Optional[str] = None
+    TTS_TOKEN: Optional[str] = None
+    LATEST_VERSION: Optional[str] = None
+    PACKAGE_BASE_URL: Optional[str] = None
+    PACKAGE_TYPE: Optional[str] = None
 
     class Config:
         env_file = ".env"

@@ -8,7 +8,7 @@ pymysql
 
 # Authentication & Security
 python-jose[cryptography]
-passlib[bcrypt]
+werkzeug  # 使用Werkzeug进行密码哈希（与原有server.py保持一致）
 
 # Rate Limiting
 slowapi
@@ -39,6 +39,12 @@ python-multipart
 # Redis client for rate limiter
 redis
 
+# Session management
 itsdangerous
 
+# Configuration management
 pydantic-settings
+
+# Additional utilities
+python-multipart
+aiofiles

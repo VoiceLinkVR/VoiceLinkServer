@@ -158,9 +158,9 @@
 <body>
  <!-- 新增导航栏 -->
   <nav class="nav">
-    <a href="{{ url_for('manage_users_ui') }}">用户管理</a>
-    <a href="{{ url_for('stats_ui') }}">使用统计</a>
-    <a href="{{ url_for('logout_ui') }}">退出登录</a>
+    <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
+    <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
+    <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
   </nav>
 
     <!-- 左侧表单区 -->
@@ -207,9 +207,11 @@
             <button type="submit" style="width: 100%;margin-top: 15px;">Submit</button>
         </form>
 
-        {% for message in get_flashed_messages() %}
-            <div class="alert">{{ message }}</div>
-        {% endfor %}
+        {% if messages %}
+            {% for message in messages %}
+                <div class="alert">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
     </div>
 
     <!-- 右侧用户列表 -->
@@ -227,7 +229,7 @@
                             Expires: {{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else 'Never' }}
                         </div>
                     </div>
-                    <form action="{{ url_for('delete_user_ui') }}" method="post">
+                    <form action="{{ request.url_for('delete_user_ui') }}" method="post">
                         <input type="hidden" name="id" value="{{user.id}}">
                         <button type="submit" style="background: #dc3545;">Delete</button>
                     </form>

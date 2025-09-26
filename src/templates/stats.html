@@ -41,15 +41,15 @@ td:nth-child(6) {
     </style>
     <script>
         function loadStats(hour) {
-            window.location.href = "{{ url_for('stats_ui') }}?hour=" + encodeURIComponent(hour);
+            window.location.href = "{{ request.url_for('stats_ui') }}?hour=" + encodeURIComponent(hour);
         }
     </script>
 </head>
 <body>
     <div class="nav">
-        <a href="{{ url_for('manage_users_ui') }}">用户管理</a>
-        <a href="{{ url_for('stats_ui') }}">使用统计</a>
-        <a href="{{ url_for('logout_ui') }}">退出登录</a>
+        <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
+        <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
+        <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
     </div>
     <!-- 添加自动刷新选项 -->
     <div class="auto-refresh">

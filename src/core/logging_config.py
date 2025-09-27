@@ -13,6 +13,20 @@ def setup_logging():
     log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     detailed_format = '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName)s() - %(message)s'
 
+    # --- 关键修改：控制第三方库的日志级别 ---
+    # 将一些特别嘈杂的库的日志级别设置为 WARNING，以屏蔽它们的 DEBUG 和 INFO 消息
+    noisy_libraries = [
+        "httpx",
+        "httpcore",
+        "openai",
+        "anyio",
+        "h11",
+    ]
+    for lib_name in noisy_libraries:
+        logging.getLogger(lib_name).setLevel(logging.INFO)
+    # -----------------------------------------
+
+
     # 创建logger
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)

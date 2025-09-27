@@ -140,7 +140,10 @@ async def stats_ui(request: Request, hour: Optional[str] = None, db: Session = D
             func.sum(case((RequestLog.status == 'failed', 1), else_=0)).label('fail_count'),
             func.sum(case((RequestLog.status == 'rate_limited', 1), else_=0)).label('rate_limited_count'),
             func.count().label('total_count')
-        ).filter(hour_expr == selected_hour).group_by(RequestLog.username, RequestLog.ip, RequestLog.endpoint)
+        ).filter(
+            hour_expr == selected_hour,
+            RequestLog.endpoint.notin_(['/api/login', '/api/latestVersionInfo'])
+        ).group_by(RequestLog.username, RequestLog.ip, RequestLog.endpoint)
         hourly_stats = hourly_query.all()
         total_success = sum(s.success_count for s in hourly_stats)
         total_fail = sum(s.fail_count for s in hourly_stats)

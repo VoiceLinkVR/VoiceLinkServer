@@ -1113,6 +1113,7 @@ def multitranslateToOtherLanguage():
         
     else:
         filterText=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language="zh")
+        if filterText.text == '': return jsonify({'text': "",'message':"filtered"}), 200
         if(filterText.text in errorFilter["errorResultDict"]) or any(errorKey in filterText.text for errorKey in errorFilter["errorKeyString"]):
             return jsonify({'text': "",'message':"filtered"}), 200
         text=whisperclient.audio.transcriptions.create(model=model, file=audiofile,language=sourceLanguage)

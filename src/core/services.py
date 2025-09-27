@@ -49,20 +49,54 @@ transalte_zt = {'bing':'zh-Hant','baidu':'cht','alibaba':'zh-TW','sogou':'zh-CHT
 def load_filter_config():
     global errorFilter
     filter_path = os.path.join(os.path.dirname(__file__), '..', 'filter.json')
+
     try:
-        if settings.FILTER_WEB_URL:
-            with httpx.Client() as client:
-                response = client.get(settings.FILTER_WEB_URL)
-                response.raise_for_status()
-                errorFilter = response.json()
-                logger.info("Successfully loaded filter config from web.")
-        else:
-            raise Exception("FILTER_WEB_URL not set")
-    except Exception as e:
-        logger.warning(f"Failed to load filter from web, falling back to local file. Error: {e}")
+        # 首先加载本地配置
         with open(filter_path, 'r', encoding='utf-8') as f:
-            errorFilter = json.load(f)
-            logger.info("Loaded filter config from local file.")
+            local_config = json.load(f)
+            logger.info("Loaded local filter config.")
+
+        # 如果配置了网络URL，尝试获取网络配置并合并
+        if settings.FILTER_WEB_URL:
+            try:
+                with httpx.Client(timeout=10.0) as client:
+                    response = client.get(settings.FILTER_WEB_URL)
+                    response.raise_for_status()
+                    web_config = response.json()
+
+                    # 合并配置：网络配置优先，补充本地配置
+                    merged_config = {
+                        "errorResultDict": list(set(web_config.get("errorResultDict", []) + local_config.get("errorResultDict", []))),
+                        "errorKeyString": list(set(web_config.get("errorKeyString", []) + local_config.get("errorKeyString", [])))
+                    }
+                    
+                    # 不要重新赋值，而是清空并更新原始字典
+                    errorFilter.clear()
+                    errorFilter.update(merged_config)
+                    
+                    logger.info("Successfully merged filter config from web and local.")
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to load filter from web, using local config. Error: {e}")
+        # 使用本地配置
+        errorFilter.clear()
+        errorFilter.update(local_config)
+        logger.info("Using local filter config.")
+
+    except Exception as e:
+        logger.error(f"Failed to load filter config: {e}")
+        # 设置默认空配置
+        errorFilter = {"errorResultDict": [], "errorKeyString": []}
+        logger.warning("Using empty filter config due to load failure.")
+
+def update_filter_config():
+    """定时更新filter配置的函数"""
+    logger.info("开始检查filter配置更新...")
+    try:
+        load_filter_config()
+        logger.info(f"Filter配置更新完成，当前规则数: errorResultDict={len(errorFilter.get('errorResultDict', []))}, errorKeyString={len(errorFilter.get('errorKeyString', []))}")
+    except Exception as e:
+        logger.error(f"Filter配置更新失败: {e}")
 
 def init_supported_languages():
     """

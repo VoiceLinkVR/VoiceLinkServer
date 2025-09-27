@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     ENABLE_WEB_TRANSLATORS: bool = False
     TRANSLATOR_SERVICE: str = "alibaba"
     TRANSLATOR_SERVICES_LIST: str = "bing,iciba,alibaba,MyMemory,google"  # 翻译供应商列表，按优先级排序
-    TRANSLATION_TIMEOUT: int = 1  # 翻译请求超时时间（秒）
+    TRANSLATION_TIMEOUT: float = 1.5  # 翻译请求超时时间（秒）
     LIMITER_REDIS_URL: Optional[str] = "redis://localhost:6379/0"
     TTS_URL: Optional[str] = None
     TTS_TOKEN: Optional[str] = None

@@ -11,7 +11,7 @@ from sqlalchemy import inspect
 
 from core.config import settings
 from core.logging_config import logger
-from core.services import load_filter_config, init_supported_languages
+from core.services import load_filter_config, update_filter_config, init_supported_languages
 from db.base import Base, engine, SessionLocal
 from db.models import User, RequestLog
 from routers import api, ui, manage_api
@@ -62,6 +62,8 @@ async def lifespan(app: FastAPI):
     load_filter_config()
     init_supported_languages()
     scheduler.add_job(check_user_expiration, 'cron', hour=0, minute=0, second=0)
+    # 添加每周一凌晨3点检查filter配置更新的任务
+    scheduler.add_job(update_filter_config, 'cron', day_of_week=0, hour=3, minute=0, second=0)
     scheduler.start()
     logger.info("后台任务调度器已启动")
     yield

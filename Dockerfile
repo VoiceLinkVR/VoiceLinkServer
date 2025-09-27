@@ -14,7 +14,7 @@ COPY ./src/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ./src .
-
+COPY run.py .
 EXPOSE 8980
 
 # 环境变量保持不变
@@ -27,4 +27,4 @@ ENV TRANSLATOR_SERVICE=alibaba
 ENV SQL_PATH=sqlite:////usr/src/app/data/db/users.db
 
 # 使用 Uvicorn 启动 - main.py 在工作目录中
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8980" , "--workers", "4"]
+CMD ["python", "run.py"]

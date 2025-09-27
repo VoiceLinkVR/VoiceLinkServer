@@ -185,7 +185,7 @@ async def multitranslate_to_other_language(
         filter_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language="zh")
         logger.info(f"[MULTITRANSLATE] 中文过滤检测结果: '{filter_res.text}'")
         if (filter_res.text in errorFilter.get("errorResultDict", [])) or any(key in filter_res.text for key in errorFilter.get("errorKeyString", [])):
-            logger.warning(f"[MULTITRANSLATE] 内容被过滤规则拦截")
+            logger.warning(f"[MULTITRANSLATE] 内容被过滤规则拦截 检测内容: '{filter_res.text}'")
             return {"text": "", "message": "filtered"}
         logger.debug(f"[MULTITRANSLATE] 进行{sourceLanguage}语言识别")
         text_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language=sourceLanguage)
@@ -234,7 +234,7 @@ async def multitranslate_to_other_language(
             logger.info(f"[MULTITRANSLATE] 第三目标语言翻译完成: '{transText3}'")
 
     logger.info(f"[MULTITRANSLATE] 多语言翻译请求处理完成 - 用户: {current_user.username}  原文: '{stext}', 主译文: '{transText}', 第二译文: '{transText2}', 第三译文: '{transText3}'")
-    
+
     return {'text': stext, 'translatedText': transText, 'translatedText2': transText2, 'translatedText3': transText3}
 
 @router.post("/whisper/multitranscription")

@@ -2,6 +2,7 @@ import os
 import logging
 import logging.handlers
 from datetime import datetime
+from core.config import settings
 
 def setup_logging():
     """配置详细日志系统"""
@@ -27,13 +28,16 @@ def setup_logging():
     # -----------------------------------------
 
 
+    # 获取日志级别配置，默认为INFO
+    log_level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+
     # 创建logger
     logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(log_level)
 
     # 控制台处理器
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(log_level)
     console_formatter = logging.Formatter(log_format)
     console_handler.setFormatter(console_formatter)
 
@@ -42,7 +46,7 @@ def setup_logging():
     main_handler = logging.handlers.RotatingFileHandler(
         main_log_file, maxBytes=50*1024*1024, backupCount=40, encoding='utf-8'
     )
-    main_handler.setLevel(logging.INFO)
+    main_handler.setLevel(log_level)
     main_formatter = logging.Formatter(detailed_format)
     main_handler.setFormatter(main_formatter)
 

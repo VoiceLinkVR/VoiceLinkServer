@@ -8,10 +8,12 @@ from starlette.middleware.sessions import SessionMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import text
 from sqlalchemy import inspect
-
+from jose import jwt
 from core.config import settings
 from core.logging_config import logger
 from core.services import load_filter_config, update_filter_config, init_supported_languages
+from core.rate_limiter import rate_limiter, RateLimitExceeded, get_client_ip
+from core.dependencies import oauth2_scheme, get_db
 from db.base import Base, engine, SessionLocal
 from db.models import User, RequestLog
 from routers import api, ui, manage_api
@@ -77,61 +79,104 @@ app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET_KEY)
 async def request_logging_middleware(request: Request, call_next):
     start_time = time.time()
     log_data = {'status': 'failed'}
+    request.state.rate_limit_contexts = []
 
-    # 尝试解析JWT获取用户名
+    client_ip = get_client_ip(request)
     current_user = "anonymous"
+
+    db_gen = None
+    db = None
+    response = None
+    response_status_code = 500
+    rate_limit_triggered = False
+
     try:
-        from core.dependencies import oauth2_scheme, get_db
-        from jose import jwt
         db_gen = get_db()
         db = next(db_gen)
-        token = await oauth2_scheme(request)
-        if token:
-            payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-            current_user = payload.get("sub", "anonymous")
-    except Exception:
-        pass # 如果token无效或不存在，则保持匿名
-
-    # 获取IP地址
-    x_real_ip = request.headers.get('x-real-ip')
-    x_forwarded_for = request.headers.get('x-forwarded-for')
-    if x_real_ip:
-        ip = x_real_ip.split(',')[0].strip()
-    elif x_forwarded_for:
-        ip = x_forwarded_for.split(',')[0].strip()
-    else:
-        ip = request.client.host if request.client else "unknown"
-
-    logger.info(f"[API-START] 用户: {current_user}, IP: {ip}, 接口: {request.url.path}, 方法: {request.method}")
+    except Exception as db_exc:
+        logger.error(f"[DB-ERROR] 获取会话失败: {db_exc}")
 
     try:
+        token = await oauth2_scheme(request)
+        if token and db:
+            payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+            username = payload.get("sub")
+            if username:
+                user = db.query(User).filter(User.username == username).first()
+                if user:
+                    current_user = user.username
+        logger.info(f"[API-START] 用户: {current_user}, IP: {client_ip}, 接口: {request.url.path}, 方法: {request.method}")
+
+        default_context = rate_limiter.create_default_context(request)
+        if default_context:
+            default_context.check()
+            request.state.rate_limit_contexts.append(default_context)
+
         response = await call_next(request)
+        response_status_code = response.status_code
         log_data['duration'] = time.time() - start_time
-        status_code = response.status_code
-        log_data['status'] = 'success' if 200 <= status_code < 400 else 'failed'
-        if status_code == 429: log_data['status'] = 'rate_limited'
-        logger.info(f"[API-END] 用户: {current_user}, 接口: {request.url.path}, 状态码: {status_code}, 耗时: {log_data['duration']:.3f}s")
-        return response
+        if response_status_code == 429 or response_status_code == 430:
+            log_data['status'] = 'rate_limited'
+        elif 200 <= response_status_code < 400:
+            log_data['status'] = 'success'
+        else:
+            log_data['status'] = 'failed'
+        logger.info(f"[API-END] 用户: {current_user}, 接口: {request.url.path}, 状态码: {response_status_code}, 耗时: {log_data['duration']:.3f}s")
+
+    except RateLimitExceeded as limit_exc:
+        rate_limit_triggered = True
+        response_status_code = 430
+        log_data['duration'] = time.time() - start_time
+        log_data['status'] = 'rate_limited'
+        logger.warning(
+            f"[RATE-LIMIT] 用户: {current_user}, IP: {client_ip}, "
+            f"全局规则: {limit_exc.limit}, 触发规则: {limit_exc.triggered_limit}"
+        )
+        response = JSONResponse(
+            status_code=430,
+            content={
+                "error": "Too many request",
+                "LimitRules": limit_exc.limit,  # 原始多条规则
+                "limit": limit_exc.triggered_limit  # 真正超限的那一条
+            },
+        )
+
     except Exception as e:
+        response_status_code = 500
         log_data['duration'] = time.time() - start_time
         log_data['status'] = 'error'
         logger.error(f"[API-ERROR] 用户: {current_user}, 接口: {request.url.path}, 错误: {e}")
         logger.exception("API处理异常:")
-        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+        response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
     finally:
-        log = RequestLog(
-            username=current_user if current_user != "anonymous" else None,
-            ip=ip, endpoint=request.url.path, duration=log_data.get('duration', 0),
-            status=log_data.get('status', 'failed')
-        )
+        if rate_limiter.enabled and not rate_limit_triggered:
+            status_for_limits = response_status_code or 500
+            for context in getattr(request.state, "rate_limit_contexts", []):
+                if context.should_deduct(status_for_limits):
+                    context.commit()
+
+        session_for_log = db or SessionLocal()
         try:
-            db.add(log)
-            db.commit()
-        except Exception as db_e:
-            db.rollback()
+            log = RequestLog(
+                username=current_user if current_user != "anonymous" else None,
+                ip=client_ip,
+                endpoint=request.url.path,
+                duration=log_data.get('duration', 0),
+                status=log_data.get('status', 'failed')
+            )
+            session_for_log.add(log)
+            session_for_log.commit()
+        except Exception as db_e:  # pylint: disable=broad-except
+            session_for_log.rollback()
             logger.error(f"[DB-ERROR] 日志提交失败: {db_e}")
         finally:
-            next(db_gen, None) # 关闭 db session
+            if db is None:
+                session_for_log.close()
+            if db_gen is not None:
+                db_gen.close()
+
+    return response
 
 # 包含路由
 app.include_router(ui.router, prefix="/ui", tags=["UI"])

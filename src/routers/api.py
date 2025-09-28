@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, Dict
 
-from core.dependencies import get_db, create_access_token, verify_password, get_current_user
+from core.dependencies import get_db, create_access_token, verify_password
+from core.rate_limiter import enforce_user_rate_limit
 from core.config import settings
 from db.models import User
 from core.services import (
@@ -57,7 +58,7 @@ async def latest_version_info():
     raise HTTPException(status_code=460, detail="version not defined")
 
 @router.post("/whisper/transcriptions")
-async def whisper_transcriptions(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+async def whisper_transcriptions(file: UploadFile = File(...), current_user: User = Depends(enforce_user_rate_limit)):
     audio_file = await file.read()
     res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language='zh')
     text = res.text
@@ -66,7 +67,7 @@ async def whisper_transcriptions(file: UploadFile = File(...), current_user: Use
     return {"text": text}
 
 @router.post("/whisper/translations")
-async def whisper_translations(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+async def whisper_translations(file: UploadFile = File(...), current_user: User = Depends(enforce_user_rate_limit)):
     audio_file = await file.read()
     res = whisperclient.audio.translations.create(model=settings.WHISPER_MODEL, file=audio_file)
     text = res.text
@@ -80,12 +81,12 @@ class LibreTranslateRequest(BaseModel):
     text: str
 
 @router.post("/libreTranslate")
-async def libre_translate(data: LibreTranslateRequest, current_user: User = Depends(get_current_user)):
+async def libre_translate(data: LibreTranslateRequest, current_user: User = Depends(enforce_user_rate_limit)):
     res = await translate_local(data.text, data.source, data.target)
     return {"text": res}
 
 @router.post("/func/translateToEnglish")
-async def translate_to_english(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+async def translate_to_english(file: UploadFile = File(...), current_user: User = Depends(enforce_user_rate_limit)):
     audio_file = await file.read()
     text_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language='zh')
     text = text_res.text
@@ -99,7 +100,7 @@ async def translate_to_english(file: UploadFile = File(...), current_user: User 
     return {"text": text, "translatedText": translated_text}
 
 @router.post("/func/translateToOtherLanguage")
-async def translate_to_other_language(file: UploadFile = File(...), targetLanguage: str = Form(...), current_user: User = Depends(get_current_user)):
+async def translate_to_other_language(file: UploadFile = File(...), targetLanguage: str = Form(...), current_user: User = Depends(enforce_user_rate_limit)):
     # supportedLanguagesList 现在是硬编码的固定列表，不需要动态初始化
 
     if targetLanguage not in supportedLanguagesList:
@@ -130,7 +131,7 @@ async def multitranslate_to_other_language(
     targetLanguage2: str = Form("none"),
     targetLanguage3: str = Form("none"),
     emojiOutput: str = Form('true'),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(enforce_user_rate_limit)
 ):
     # supportedLanguagesList 现在是硬编码的固定列表，不需要动态初始化
     logger.info(f"[MULTITRANSLATE] 开始多语言翻译请求 - 用户: {current_user.username}, 文件: {file.filename}, 大小: {len(file.file.read()) if hasattr(file, 'file') else 'unknown'} bytes")
@@ -242,7 +243,7 @@ async def multitranscription(
     file: UploadFile = File(...),
     sourceLanguage: str = Form(...),
     emojiOutput: str = Form('true'),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(enforce_user_rate_limit)
 ):
     if sourceLanguage not in whisperSupportedLanguageList:
         raise HTTPException(status_code=401, detail="sourceLanguage error")
@@ -275,7 +276,7 @@ class TTSRequest(BaseModel):
     speed: float
 
 @router.post("/func/tts")
-async def tts_proxy(data: TTSRequest, current_user: User = Depends(get_current_user)):
+async def tts_proxy(data: TTSRequest, current_user: User = Depends(enforce_user_rate_limit)):
     if not settings.TTS_URL or not settings.TTS_TOKEN:
         raise HTTPException(status_code=500, detail="TTS service not configured")
     payload = {"model": "tts-1", "input": data.input, "voice": data.voice, "speed": data.speed}
@@ -293,7 +294,7 @@ class WebTranslateRequest(BaseModel):
     targetLanguage3: str = "none"
 
 @router.post("/func/webtranslate")
-async def web_translate(data: WebTranslateRequest, current_user: User = Depends(get_current_user)):
+async def web_translate(data: WebTranslateRequest, current_user: User = Depends(enforce_user_rate_limit)):
     transText = do_translate(data.text, data.sourceLanguage, data.targetLanguage)
     transText2 = ''
     transText3 = ''

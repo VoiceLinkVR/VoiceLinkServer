@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     LATEST_VERSION: Optional[str] = None
     PACKAGE_BASE_URL: Optional[str] = None
     PACKAGE_TYPE: Optional[str] = None
+    LOG_LEVEL: str = "INFO"  # 日志级别，支持 DEBUG, INFO, WARNING, ERROR, CRITICAL
     
 
     class Config:

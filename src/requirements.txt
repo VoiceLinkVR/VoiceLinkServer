@@ -12,6 +12,7 @@ werkzeug  # 使用Werkzeug进行密码哈希（与原有server.py保持一致）
 
 # Rate Limiting
 slowapi
+limits>=3.10.1
 
 # Async HTTP Client (替代 requests)
 httpx
@@ -48,3 +49,4 @@ pydantic-settings
 # Additional utilities
 python-multipart
 aiofiles
+coredis

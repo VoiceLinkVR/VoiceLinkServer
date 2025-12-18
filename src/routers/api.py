@@ -14,7 +14,7 @@ from db.models import User
 from core.services import (
     whisperclient, errorFilter, do_translate, translate_local,
     supportedLanguagesList, whisperSupportedLanguageList, SENSEVOICE_URL, packaged_opus_stream_to_wav_bytes,
-    glm_client, codeTochinese
+    glm_client, codeTochinese, compress_repeated_chars
 )
 from core.logging_config import logger
 # 导入用于接收JSON体的Pydantic模型
@@ -64,6 +64,9 @@ async def whisper_transcriptions(file: UploadFile = File(...), current_user: Use
     text = res.text
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
+    # 压缩重复字符
+    if settings.ENABLE_TEXT_COMPRESSION:
+        text = compress_repeated_chars(text, settings.TEXT_COMPRESSION_MIN_REPEAT)
     return {"text": text}
 
 @router.post("/whisper/translations")
@@ -73,6 +76,9 @@ async def whisper_translations(file: UploadFile = File(...), current_user: User 
     text = res.text
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
+    # 压缩重复字符
+    if settings.ENABLE_TEXT_COMPRESSION:
+        text = compress_repeated_chars(text, settings.TEXT_COMPRESSION_MIN_REPEAT)
     return {"text": text}
 
 class LibreTranslateRequest(BaseModel):
@@ -92,6 +98,9 @@ async def translate_to_english(file: UploadFile = File(...), current_user: User 
     text = text_res.text
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
+    # 压缩重复字符
+    if settings.ENABLE_TEXT_COMPRESSION:
+        text = compress_repeated_chars(text, settings.TEXT_COMPRESSION_MIN_REPEAT)
     if settings.ENABLE_WEB_TRANSLATORS:
         translated_text = do_translate(text, from_='zh', to="en")
     else:
@@ -180,6 +189,12 @@ async def multitranslate_to_other_language(
             if stext == '。' or stext == '':
                 logger.info(f"[MULTITRANSLATE] 识别结果为空或只有句号，返回过滤")
                 return {"text": "", "message": "filtered"}
+            # 压缩重复字符
+            if settings.ENABLE_TEXT_COMPRESSION:
+                original_stext = stext
+                stext = compress_repeated_chars(stext, settings.TEXT_COMPRESSION_MIN_REPEAT)
+                if original_stext != stext:
+                    logger.info(f"[MULTITRANSLATE] 压缩重复字符 - 原始: '{original_stext}' -> 处理后: '{stext}'")
     else:
         logger.info(f"[MULTITRANSLATE] 使用Whisper进行{sourceLanguage}语音识别")
         logger.debug(f"[MULTITRANSLATE] 先进行中文过滤检测")
@@ -192,6 +207,12 @@ async def multitranslate_to_other_language(
         text_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language=sourceLanguage)
         stext = text_res.text
         logger.info(f"[MULTITRANSLATE] {sourceLanguage}语音识别结果: '{stext}'")
+        # 压缩重复字符
+        if settings.ENABLE_TEXT_COMPRESSION:
+            original_stext = stext
+            stext = compress_repeated_chars(stext, settings.TEXT_COMPRESSION_MIN_REPEAT)
+            if original_stext != stext:
+                logger.info(f"[MULTITRANSLATE] 压缩重复字符 - 原始: '{original_stext}' -> 处理后: '{stext}'")
 
     transText, transText2, transText3 = '', '', ''
     logger.info(f"[MULTITRANSLATE] 开始翻译流程 - ENABLE_WEB_TRANSLATORS: {settings.ENABLE_WEB_TRANSLATORS}")

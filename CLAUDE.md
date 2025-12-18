@@ -187,3 +187,4 @@ Key environment variables for configuration:
 - **First Admin**: First login creates admin account automatically
 - **User Expiration**: Daily cron job disables expired users at midnight UTC
 - 这个项目不要本地验证，让我手动验证
+- 请不需要执行测试，我会手动测试并将测试结果发给你

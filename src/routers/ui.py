@@ -10,16 +10,40 @@ from core.dependencies import get_db, hash_password, verify_password, get_admin_
 from db.models import User, RequestLog
 from core.logging_config import logger
 
-router = APIRouter()
+router = APIRouter(
+    tags=["UI Management"],
+    responses={404: {"description": "Page not found"}}
+)
 templates = Jinja2Templates(directory="templates")
 
 @router.get("/login", response_class=HTMLResponse)
 async def login_ui_get(request: Request):
+    """
+    显示管理员登录页面。
+
+    Returns:
+        HTMLResponse: 渲染的登录页面，包含任何待显示的消息
+    """
     messages = request.session.pop("flash_messages", [])
     return templates.TemplateResponse("login.html", {"request": request, "messages": messages})
 
 @router.post("/login", response_class=RedirectResponse)
 async def login_ui_post(request: Request, db: Session = Depends(get_db), username: str = Form(...), password: str = Form(...)):
+    """
+    处理管理员登录表单提交。
+
+    如果是首次登录，自动创建管理员用户。
+    验证用户凭据并创建会话。
+
+    Args:
+        request: FastAPI请求对象
+        db: 数据库会话
+        username: 用户名（表单数据）
+        password: 密码（表单数据）
+
+    Returns:
+        RedirectResponse: 成功则重定向到用户管理页面，失败则返回登录页面
+    """
     if db.query(User).filter_by(is_admin=True).count() == 0:
         hashed_password = hash_password(password)
         new_user = User(username=username, password=hashed_password, is_admin=True, is_active=True)
@@ -41,11 +65,35 @@ async def login_ui_post(request: Request, db: Session = Depends(get_db), usernam
 
 @router.get("/logout", response_class=RedirectResponse)
 async def logout_ui(request: Request):
+    """
+    管理员登出。
+
+    清除用户会话并重定向到登录页面。
+
+    Args:
+        request: FastAPI请求对象
+
+    Returns:
+        RedirectResponse: 重定向到登录页面
+    """
     request.session.pop("user_id", None)
     return RedirectResponse(url=request.url_for('login_ui_get'), status_code=303)
 
 @router.get("/manage_users", response_class=HTMLResponse)
 async def manage_users_ui(request: Request, db: Session = Depends(get_db)):
+    """
+    显示用户管理界面。
+
+    需要管理员权限。显示所有用户列表和管理操作界面。
+
+    Args:
+        request: FastAPI请求对象
+        db: 数据库会话
+
+    Returns:
+        HTMLResponse: 用户管理页面，包含用户列表
+        RedirectResponse: 未登录则重定向到登录页面
+    """
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
         return RedirectResponse(url=request.url_for('login_ui_get'))
@@ -56,6 +104,18 @@ async def manage_users_ui(request: Request, db: Session = Depends(get_db)):
 
 @router.post("/manage_users", response_class=RedirectResponse)
 async def manage_users_post(request: Request, db: Session = Depends(get_db)):
+    """
+    处理用户管理表单提交。
+
+    支持新增用户和更新现有用户。需要管理员权限。
+
+    Args:
+        request: FastAPI请求对象
+        db: 数据库会话
+
+    Returns:
+        RedirectResponse: 重定向回用户管理页面
+    """
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
         return RedirectResponse(url=request.url_for('login_ui_get'))
@@ -101,6 +161,18 @@ async def manage_users_post(request: Request, db: Session = Depends(get_db)):
 
 @router.post("/deleteUser", response_class=RedirectResponse)
 async def delete_user_ui(request: Request, db: Session = Depends(get_db)):
+    """
+    删除用户。
+
+    需要管理员权限。从数据库中删除指定用户。
+
+    Args:
+        request: FastAPI请求对象
+        db: 数据库会话
+
+    Returns:
+        RedirectResponse: 重定向回用户管理页面
+    """
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
         return RedirectResponse(url=request.url_for('login_ui_get'))
@@ -116,6 +188,23 @@ async def delete_user_ui(request: Request, db: Session = Depends(get_db)):
 
 @router.get('/stats', response_class=HTMLResponse)
 async def stats_ui(request: Request, hour: Optional[str] = None, db: Session = Depends(get_db)):
+    """
+    显示系统统计信息页面。
+
+    需要管理员权限。显示API使用统计，包括小时统计、每日统计和请求耗时分布。
+
+    Args:
+        request: FastAPI请求对象
+        hour: 可选的小时筛选参数，格式为"YYYY-MM-DD HH:00"
+        db: 数据库会话
+
+    Returns:
+        HTMLResponse: 统计信息页面，包含：
+            - 小时统计：按用户、IP、端点的请求统计
+            - 每日统计：最近7天的请求趋势
+            - 耗时分布：请求响应时间分布
+        RedirectResponse: 未登录则重定向到登录页面
+    """
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user: return RedirectResponse(url=request.url_for('login_ui_get'))
 

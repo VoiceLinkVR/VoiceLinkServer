@@ -15,8 +15,8 @@ from core.dependencies import get_current_user
 from core.logging_config import logger
 from db.models import User
 
-DEFAULT_GLOBAL_LIMIT = "400/hour"
-FALLBACK_USER_LIMIT = "500/day;400/hour"
+DEFAULT_GLOBAL_LIMIT = "3000/hour"
+FALLBACK_USER_LIMIT = "800/day;8/minute"
 SHARED_LIMIT_SCOPE = "shared_limit_scope"
 
 
@@ -174,7 +174,7 @@ async def enforce_user_rate_limit(
     if is_public_test_user:
         context = rate_limiter.create_context(
             limit_string=limit_rule,
-            key=get_client_ip(request),
+            key=f"{get_client_ip(request)}:{datetime.now().strftime('%Y-%m-%d')}",
             scope=SHARED_LIMIT_SCOPE,
             deduct_when=lambda status: True,
         )

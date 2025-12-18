@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     PACKAGE_BASE_URL: Optional[str] = None
     PACKAGE_TYPE: Optional[str] = None
     LOG_LEVEL: str = "INFO"  # 日志级别，支持 DEBUG, INFO, WARNING, ERROR, CRITICAL
+    ENABLE_TEXT_COMPRESSION: bool = True  # 是否启用文本重复字符压缩
+    TEXT_COMPRESSION_MIN_REPEAT: int = 5  # 文本压缩最小重复次数（默认5次）
     
 
     class Config:

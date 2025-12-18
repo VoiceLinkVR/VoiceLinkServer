@@ -12,6 +12,7 @@ import opuslib
 import emoji
 from core.config import settings, WHISPER_URL, SENSEVOICE_URL, LOCAL_TRANS_URL, LOCAL_LANGUAGE_URL
 from core.logging_config import logger
+from core.text_compressor import compress_repeated_chars
 
 # 延迟导入translators，避免初始化时的网络问题
 translators = None

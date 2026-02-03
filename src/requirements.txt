@@ -16,6 +16,7 @@ limits>=3.10.1
 
 # Async HTTP Client (替代 requests)
 httpx
+aiohttp  # translators库异步模式需要
 
 # Web Translators
 translators

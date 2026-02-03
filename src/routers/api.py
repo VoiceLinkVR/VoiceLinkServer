@@ -14,7 +14,8 @@ from db.models import User
 from core.services import (
     whisperclient, errorFilter, do_translate, translate_local,
     supportedLanguagesList, whisperSupportedLanguageList, SENSEVOICE_URL, packaged_opus_stream_to_wav_bytes,
-    glm_client, codeTochinese, compress_repeated_chars
+    glm_client, codeTochinese, compress_repeated_chars, do_multi_translate_async,
+    async_transcribe, async_translate_audio
 )
 from core.logging_config import logger
 # 导入用于接收JSON体的Pydantic模型
@@ -60,8 +61,7 @@ async def latest_version_info():
 @router.post("/whisper/transcriptions")
 async def whisper_transcriptions(file: UploadFile = File(...), current_user: User = Depends(enforce_user_rate_limit)):
     audio_file = await file.read()
-    res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language='zh')
-    text = res.text
+    text = await async_transcribe(audio_file, language='zh')
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
     # 压缩重复字符
@@ -72,8 +72,7 @@ async def whisper_transcriptions(file: UploadFile = File(...), current_user: Use
 @router.post("/whisper/translations")
 async def whisper_translations(file: UploadFile = File(...), current_user: User = Depends(enforce_user_rate_limit)):
     audio_file = await file.read()
-    res = whisperclient.audio.translations.create(model=settings.WHISPER_MODEL, file=audio_file)
-    text = res.text
+    text = await async_translate_audio(audio_file)
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
     # 压缩重复字符
@@ -94,8 +93,7 @@ async def libre_translate(data: LibreTranslateRequest, current_user: User = Depe
 @router.post("/func/translateToEnglish")
 async def translate_to_english(file: UploadFile = File(...), current_user: User = Depends(enforce_user_rate_limit)):
     audio_file = await file.read()
-    text_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language='zh')
-    text = text_res.text
+    text = await async_transcribe(audio_file, language='zh')
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
     # 压缩重复字符
@@ -104,8 +102,7 @@ async def translate_to_english(file: UploadFile = File(...), current_user: User 
     if settings.ENABLE_WEB_TRANSLATORS:
         translated_text = do_translate(text, from_='zh', to="en")
     else:
-        translated_res = whisperclient.audio.translations.create(model=settings.WHISPER_MODEL, file=audio_file)
-        translated_text = translated_res.text
+        translated_text = await async_translate_audio(audio_file)
     return {"text": text, "translatedText": translated_text}
 
 @router.post("/func/translateToOtherLanguage")
@@ -116,8 +113,7 @@ async def translate_to_other_language(file: UploadFile = File(...), targetLangua
         # 与原有server.py保持一致的错误信息格式
         raise HTTPException(status_code=401, detail=f"targetLanguage error, please use following languages: {str(supportedLanguagesList)}")
     audio_file = await file.read()
-    text_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language='zh')
-    text = text_res.text
+    text = await async_transcribe(audio_file, language='zh')
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
 
@@ -125,11 +121,11 @@ async def translate_to_other_language(file: UploadFile = File(...), targetLangua
     if settings.ENABLE_WEB_TRANSLATORS:
         trans_text = do_translate(text, from_='zh', to=targetLanguage)
     else:
-        translated_res = whisperclient.audio.translations.create(model=settings.WHISPER_MODEL, file=audio_file)
+        translated_text = await async_translate_audio(audio_file)
         if targetLanguage == 'en':
-            trans_text = translated_res.text
+            trans_text = translated_text
         else:
-            trans_text = await translate_local(translated_res.text, "en", targetLanguage)
+            trans_text = await translate_local(translated_text, "en", targetLanguage)
     return {"text": text, "translatedText": trans_text}
 
 @router.post("/func/multitranslateToOtherLanguage")
@@ -198,14 +194,13 @@ async def multitranslate_to_other_language(
     else:
         logger.info(f"[MULTITRANSLATE] 使用Whisper进行{sourceLanguage}语音识别")
         logger.debug(f"[MULTITRANSLATE] 先进行中文过滤检测")
-        filter_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language="zh")
-        logger.info(f"[MULTITRANSLATE] 中文过滤检测结果: '{filter_res.text}'")
-        if (filter_res.text in errorFilter.get("errorResultDict", [])) or any(key in filter_res.text for key in errorFilter.get("errorKeyString", [])):
-            logger.warning(f"[MULTITRANSLATE] 内容被过滤规则拦截 检测内容: '{filter_res.text}'")
+        filter_text = await async_transcribe(audio_file, language="zh")
+        logger.info(f"[MULTITRANSLATE] 中文过滤检测结果: '{filter_text}'")
+        if (filter_text in errorFilter.get("errorResultDict", [])) or any(key in filter_text for key in errorFilter.get("errorKeyString", [])):
+            logger.warning(f"[MULTITRANSLATE] 内容被过滤规则拦截 检测内容: '{filter_text}'")
             return {"text": "", "message": "filtered"}
         logger.debug(f"[MULTITRANSLATE] 进行{sourceLanguage}语言识别")
-        text_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language=sourceLanguage)
-        stext = text_res.text
+        stext = await async_transcribe(audio_file, language=sourceLanguage)
         logger.info(f"[MULTITRANSLATE] {sourceLanguage}语音识别结果: '{stext}'")
         # 压缩重复字符
         if settings.ENABLE_TEXT_COMPRESSION:
@@ -220,39 +215,46 @@ async def multitranslate_to_other_language(
     if settings.ENABLE_WEB_TRANSLATORS:
         translate_source_lang = 'auto' if sourceLanguage == 'zh' else sourceLanguage
         logger.info(f"[MULTITRANSLATE] 使用网页翻译服务 - 源语言: {translate_source_lang}")
-        logger.debug(f"[MULTITRANSLATE] 开始翻译到目标语言: {targetLanguage}")
-        transText = do_translate(stext, from_=translate_source_lang, to=targetLanguage)
-        logger.info(f"[MULTITRANSLATE] 主目标语言翻译完成: '{transText}'")
 
+        # 构建需要翻译的目标语言列表
+        target_languages = [targetLanguage]
         if targetLanguage2 != "none":
-            logger.debug(f"[MULTITRANSLATE] 开始翻译到第二目标语言: {targetLanguage2}")
-            transText2 = do_translate(stext, from_=translate_source_lang, to=targetLanguage2)
-            logger.info(f"[MULTITRANSLATE] 第二目标语言翻译完成: '{transText2}'")
+            target_languages.append(targetLanguage2)
         if targetLanguage3 != "none":
-            logger.debug(f"[MULTITRANSLATE] 开始翻译到第三目标语言: {targetLanguage3}")
-            transText3 = do_translate(stext, from_=translate_source_lang, to=targetLanguage3)
-            logger.info(f"[MULTITRANSLATE] 第三目标语言翻译完成: '{transText3}'")
+            target_languages.append(targetLanguage3)
+
+        logger.info(f"[MULTITRANSLATE] 开始并发翻译到目标语言: {target_languages}")
+
+        # 并发执行所有翻译
+        results = await do_multi_translate_async(stext, translate_source_lang, target_languages)
+
+        # 分配翻译结果
+        transText = results[0] if len(results) > 0 else ''
+        transText2 = results[1] if len(results) > 1 else ''
+        transText3 = results[2] if len(results) > 2 else ''
+
+        logger.info(f"[MULTITRANSLATE] 并发翻译完成 - 主译文: '{transText}', 第二译文: '{transText2}', 第三译文: '{transText3}'")
     else:
         logger.info(f"[MULTITRANSLATE] 使用Whisper翻译服务")
         logger.debug(f"[MULTITRANSLATE] 创建Whisper翻译请求")
-        translated_res = whisperclient.audio.translations.create(model=settings.WHISPER_MODEL, file=audio_file)
-        logger.info(f"[MULTITRANSLATE] Whisper翻译结果: '{translated_res.text}'")
+        translated_text = await async_translate_audio(audio_file)
+        logger.info(f"[MULTITRANSLATE] Whisper翻译结果: '{translated_text}'")
 
         if targetLanguage == 'en':
-            transText = translated_res.text
+            transText = translated_text
             logger.info(f"[MULTITRANSLATE] 目标语言为英文，直接使用Whisper翻译结果")
         else:
             logger.debug(f"[MULTITRANSLATE] 使用本地翻译从英文到{targetLanguage}")
-            transText = await translate_local(translated_res.text, "en", targetLanguage)
+            transText = await translate_local(translated_text, "en", targetLanguage)
             logger.info(f"[MULTITRANSLATE] 本地翻译完成: '{transText}'")
 
         if targetLanguage2 != "none":
             logger.debug(f"[MULTITRANSLATE] 翻译到第二目标语言: {targetLanguage2}")
-            transText2 = await translate_local(translated_res.text, 'en', targetLanguage2)
+            transText2 = await translate_local(translated_text, 'en', targetLanguage2)
             logger.info(f"[MULTITRANSLATE] 第二目标语言翻译完成: '{transText2}'")
         if targetLanguage3 != "none":
             logger.debug(f"[MULTITRANSLATE] 翻译到第三目标语言: {targetLanguage3}")
-            transText3 = await translate_local(translated_res.text, 'en', targetLanguage3)
+            transText3 = await translate_local(translated_text, 'en', targetLanguage3)
             logger.info(f"[MULTITRANSLATE] 第三目标语言翻译完成: '{transText3}'")
 
     logger.info(f"[MULTITRANSLATE] 多语言翻译请求处理完成 - 用户: {current_user.username}  原文: '{stext}', 主译文: '{transText}', 第二译文: '{transText2}', 第三译文: '{transText3}'")
@@ -275,11 +277,10 @@ async def multitranscription(
 
     text_to_return = ""
     if sourceLanguage != 'zh':
-        filter_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language="zh")
-        if (filter_res.text in errorFilter.get("errorResultDict", [])) or any(key in filter_res.text for key in errorFilter.get("errorKeyString", [])):
+        filter_text = await async_transcribe(audio_file, language="zh")
+        if (filter_text in errorFilter.get("errorResultDict", [])) or any(key in filter_text for key in errorFilter.get("errorKeyString", [])):
             return {"text": "", "message": "filtered"}
-        text_res = whisperclient.audio.transcriptions.create(model=settings.WHISPER_MODEL, file=audio_file, language=sourceLanguage)
-        text_to_return = text_res.text
+        text_to_return = await async_transcribe(audio_file, language=sourceLanguage)
     else:
         async with httpx.AsyncClient() as client:
             files = {'file': ('audio.wav', audio_file, 'audio/wav')}
@@ -316,9 +317,19 @@ class WebTranslateRequest(BaseModel):
 
 @router.post("/func/webtranslate")
 async def web_translate(data: WebTranslateRequest, current_user: User = Depends(enforce_user_rate_limit)):
-    transText = do_translate(data.text, data.sourceLanguage, data.targetLanguage)
-    transText2 = ''
-    transText3 = ''
-    if data.targetLanguage2 != "none": transText2 = do_translate(data.text, data.sourceLanguage, data.targetLanguage2)
-    if data.targetLanguage3 != "none": transText3 = do_translate(data.text, data.sourceLanguage, data.targetLanguage3)
+    # 构建需要翻译的目标语言列表
+    target_languages = [data.targetLanguage]
+    if data.targetLanguage2 != "none":
+        target_languages.append(data.targetLanguage2)
+    if data.targetLanguage3 != "none":
+        target_languages.append(data.targetLanguage3)
+
+    # 并发执行所有翻译
+    results = await do_multi_translate_async(data.text, data.sourceLanguage, target_languages)
+
+    # 分配翻译结果
+    transText = results[0] if len(results) > 0 else ''
+    transText2 = results[1] if len(results) > 1 else ''
+    transText3 = results[2] if len(results) > 2 else ''
+
     return {'text': data.text, 'translatedText': transText, 'translatedText2': transText2, 'translatedText3': transText3}

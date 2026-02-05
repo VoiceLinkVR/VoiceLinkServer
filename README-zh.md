@@ -27,7 +27,16 @@ docker-compose -f docker-compose-cuda-all-cn.yml up -d
 ```
 docker-compose -f docker-compose-cpu-cn.yml up -d
 ```
-等待一切运行就绪后请访问：`http://{服务器ip}:8980/ui/login` 
+
+海外用户：
+```
+# GPU版本
+docker-compose -f docker-compose-cuda.yml up -d
+# CPU版本
+docker-compose -f docker-compose-cpu.yml up -d
+```
+
+等待一切运行就绪后请访问：`http://{服务器ip}:8980/ui/login`
 
 首次登陆时输入的用户名和密码将作为默认管理员的账户和密码，请妥善保管
 
@@ -46,12 +55,13 @@ docker-compose -f docker-compose-cpu-cn.yml up -d
 
 ### 控制api
 除管理员注册接口在启动后无用户时不需要token外，都需要增加token
-#### 注册管理员接口 
+
+#### 注册管理员接口
 
 该接口在无用户信息时会自动将第一个用户作为管理员，其他时间将验证token
 
 方法：POST
-url: /manageapi/registerAdmin  
+url: /manageapi/registerAdmin
 传入参数：
 ```json
 {
@@ -61,7 +71,7 @@ url: /manageapi/registerAdmin
 ```
 响应格式：
 ```json
-{"message": "User created successfully"}
+{"message": "AdminUser created successfully"}
 ```
 
 #### 更换用户密码接口
@@ -76,9 +86,10 @@ url:/manageapi/changePassword
 ```
 响应格式：
 ```json
-{"message": "User created successfully"}
+{"message": "user:{username}, Password changed successfully"}
 ```
-#### 注册用户接口
+
+#### 注册用户接口（简单版）
 方法：POST
 url:/manageapi/register
 传入参数：
@@ -92,23 +103,79 @@ url:/manageapi/register
 ```json
 {"message": "User created successfully"}
 ```
+
+#### 添加用户接口（完整版）
+方法：POST
+url:/manageapi/addUser
+传入参数：
+```json
+{
+    "username": "",
+    "password": "",
+    "is_admin": false,
+    "is_active": true,
+    "limit_rule": "10000/day;1000/hour",
+    "expiration_date": "2025-12-31T23:59:59"
+}
+```
+字段说明：
+- `username`: 用户名（必填，3-50字符）
+- `password`: 密码（必填，最少6字符）
+- `is_admin`: 是否为管理员（可选，默认false）
+- `is_active`: 是否激活（可选，默认true）
+- `limit_rule`: 限速规则（可选）
+- `expiration_date`: 过期时间（可选，ISO格式）
+
+响应格式：
+```json
+{"message": "User created successfully", "user": {"username": ""}}
+```
+
+#### 更新用户接口
+方法：POST
+url:/manageapi/updateUser
+传入参数：
+```json
+{
+    "username": "",
+    "password": "",
+    "is_admin": false,
+    "is_active": true,
+    "limit_rule": "10000/day;1000/hour",
+    "expiration_date": "2025-12-31T23:59:59"
+}
+```
+字段说明：
+- `username`: 用户名（必填，用于定位要更新的用户）
+- `password`: 新密码（可选，不传则不修改）
+- `is_admin`: 是否为管理员（可选，不传则不修改）
+- `is_active`: 是否激活（可选，不传则不修改）
+- `limit_rule`: 限速规则（可选，不传则不修改）
+- `expiration_date`: 过期时间（可选，不传则不修改）
+
+响应格式：
+```json
+{"message": "user:{username}, updated successfully"}
+```
+
 #### 删除用户接口
 方法：POST
 url:/manageapi/deleteUser
 传入参数：
 ```json
 {
-    "username":"",
-    "password":""
+    "username":""
 }
 ```
 响应格式：
 ```json
-{"message": "User created successfully"}
+{"message": "User deleted successfully"}
 ```
+
 ### 调用api
-推荐去server.py中查看
-#### 登陆获取token 
+
+#### 登陆获取token
+方法：POST
 url:/api/login
 ```json
 {
@@ -119,17 +186,17 @@ url:/api/login
 响应格式：
 ```json
 //成功
-{"message": "Login successful", "access_token": ""}
+{"message": "Login successful", "access_token": "", "token_type": "bearer"}
 //失败
-{"message": "Invalid credentials"}
-
+{"detail": "Invalid credentials"}
 ```
+
 #### 获取语音识别结果(中文)
 方法：POST
 url:/api/whisper/transcriptions
 传入参数：
 ```
-//from-data格式
+//form-data格式
 'file':{文件二进制}
 ```
 
@@ -137,6 +204,7 @@ url:/api/whisper/transcriptions
 ```json
 {"text": ""}
 ```
+
 #### 文字翻译接口
 方法：POST
 url:/api/libreTranslate
@@ -146,31 +214,32 @@ url:/api/libreTranslate
     "source":"",
     "target":"",
     "text":""
-
 }
 ```
 响应格式：
 ```json
 {"text": ""}
 ```
+
 #### 语音翻译接口(英语)
 方法：POST
 url:/api/func/translateToEnglish
 传入参数：
 ```
-//from-data格式
+//form-data格式
 'file':{文件二进制}
 ```
 响应格式：
 ```json
 {"text": "","translatedText":""}
 ```
-#### 注册用户接口
+
+#### 语音翻译接口(其他语言)
 方法：POST
 url:/api/func/translateToOtherLanguage
 传入参数：
 ```
-//from-data格式
+//form-data格式
 files["file"]:{文件二进制}
 data={"targetLanguage":""}
 //支持的目标语言格式请查看自己部署libreTranslate的/language 接口
@@ -179,4 +248,20 @@ data={"targetLanguage":""}
 ```json
 {"text": "","translatedText":""}
 ```
-#### 其他接口请查看server.py
+
+## 环境变量说明
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| WHISPER_HOST | Whisper服务地址 | localhost |
+| WHISPER_PORT | Whisper服务端口 | 8000 |
+| LIBRETRANSLATE_HOST | LibreTranslate服务地址 | localhost |
+| LIBRETRANSLATE_PORT | LibreTranslate服务端口 | 5000 |
+| SENSEVOICE_HOST | SenseVoice服务地址 | localhost |
+| SENSEVOICE_PORT | SenseVoice服务端口 | 8800 |
+| LIMIT_ENABLE | 是否启用限速 | False |
+| LIMITER_REDIS_URL | Redis连接URL | - |
+| TRANSLATOR_SERVICES_LIST | 翻译服务列表 | bing,modernMt,cloudTranslation |
+| ENABLE_WEB_TRANSLATORS | 启用在线翻译服务 | True |
+| JWT_SECRET_KEY | JWT密钥（生产环境请修改） | voicelinkvr-secret-key |
+| SQL_PATH | 数据库连接字符串 | sqlite:///data/db/users.db |

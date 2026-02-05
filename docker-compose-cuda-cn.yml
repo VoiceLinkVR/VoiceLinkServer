@@ -1,4 +1,16 @@
 services:
+  redis:
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/redis:latest
+    container_name: redis
+    restart: always
+    ports:
+      - 6379:6379
+    volumes:
+      - ./redisFiles/data:/data
+      - ./redisFiles/redis.conf:/usr/local/etc/redis/redis.conf
+      # - ./redisFiles/logs:/logs
+    #配置文件启动
+    command: redis-server /usr/local/etc/redis/redis.conf
   faster-whisper-server-cuda:
     image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/faster-whisper-server:latest-cuda
     restart: unless-stopped
@@ -6,26 +18,40 @@ services:
       - 8000:8000
     environment:
       - WHISPER__TTL=-1
+      - WHISPER__NUM_WORKERS=10
+      - WHISPER__CPU_THREADS=40
        # environment params in:https://github.com/speaches-ai/speaches/blob/v0.5.0/src/faster_whisper_server/config.py
-    
     deploy:
       resources:
         reservations:
           devices:
-            - capabilities: ["gpu"]
-  
-  libretranslate-cpu:
-    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/libretranslate
+            - count: all
+              driver: nvidia
+              capabilities: [gpu]
+
+
+  libretranslate-cuda:
+    # image: libretranslate/libretranslate
+    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/libretranslate:latest-cuda
     restart: unless-stopped
     ports:
       - 5000:5000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
     # volumes:
-    #   # Keep the models in a docker volume, to avoid re-downloading on startup
-    # - lt-local:/home/libretranslate/.local:rw
+      # Keep the models in a docker volume, to avoid re-downloading on startup
+      # - lt-local:/home/libretranslate/.local:rw
     ## Uncomment above command and define your args if necessary
     # command: --ssl --ga-id MY-GA-ID --req-limit 100 --char-limit 500
     ## Uncomment this section and the libretranslate_api_keys volume if you want to backup your API keys
-    # environment:
+    environment:
+      - LT_THREADS=20
     #   - LT_API_KEYS=true
     #   - LT_API_KEYS_DB_PATH=/app/db/api_keys.db # Same result as `db/api_keys.db` or `./db/api_keys.db`
     ## Uncomment these vars and libretranslate_models volume to optimize loading time.
@@ -34,22 +60,36 @@ services:
     # volumes:
     #   - libretranslate_api_keys:/app/db
 
-  VoiceLinkVR-server-cpu:
+  VoiceLinkVR-server:
     image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/voice-link-vr-server:latest
     restart: unless-stopped
     ports:
       - 8980:8980
     volumes:
-      -  voice-link-vr-server-local:/usr/src/app/data:rw
+      - voice-link-vr-server-local:/usr/src/app/data:rw
     environment:
       - WHISPER_HOST=faster-whisper-server-cuda
       - WHISPER_PORT=8000
-      - LIBRETRANSLATE_HOST=libretranslate-cpu
+      - LIBRETRANSLATE_HOST=libretranslate-cuda
       - LIBRETRANSLATE_PORT=5000
       - FILTER_WEB_URL=https://gitee.com/voice-link-vr/VoiceLinkServer/raw/main/src/filter.json
-    #  - LIMIT_ENABLE=True
+      - THREADS_NUM=50
+      - LIMIT_ENABLE=True
+      - LIMIT_PUBLIC_TEST_USER=testuser
+      - SQLALCHEMY_POOL_SIZE=0
+      - TRANSLATOR_SERVICES_LIST=bing,modernMt,cloudTranslation,caiyun,alibaba,youdao
+      - LIMITER_REDIS_URL=redis://redis:6379/0
+      - TTS_TOKEN=
+      - TTS_URL=
+      - ENABLE_WEB_TRANSLATORS=True
+      - LATEST_VERSION=v0.6.0-fix1
+      - PACKAGE_BASE_URL=https://cloudflarestorage.boyqiu001.top/VRCLS-windows-
+      - PACKAGE_TYPE=.exe
+      # 可以使用mysql
+      # - SQL_PATH=mysql+pymysql://voicelinkvr:voicelinkabc123%40@192.168.2.198:3306/voicelinkvr_server_test?charset=utf8
     depends_on:
-      - libretranslate-cpu
+      - libretranslate-cuda
       - faster-whisper-server-cuda
+      - redis
 volumes:
   voice-link-vr-server-local:

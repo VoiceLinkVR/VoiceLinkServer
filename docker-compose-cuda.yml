@@ -1,6 +1,6 @@
 services:
   redis:
-    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/redis:latest
+    image: redis:latest
     container_name: redis
     restart: always
     ports:
@@ -12,7 +12,7 @@ services:
     #配置文件启动
     command: redis-server /usr/local/etc/redis/redis.conf
   faster-whisper-server-cuda:
-    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/faster-whisper-server:latest-cuda
+    image: fedirz/faster-whisper-server:latest-cuda
     restart: unless-stopped
     ports:
       - 8000:8000
@@ -28,11 +28,10 @@ services:
             - count: all
               driver: nvidia
               capabilities: [gpu]
-              
+
 
   libretranslate-cuda:
-    # image: libretranslate/libretranslate
-    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/libretranslate:latest-cuda
+    image: libretranslate/libretranslate:latest
     restart: unless-stopped
     ports:
       - 5000:5000
@@ -61,7 +60,7 @@ services:
     #   - libretranslate_api_keys:/app/db
 
   VoiceLinkVR-server:
-    image: crpi-ljf6ob20bt5kluhe.cn-shanghai.personal.cr.aliyuncs.com/voicelinkvr/voice-link-vr-server:latest
+    image: boyqiu0010/voice-link-vr-server:latest
     restart: unless-stopped
     ports:
       - 8980:8980
@@ -77,13 +76,16 @@ services:
       - LIMIT_ENABLE=True
       - LIMIT_PUBLIC_TEST_USER=testuser
       - SQLALCHEMY_POOL_SIZE=0
-      - TRANSLATOR_SERVICE=bing
+      - TRANSLATOR_SERVICES_LIST=bing,modernMt,cloudTranslation,caiyun,alibaba,youdao
       - LIMITER_REDIS_URL=redis://redis:6379/0
       - TTS_TOKEN=
       - TTS_URL=
       - ENABLE_WEB_TRANSLATORS=True
-      - LATEST_VERSION=v0.5.2
-      - PACKAGE_BASE_URL=https://cloudflarestorage.boyqiu001.top/VRCLS-windwos-
+      - LATEST_VERSION=v0.6.0-fix1
+      - PACKAGE_BASE_URL=https://cloudflarestorage.boyqiu001.top/VRCLS-windows-
+      - PACKAGE_TYPE=.exe
+      # 可以使用mysql
+      # - SQL_PATH=mysql+pymysql://voicelinkvr:voicelinkabc123%40@192.168.2.198:3306/voicelinkvr_server_test?charset=utf8
     depends_on:
       - libretranslate-cuda
       - faster-whisper-server-cuda

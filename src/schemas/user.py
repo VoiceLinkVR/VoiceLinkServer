@@ -12,6 +12,14 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     password: str = Field(..., min_length=6)
 
+class UserUpdate(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: Optional[str] = Field(None, min_length=6)
+    is_admin: Optional[bool] = None
+    is_active: Optional[bool] = None
+    limit_rule: Optional[str] = None
+    expiration_date: Optional[datetime] = None
+
 class UserResponse(UserBase):
     id: int
 

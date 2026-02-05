@@ -29,19 +29,6 @@ def get_translators():
     return translators
 
 
-async def preload_translators():
-    """
-    预加载translators模块并预热连接
-    建议在应用启动时调用
-    """
-    try:
-        ts = get_translators()
-        # 可选：预热连接池
-        # await asyncio.to_thread(ts.preaccelerate_and_speedtest)
-        logger.info("[TRANSLATE] translators模块预加载完成")
-    except Exception as e:
-        logger.warning(f"[TRANSLATE] translators预加载失败: {e}")
-
 # --- 全局客户端和服务变量 ---
 # 同步客户端（保留用于向后兼容）
 whisperclient = OpenAI(api_key=settings.WHISPER_APIKEY, base_url=WHISPER_URL)
@@ -228,95 +215,6 @@ def do_translate(text: str, from_: str, to: str):
     # 所有供应商都失败，返回原文
     logger.error(f"[TRANSLATE] 翻译失败，所有供应商不可用 - 返回原文")
     return text
-
-
-async def do_translate_async(text: str, from_: str, to: str) -> str:
-    """
-    异步翻译函数，使用translators库的原生异步支持
-    通过 http_client='aiohttp' 和 if_use_async=True 实现真正的异步IO
-    """
-    # 获取供应商列表
-    services_list = [s.strip() for s in settings.TRANSLATOR_SERVICES_LIST.split(',')]
-
-    translators_module = get_translators()
-
-    # 记录开始翻译
-    logger.info(f"[TRANSLATE_ASYNC] 开始异步翻译 - 原文: '{text[:50]}...', 源语言: {from_}, 目标语言: {to}")
-
-    # 依次尝试每个供应商
-    for i, service in enumerate(services_list):
-        try:
-            logger.info(f"[TRANSLATE_ASYNC] 尝试供应商 {i+1}/{len(services_list)}: {service}")
-
-            # 处理繁体中文映射
-            to_language = transalte_zt.get(service, 'zt') if to == 'zt' else to
-
-            # 使用原生异步模式执行翻译
-            result = await translators_module.translate_text(
-                text,
-                translator=service,
-                from_language=from_,
-                to_language=to_language,
-                timeout=settings.TRANSLATION_TIMEOUT,
-                http_client='aiohttp',      # 使用aiohttp作为HTTP客户端
-                if_use_async=True           # 启用异步模式
-            )
-
-            result = html.unescape(result)
-            logger.info(f"[TRANSLATE_ASYNC] 翻译成功 - 供应商: {service}, 结果: '{result[:50]}...'")
-            return result
-
-        except Exception as e:
-            logger.warning(f"[TRANSLATE_ASYNC] 供应商 {service} 失败: {type(e).__name__}: {e}")
-
-            # 如果是最后一个供应商，记录错误并返回原文
-            if i == len(services_list) - 1:
-                logger.error(f"[TRANSLATE_ASYNC] 所有供应商都失败，返回原文 - 已尝试: {services_list}")
-                return text
-
-            # 继续尝试下一个供应商
-            logger.info(f"[TRANSLATE_ASYNC] 切换到下一个供应商")
-            continue
-
-    # 所有供应商都失败，返回原文
-    logger.error(f"[TRANSLATE_ASYNC] 翻译失败，所有供应商不可用 - 返回原文")
-    return text
-
-
-async def do_multi_translate_async(text: str, from_: str, targets: list) -> list:
-    """
-    并发执行多语言翻译，使用translators库的原生异步支持
-
-    Args:
-        text: 要翻译的文本
-        from_: 源语言代码
-        targets: 目标语言代码列表，例如 ['en', 'ja', 'ko']
-
-    Returns:
-        翻译结果列表，顺序与targets对应
-    """
-    if not targets:
-        return []
-
-    logger.info(f"[MULTI_TRANSLATE] 开始并发翻译 - 源语言: {from_}, 目标语言: {targets}")
-
-    # 创建所有翻译任务，使用原生异步翻译函数
-    tasks = [do_translate_async(text, from_, target) for target in targets]
-
-    # 并发执行所有翻译任务
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # 处理结果，如果有异常则返回原文
-    processed_results = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            logger.error(f"[MULTI_TRANSLATE] 翻译到 {targets[i]} 失败: {result}")
-            processed_results.append(text)  # 失败时返回原文
-        else:
-            processed_results.append(result)
-
-    logger.info(f"[MULTI_TRANSLATE] 并发翻译完成 - 结果数量: {len(processed_results)}")
-    return processed_results
 
 
 async def translate_local(text: str, source: str, target: str) -> str:

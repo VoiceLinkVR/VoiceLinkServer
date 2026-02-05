@@ -14,7 +14,7 @@ from db.models import User
 from core.services import (
     whisperclient, errorFilter, do_translate, translate_local,
     supportedLanguagesList, whisperSupportedLanguageList, SENSEVOICE_URL, packaged_opus_stream_to_wav_bytes,
-    glm_client, codeTochinese, compress_repeated_chars, do_multi_translate_async,
+    glm_client, codeTochinese, compress_repeated_chars,
     async_transcribe, async_translate_audio
 )
 from core.logging_config import logger
@@ -215,25 +215,18 @@ async def multitranslate_to_other_language(
     if settings.ENABLE_WEB_TRANSLATORS:
         translate_source_lang = 'auto' if sourceLanguage == 'zh' else sourceLanguage
         logger.info(f"[MULTITRANSLATE] 使用网页翻译服务 - 源语言: {translate_source_lang}")
+        logger.debug(f"[MULTITRANSLATE] 开始翻译到目标语言: {targetLanguage}")
+        transText = do_translate(stext, from_=translate_source_lang, to=targetLanguage)
+        logger.info(f"[MULTITRANSLATE] 主目标语言翻译完成: '{transText}'")
 
-        # 构建需要翻译的目标语言列表
-        target_languages = [targetLanguage]
         if targetLanguage2 != "none":
-            target_languages.append(targetLanguage2)
+            logger.debug(f"[MULTITRANSLATE] 开始翻译到第二目标语言: {targetLanguage2}")
+            transText2 = do_translate(stext, from_=translate_source_lang, to=targetLanguage2)
+            logger.info(f"[MULTITRANSLATE] 第二目标语言翻译完成: '{transText2}'")
         if targetLanguage3 != "none":
-            target_languages.append(targetLanguage3)
-
-        logger.info(f"[MULTITRANSLATE] 开始并发翻译到目标语言: {target_languages}")
-
-        # 并发执行所有翻译
-        results = await do_multi_translate_async(stext, translate_source_lang, target_languages)
-
-        # 分配翻译结果
-        transText = results[0] if len(results) > 0 else ''
-        transText2 = results[1] if len(results) > 1 else ''
-        transText3 = results[2] if len(results) > 2 else ''
-
-        logger.info(f"[MULTITRANSLATE] 并发翻译完成 - 主译文: '{transText}', 第二译文: '{transText2}', 第三译文: '{transText3}'")
+            logger.debug(f"[MULTITRANSLATE] 开始翻译到第三目标语言: {targetLanguage3}")
+            transText3 = do_translate(stext, from_=translate_source_lang, to=targetLanguage3)
+            logger.info(f"[MULTITRANSLATE] 第三目标语言翻译完成: '{transText3}'")
     else:
         logger.info(f"[MULTITRANSLATE] 使用Whisper翻译服务")
         logger.debug(f"[MULTITRANSLATE] 创建Whisper翻译请求")
@@ -317,19 +310,9 @@ class WebTranslateRequest(BaseModel):
 
 @router.post("/func/webtranslate")
 async def web_translate(data: WebTranslateRequest, current_user: User = Depends(enforce_user_rate_limit)):
-    # 构建需要翻译的目标语言列表
-    target_languages = [data.targetLanguage]
-    if data.targetLanguage2 != "none":
-        target_languages.append(data.targetLanguage2)
-    if data.targetLanguage3 != "none":
-        target_languages.append(data.targetLanguage3)
-
-    # 并发执行所有翻译
-    results = await do_multi_translate_async(data.text, data.sourceLanguage, target_languages)
-
-    # 分配翻译结果
-    transText = results[0] if len(results) > 0 else ''
-    transText2 = results[1] if len(results) > 1 else ''
-    transText3 = results[2] if len(results) > 2 else ''
-
+    transText = do_translate(data.text, data.sourceLanguage, data.targetLanguage)
+    transText2 = ''
+    transText3 = ''
+    if data.targetLanguage2 != "none": transText2 = do_translate(data.text, data.sourceLanguage, data.targetLanguage2)
+    if data.targetLanguage3 != "none": transText3 = do_translate(data.text, data.sourceLanguage, data.targetLanguage3)
     return {'text': data.text, 'translatedText': transText, 'translatedText2': transText2, 'translatedText3': transText3}

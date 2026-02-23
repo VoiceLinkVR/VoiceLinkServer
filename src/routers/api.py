@@ -7,7 +7,13 @@ from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile,
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
-from core.dependencies import get_db, create_access_token, verify_password
+from core.dependencies import (
+    get_db,
+    create_access_token,
+    verify_password,
+    get_current_user_for_status,
+    is_user_expired,
+)
 from core.rate_limiter import enforce_user_rate_limit
 from core.config import settings
 from db.models import User
@@ -48,17 +54,31 @@ async def login(db: Session = Depends(get_db), user_credentials: UserLogin = Bod
         logger.warning(f"[LOGIN] 用户被禁用: {user_credentials.username}")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户已被禁用")
 
+    expired, expiration_utc = is_user_expired(user)
+    if expired:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "account_expired",
+                "message": "用户已过期",
+                "expiration_utc": expiration_utc.isoformat().replace("+00:00", "Z") if expiration_utc else None,
+            },
+        )
+
     logger.info(f"[LOGIN] 用户登录成功: {user_credentials.username}")
     access_token = create_access_token(data={"sub": user.username})
     return {"message": "Login successful", "access_token": access_token}
 
 @router.get("/account/status")
-async def account_status(current_user: User = Depends(enforce_user_rate_limit)):
+async def account_status(current_user: User = Depends(get_current_user_for_status)):
     expires_at = current_user.expiration_date
+    boost_expires_at = current_user.boost_expiration_date
     now = datetime.now(timezone.utc)
     expiration_utc = None
     remaining_seconds = None
     is_expired = False
+    boost_expiration_utc = None
+    boost_remaining_seconds = None
 
     if expires_at is not None:
         if expires_at.tzinfo is None:
@@ -70,12 +90,23 @@ async def account_status(current_user: User = Depends(enforce_user_rate_limit)):
         remaining_seconds = int((expires_at - now).total_seconds())
         is_expired = remaining_seconds <= 0
 
+    if boost_expires_at is not None:
+        if boost_expires_at.tzinfo is None:
+            boost_expires_at = boost_expires_at.replace(tzinfo=timezone.utc)
+        else:
+            boost_expires_at = boost_expires_at.astimezone(timezone.utc)
+        boost_expiration_utc = boost_expires_at.isoformat().replace("+00:00", "Z")
+        boost_remaining_seconds = int((boost_expires_at - now).total_seconds())
+
     return {
         "username": current_user.username,
         "is_active": bool(current_user.is_active),
         "is_expired": is_expired,
         "expiration_utc": expiration_utc,
         "remaining_seconds": remaining_seconds,
+        "boost_expiration_utc": boost_expiration_utc,
+        "boost_remaining_seconds": boost_remaining_seconds,
+        "boost_limit_rule": current_user.boost_limit_rule,
     }
 
 @router.post("/whisper/transcriptions")
@@ -131,7 +162,7 @@ async def translate_to_other_language(file: UploadFile = File(...), targetLangua
 
     if targetLanguage not in supportedLanguagesList:
         # 与原有server.py保持一致的错误信息格式
-        raise HTTPException(status_code=401, detail=f"targetLanguage error, please use following languages: {str(supportedLanguagesList)}")
+        raise HTTPException(status_code=400, detail=f"targetLanguage error, please use following languages: {str(supportedLanguagesList)}")
     audio_file = await file.read()
     text = await async_transcribe(audio_file, language='zh')
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
@@ -169,13 +200,13 @@ async def multitranslate_to_other_language(
     if sourceLanguage not in whisperSupportedLanguageList:
         logger.warning(f"[MULTITRANSLATE] sourceLanguage错误: {sourceLanguage} 不在支持的列表中")
         logger.debug(f"[MULTITRANSLATE] 支持的语言列表: {whisperSupportedLanguageList}")
-        # 与原有server.py保持一致，返回401状态码和详细错误信息
-        raise HTTPException(status_code=401, detail=f"sourceLanguage error")
+        # 参数错误返回400，避免客户端误判为token过期
+        raise HTTPException(status_code=400, detail="sourceLanguage error")
     if targetLanguage not in supportedLanguagesList:
         logger.warning(f"[MULTITRANSLATE] targetLanguage错误: {targetLanguage} 不在支持的列表中")
         logger.debug(f"[MULTITRANSLATE] 支持的目标语言列表: {supportedLanguagesList}")
-        # 与原有server.py保持一致，返回401状态码和详细错误信息
-        raise HTTPException(status_code=401, detail=f"targetLanguage error, please use following languages: {str(supportedLanguagesList)}")
+        # 参数错误返回400，避免客户端误判为token过期
+        raise HTTPException(status_code=400, detail=f"targetLanguage error, please use following languages: {str(supportedLanguagesList)}")
 
     logger.info(f"[MULTITRANSLATE] 开始处理音频文件 - content_type: {file.content_type}")
     audio_file = await file.read()
@@ -282,7 +313,7 @@ async def multitranscription(
     current_user: User = Depends(enforce_user_rate_limit)
 ):
     if sourceLanguage not in whisperSupportedLanguageList:
-        raise HTTPException(status_code=401, detail="sourceLanguage error")
+        raise HTTPException(status_code=400, detail="sourceLanguage error")
 
     audio_file = await file.read()
     if file.content_type == 'audio/opus':

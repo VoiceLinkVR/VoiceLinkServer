@@ -11,7 +11,7 @@ from limits.storage import storage_from_string
 from limits.strategies import MovingWindowRateLimiter
 
 from core.config import settings
-from core.dependencies import get_current_user
+from core.dependencies import get_current_user, get_effective_user_limit_rule
 from core.logging_config import logger
 from db.models import User
 
@@ -164,7 +164,7 @@ async def enforce_user_rate_limit(
     if not rate_limiter.enabled:
         return current_user
 
-    limit_rule = (current_user.limit_rule or "").strip() or FALLBACK_USER_LIMIT
+    limit_rule = get_effective_user_limit_rule(current_user) or FALLBACK_USER_LIMIT
 
     is_public_test_user = (
         settings.LIMIT_PUBLIC_TEST_USER is not None

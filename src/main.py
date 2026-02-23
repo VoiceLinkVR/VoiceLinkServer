@@ -15,8 +15,8 @@ from core.services import load_filter_config, update_filter_config, init_support
 from core.rate_limiter import rate_limiter, RateLimitExceeded, get_client_ip
 from core.dependencies import oauth2_scheme, get_db
 from db.base import Base, engine, SessionLocal
-from db.models import User, RequestLog
-from routers import api, ui, manage_api
+from db.models import User, RequestLog, PaymentOrder
+from routers import api, ui, manage_api, user_center
 
 def check_and_update_db():
     db = SessionLocal()
@@ -30,6 +30,12 @@ def check_and_update_db():
             if 'is_active' not in user_columns:
                 db.execute(text('ALTER TABLE user ADD COLUMN is_active BOOLEAN DEFAULT 1'))
                 logger.info("Added is_active to user table")
+            if 'boost_expiration_date' not in user_columns:
+                db.execute(text('ALTER TABLE user ADD COLUMN boost_expiration_date DATETIME'))
+                logger.info("Added boost_expiration_date to user table")
+            if 'boost_limit_rule' not in user_columns:
+                db.execute(text('ALTER TABLE user ADD COLUMN boost_limit_rule VARCHAR(100)'))
+                logger.info("Added boost_limit_rule to user table")
         if 'request_log' in inspector.get_table_names():
             log_columns = [col['name'] for col in inspector.get_columns('request_log')]
             if 'status' not in log_columns:
@@ -44,6 +50,16 @@ def check_and_update_db():
             ]
             for index_name, create_sql in index_defs:
                 if index_name not in existing_indexes:
+                    db.execute(text(create_sql))
+                    logger.info(f"Added index: {index_name}")
+
+        if 'payment_order' in inspector.get_table_names():
+            payment_indexes = {idx.get('name') for idx in inspector.get_indexes('payment_order')}
+            for index_name, create_sql in [
+                ('idx_payment_order_status', 'CREATE INDEX idx_payment_order_status ON payment_order (status)'),
+                ('idx_payment_order_username', 'CREATE INDEX idx_payment_order_username ON payment_order (username)'),
+            ]:
+                if index_name not in payment_indexes:
                     db.execute(text(create_sql))
                     logger.info(f"Added index: {index_name}")
         db.commit()
@@ -192,6 +208,7 @@ async def request_logging_middleware(request: Request, call_next):
 # 包含路由
 app.include_router(ui.router, prefix="/ui", tags=["UI"])
 app.include_router(api.router, prefix="/api", tags=["API"])
+app.include_router(user_center.router, prefix="/api/user-center", tags=["User Center"])
 app.include_router(manage_api.router, prefix="/manageapi", tags=["Management API"])
 
 @app.get("/", include_in_schema=False)

@@ -55,6 +55,18 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"  # 日志级别，支持 DEBUG, INFO, WARNING, ERROR, CRITICAL
     ENABLE_TEXT_COMPRESSION: bool = True  # 是否启用文本重复字符压缩
     TEXT_COMPRESSION_MIN_REPEAT: int = 5  # 文本压缩最小重复次数（默认5次）
+    AFDIAN_USER_ID: str = "db43f694299511ef821252540025c377"
+    AFDIAN_TOKEN: str = ""
+    AFDIAN_ORDER_CREATE_BASE_URL: str = "https://afdian.com/order/create"
+    AFDIAN_QUERY_ORDER_URL: str = "https://afdian.com/api/open/query-order"
+    AFDIAN_CUSTOM_ID_KEY: str = "change-me-to-32-byte-secret"
+    AFDIAN_CUSTOM_PRICE: float = 5.0
+    AFDIAN_RENEW_DAYS: int = 30
+    AFDIAN_BOOST_DAYS: int = 30
+    AFDIAN_DEFAULT_LIMIT_RULE: str = "800/day;8/minute"
+    AFDIAN_BOOST_LIMIT_RULE: str = ""
+    AFDIAN_QUERY_SCAN_PAGES: int = 3
+    AFDIAN_CUSTOM_ID_TTL_SECONDS: int = 604800
     
 
     class Config:

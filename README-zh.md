@@ -262,6 +262,14 @@ data={"targetLanguage":""}
 | LIMIT_ENABLE | 是否启用限速 | False |
 | LIMITER_REDIS_URL | Redis连接URL | - |
 | TRANSLATOR_SERVICES_LIST | 翻译服务列表 | bing,modernMt,cloudTranslation |
+| UPDATE_PUBLIC_BASE_URL | 更新资源对外访问基础URL（可选） | - |
+| UPDATE_STATIC_ROOT | 热更新静态资源根目录 | src/data/update/files |
+| UPDATE_MANIFEST_PATH | 应用更新manifest路径 | src/data/update/update_manifest.json |
+| MODEL_MANIFEST_PATH | 模型目录manifest路径 | src/data/update/models_manifest.json |
+| TRANSLATION_PROFILE_MANIFEST_PATH | 翻译能力profile manifest路径 | src/data/update/translation_profile_manifest.json |
+| TRANSLATOR_RUNTIME_MANIFEST_PATH | 翻译运行时manifest路径 | src/data/update/translator_runtime_manifest.json |
+| TRANSLATION_CAPABILITIES_CACHE_SECONDS | 翻译能力缓存秒数 | 1800 |
+| TRANSLATION_CAPABILITY_TIMEOUT | 单引擎语言探测超时（秒） | 4.0 |
 | ENABLE_WEB_TRANSLATORS | 启用在线翻译服务 | True |
 | JWT_SECRET_KEY | JWT密钥（生产环境请修改） | voicelinkvr-secret-key |
 | SQL_PATH | 数据库连接字符串 | sqlite:///data/db/users.db |

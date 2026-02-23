@@ -73,7 +73,10 @@ src/
 │   ├── config.py   # Pydantic settings management
 │   ├── dependencies.py # FastAPI dependency injection
 │   ├── services.py # Business logic (translation, audio processing)
-│   └── limiter.py  # Rate limiting configuration
+│   ├── rate_limiter.py  # Rate limiting with Redis/memory backend
+│   ├── logging_config.py # Logging configuration
+│   ├── text_compressor.py # Text compression utilities
+│   └── translation_service.py # Translation service abstraction
 ├── db/             # Database layer
 │   ├── base.py     # SQLAlchemy base configuration
 │   └── models.py   # ORM models (User, RequestLog)
@@ -141,6 +144,11 @@ All configuration is managed through `src/core/config.py` using Pydantic Setting
 - OPUS decoding via `opuslib`
 - Automatic format detection and conversion
 - Content filtering for error results
+- Text compression for repeated characters (configurable)
+
+### Scheduled Tasks
+- **User Expiration Check**: Daily at midnight UTC, disables expired users
+- **Filter Config Update**: Weekly on Monday at 3:00 AM UTC, updates filter rules from web
 
 ## Common Development Tasks
 

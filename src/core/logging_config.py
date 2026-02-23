@@ -35,6 +35,10 @@ def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(log_level)
 
+    # Prevent duplicate logs when other modules configured root handlers earlier.
+    if logger.handlers:
+        logger.handlers.clear()
+
     # 控制台处理器
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)

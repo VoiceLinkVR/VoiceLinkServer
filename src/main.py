@@ -35,6 +35,17 @@ def check_and_update_db():
             if 'status' not in log_columns:
                 db.execute(text('ALTER TABLE request_log ADD COLUMN status VARCHAR(20) DEFAULT "pending"'))
                 logger.info("Added status to request_log table")
+
+            existing_indexes = {idx.get('name') for idx in inspector.get_indexes('request_log')}
+            index_defs = [
+                ('idx_request_log_timestamp', 'CREATE INDEX idx_request_log_timestamp ON request_log (timestamp)'),
+                ('idx_request_log_timestamp_endpoint', 'CREATE INDEX idx_request_log_timestamp_endpoint ON request_log (timestamp, endpoint)'),
+                ('idx_request_log_timestamp_status', 'CREATE INDEX idx_request_log_timestamp_status ON request_log (timestamp, status)')
+            ]
+            for index_name, create_sql in index_defs:
+                if index_name not in existing_indexes:
+                    db.execute(text(create_sql))
+                    logger.info(f"Added index: {index_name}")
         db.commit()
     except Exception as e:
         db.rollback()

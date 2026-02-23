@@ -1,11 +1,11 @@
 import emoji
 import httpx
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form, Body, Response
 # 移除 OAuth2PasswordRequestForm 的导入
 # from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import Optional, Dict
 
 from core.dependencies import get_db, create_access_token, verify_password
 from core.rate_limiter import enforce_user_rate_limit
@@ -52,11 +52,31 @@ async def login(db: Session = Depends(get_db), user_credentials: UserLogin = Bod
     access_token = create_access_token(data={"sub": user.username})
     return {"message": "Login successful", "access_token": access_token}
 
-@router.get("/latestVersionInfo")
-async def latest_version_info():
-    if settings.LATEST_VERSION and settings.PACKAGE_BASE_URL:
-        return {"version": settings.LATEST_VERSION, "packgeURL": f"{settings.PACKAGE_BASE_URL}{settings.LATEST_VERSION}{settings.PACKAGE_TYPE}"}
-    raise HTTPException(status_code=460, detail="version not defined")
+@router.get("/account/status")
+async def account_status(current_user: User = Depends(enforce_user_rate_limit)):
+    expires_at = current_user.expiration_date
+    now = datetime.now(timezone.utc)
+    expiration_utc = None
+    remaining_seconds = None
+    is_expired = False
+
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at.astimezone(timezone.utc)
+
+        expiration_utc = expires_at.isoformat().replace("+00:00", "Z")
+        remaining_seconds = int((expires_at - now).total_seconds())
+        is_expired = remaining_seconds <= 0
+
+    return {
+        "username": current_user.username,
+        "is_active": bool(current_user.is_active),
+        "is_expired": is_expired,
+        "expiration_utc": expiration_utc,
+        "remaining_seconds": remaining_seconds,
+    }
 
 @router.post("/whisper/transcriptions")
 async def whisper_transcriptions(file: UploadFile = File(...), current_user: User = Depends(enforce_user_rate_limit)):
@@ -213,7 +233,7 @@ async def multitranslate_to_other_language(
     logger.info(f"[MULTITRANSLATE] 开始翻译流程 - ENABLE_WEB_TRANSLATORS: {settings.ENABLE_WEB_TRANSLATORS}")
 
     if settings.ENABLE_WEB_TRANSLATORS:
-        translate_source_lang = 'auto' if sourceLanguage == 'zh' else sourceLanguage
+        translate_source_lang = sourceLanguage
         logger.info(f"[MULTITRANSLATE] 使用网页翻译服务 - 源语言: {translate_source_lang}")
         logger.debug(f"[MULTITRANSLATE] 开始翻译到目标语言: {targetLanguage}")
         transText = do_translate(stext, from_=translate_source_lang, to=targetLanguage)

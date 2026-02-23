@@ -1,25 +1,183 @@
 <!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-t-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
-    <title>Admin Login</title>
-  </head>
-  <body>
-    <h2>Admin Login</h2>
-    <form method="POST">
-      <label for="username">Username:</label>
-      <input type="text" id="username" name="username" required><br>
-      <label for="password">Password:</label>
-      <input type="password" id="password" name="password" required><br>
-      <button type="submit">Login</button>
-    </form>
-    {% if messages %}
-      <ul>
-      {% for message in messages %}
-        <li>{{ message }}</li>
-      {% endfor %}
-      </ul>
-    {% endif %}
-  </body>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>后台登录 - VoiceLink Server</title>
+    <style>
+        :root {
+            --bg-1: #f8fbff;
+            --bg-2: #fff8f2;
+            --card: #ffffff;
+            --text: #162033;
+            --muted: #60708f;
+            --line: #d9e3f3;
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --danger-bg: #fff3f2;
+            --danger-text: #b42318;
+            --danger-line: #ffd2cd;
+            --ok-bg: #effaf2;
+            --ok-text: #166534;
+            --ok-line: #b9e6c6;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            font-family: "Manrope", "Noto Sans SC", "Segoe UI", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at 15% 20%, #deebff 0, transparent 28%),
+                radial-gradient(circle at 85% 85%, #ffe3c8 0, transparent 30%),
+                linear-gradient(145deg, var(--bg-1), var(--bg-2));
+            padding: 24px;
+        }
+        .auth-card {
+            width: min(420px, 100%);
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.09);
+            padding: 24px;
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+            font-weight: 800;
+            font-size: 17px;
+        }
+        .logo {
+            width: 34px;
+            height: 34px;
+            border-radius: 10px;
+            display: grid;
+            place-items: center;
+            color: #fff;
+            background: linear-gradient(135deg, #2563eb, #1e40af);
+            box-shadow: 0 8px 18px rgba(37, 99, 235, 0.35);
+            font-size: 14px;
+            font-weight: 700;
+        }
+        h1 {
+            margin: 2px 0 6px;
+            font-size: 24px;
+            line-height: 1.2;
+        }
+        .desc {
+            margin: 0 0 20px;
+            color: var(--muted);
+            font-size: 14px;
+            line-height: 1.45;
+        }
+        form {
+            display: grid;
+            gap: 14px;
+        }
+        .field label {
+            display: block;
+            font-size: 13px;
+            margin-bottom: 6px;
+            color: #334155;
+            font-weight: 700;
+        }
+        .field input {
+            width: 100%;
+            height: 42px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 0 12px;
+            font-size: 14px;
+            color: var(--text);
+            background: #fff;
+            outline: none;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .field input:focus {
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+        }
+        .submit-btn {
+            height: 44px;
+            border: 0;
+            border-radius: 10px;
+            background: linear-gradient(135deg, var(--primary), #1d4ed8);
+            color: #fff;
+            font-weight: 700;
+            font-size: 14px;
+            cursor: pointer;
+            transition: transform 0.08s ease, filter 0.15s ease;
+        }
+        .submit-btn:hover { filter: brightness(1.03); }
+        .submit-btn:active { transform: translateY(1px); }
+        .tips {
+            margin-top: 10px;
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.45;
+        }
+        .alerts {
+            list-style: none;
+            margin: 0 0 14px;
+            padding: 0;
+            display: grid;
+            gap: 8px;
+        }
+        .alerts li {
+            border: 1px solid var(--danger-line);
+            background: var(--danger-bg);
+            color: var(--danger-text);
+            border-radius: 10px;
+            font-size: 13px;
+            padding: 10px 12px;
+        }
+        .welcome-note {
+            border: 1px solid var(--ok-line);
+            background: var(--ok-bg);
+            color: var(--ok-text);
+            border-radius: 10px;
+            font-size: 12px;
+            padding: 9px 11px;
+            margin-bottom: 14px;
+        }
+    </style>
+</head>
+<body>
+    <main class="auth-card">
+        <div class="brand">
+            <div class="logo">VL</div>
+            <span>VoiceLink Server 管理后台</span>
+        </div>
+        <h1>管理员登录</h1>
+        <p class="desc">登录后可管理用户、查看接口调用统计与性能数据。</p>
+
+        <div class="welcome-note">首次登录时，如果系统还没有管理员账号，会自动创建当前账号为管理员。</div>
+
+        {% if messages %}
+        <ul class="alerts">
+            {% for message in messages %}
+            <li>{{ message }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+
+        <form method="POST">
+            <div class="field">
+                <label for="username">用户名</label>
+                <input type="text" id="username" name="username" autocomplete="username" required>
+            </div>
+            <div class="field">
+                <label for="password">密码</label>
+                <input type="password" id="password" name="password" autocomplete="current-password" required>
+            </div>
+            <button class="submit-btn" type="submit">登录后台</button>
+        </form>
+
+        <div class="tips">安全提示：请勿在公共设备保存密码，建议管理员账号定期轮换密码。</div>
+    </main>
+</body>
 </html>

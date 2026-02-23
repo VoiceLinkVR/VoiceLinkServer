@@ -1,167 +1,697 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="zh-CN">
 <head>
-    <title>使用统计</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>使用统计 - VoiceLink Server</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        table { border-collapse: collapse; margin: 20px 0; width: 100%; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
-        .nav { margin-bottom: 20px; }
-        .nav a { margin-right: 15px; text-decoration: none; color: #333; }
-        .nav a:hover { color: #666; }
-        .hour-selector { margin: 20px 0; padding: 8px; width: 200px; }
-        .total-row { font-weight: bold; background-color: #f9f9f9; }
-        /* 状态列宽度优化 */
-th:nth-child(4), th:nth-child(5), th:nth-child(6), th:nth-child(7),
-td:nth-child(4), td:nth-child(5), td:nth-child(6), td:nth-child(7) {
-    text-align: right;
-    min-width: 70px;
-}
-
-/* 突出显示限流数据 */
-td:nth-child(6) {
-    color: #d32f2f;
-    font-weight: 500;
-}
-/* 在原有样式后添加 */
-.date-range {
-    font-size: 0.9em;
-    color: #666;
-    margin: 5px 0 15px;
-}
-
-.date-error {
-    color: #d32f2f;
-    padding: 10px;
-    border: 1px solid #ffcdd2;
-    background-color: #ffebee;
-    margin: 10px 0;
-}
-    </style>
-    <script>
-        function loadStats(hour) {
-            window.location.href = "{{ request.url_for('stats_ui') }}?hour=" + encodeURIComponent(hour);
+        :root {
+            --bg: #f6f8fc;
+            --card: #ffffff;
+            --line: #dde5f2;
+            --text: #182235;
+            --muted: #66758f;
+            --primary: #2563eb;
+            --success: #16a34a;
+            --danger: #dc2626;
+            --warn: #ea580c;
+            --chip-bg: #eff4ff;
+            --chip-text: #2d4eb2;
         }
-    </script>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "Manrope", "Noto Sans SC", "Segoe UI", sans-serif;
+            color: var(--text);
+            background: var(--bg);
+        }
+        .topbar {
+            position: sticky;
+            top: 0;
+            z-index: 30;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 20px;
+            background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(7px);
+            border-bottom: 1px solid var(--line);
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 800;
+        }
+        .brand-logo {
+            width: 32px;
+            height: 32px;
+            border-radius: 9px;
+            display: grid;
+            place-items: center;
+            color: #fff;
+            font-size: 13px;
+            background: linear-gradient(135deg, #2563eb, #1e3a8a);
+        }
+        .nav {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .nav a {
+            text-decoration: none;
+            color: #10203d;
+            border: 1px solid var(--line);
+            background: #fff;
+            border-radius: 9px;
+            padding: 7px 11px;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        .nav a:hover { background: #eff6ff; border-color: #c9d8f9; }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 16px 18px 24px;
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            box-shadow: 0 4px 14px rgba(17, 24, 39, 0.05);
+            margin-bottom: 12px;
+        }
+        .card-head {
+            padding: 13px 15px;
+            border-bottom: 1px solid #edf2fb;
+        }
+        .card-head h2 {
+            margin: 0;
+            font-size: 17px;
+        }
+        .card-head p {
+            margin: 5px 0 0;
+            color: var(--muted);
+            font-size: 12px;
+        }
+        .card-body { padding: 14px 15px; }
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 10px;
+        }
+        .field {
+            display: grid;
+            gap: 6px;
+        }
+        .field label {
+            font-size: 12px;
+            color: #334155;
+            font-weight: 700;
+        }
+        .field input,
+        .field select,
+        .field button {
+            height: 38px;
+            border: 1px solid var(--line);
+            border-radius: 9px;
+            padding: 0 10px;
+            font-size: 13px;
+            background: #fff;
+            color: var(--text);
+            outline: none;
+        }
+        .field button {
+            border: 0;
+            font-weight: 700;
+            cursor: pointer;
+            background: linear-gradient(135deg, var(--primary), #1d4ed8);
+            color: #fff;
+        }
+        .field button:hover { filter: brightness(1.04); }
+        .meta-row {
+            margin-top: 9px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+        .chip {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: var(--chip-bg);
+            color: var(--chip-text);
+            font-size: 11px;
+            font-weight: 700;
+            margin-left: 6px;
+        }
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
+            gap: 10px;
+        }
+        .kpi {
+            border: 1px solid #edf2fb;
+            border-radius: 11px;
+            padding: 11px;
+            background: #fff;
+        }
+        .kpi .label {
+            color: var(--muted);
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .kpi .value {
+            margin-top: 7px;
+            font-size: 26px;
+            line-height: 1.05;
+            font-weight: 800;
+        }
+        .ok { color: var(--success); }
+        .bad { color: var(--danger); }
+        .warn { color: var(--warn); }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        @media (max-width: 1120px) {
+            .grid-2 { grid-template-columns: 1fr; }
+        }
+        .table-wrap {
+            border: 1px solid #edf2fb;
+            border-radius: 12px;
+            overflow: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 660px;
+            font-size: 13px;
+        }
+        th, td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #f1f5fb;
+            text-align: left;
+            white-space: nowrap;
+            vertical-align: middle;
+        }
+        th {
+            font-size: 12px;
+            color: var(--muted);
+            background: #f9fbff;
+            font-weight: 700;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+        td.right, th.right { text-align: right; }
+        .mono { font-family: "Consolas", "Courier New", monospace; }
+        .bar-wrap {
+            width: 110px;
+            height: 7px;
+            border-radius: 999px;
+            background: #e8eefc;
+            overflow: hidden;
+        }
+        .bar {
+            height: 100%;
+            background: linear-gradient(90deg, #2563eb, #60a5fa);
+        }
+        .empty {
+            text-align: center;
+            color: var(--muted);
+            font-size: 13px;
+            padding: 16px 10px;
+        }
+        .tips {
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: 12px;
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .loading-mask {
+            position: fixed;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 50;
+            background: rgba(255, 255, 255, 0.7);
+            color: #1d4ed8;
+            font-weight: 800;
+        }
+        .highlight {
+            background: #f0f9ff;
+        }
+    </style>
 </head>
 <body>
-    <div class="nav">
-        <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
-        <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
-        <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
-    </div>
-    <!-- 添加自动刷新选项 -->
-    <div class="auto-refresh">
-        <label>
-            <input type="checkbox" id="autoRefresh"> 每60秒自动刷新
-        </label>
-    </div>
-    <h2>时间段选择</h2>
-    <select class="hour-selector" onchange="loadStats(this.value)">
-        {% for hour in hours %}
-        <option value="{{ hour }}" {% if hour == selected_hour %}selected{% endif %}>
-            {{ hour }}
-        </option>
-        {% endfor %}
-    </select>
-<!-- 每日统计表格 -->
-<h2>七日请求统计
-    {% if not date_filter_info.error and date_filter_info.start_date %}
-    （{{ date_filter_info.start_date }} 至 {{ date_filter_info.end_date }}）
-    {% endif %}
-</h2>
-<table>
-    <tr>
-        <th>日期</th>
-        <th>成功</th>
-        <th>失败</th>
-        <th>限流</th>
-        <th>总计</th>
-    </tr>
-    {% for day in daily_stats %}
-    <tr>
-        <td>{{ day.day }}</td>
-        <td>{{ day.daily_success }}</td>
-        <td>{{ day.daily_fail }}</td>
-        <td>{{ day.daily_rate_limited }}</td>
-        <td>{{ day.daily_total }}</td>
-    </tr>
-    {% else %}
-    <tr>
-        <td colspan="5">暂无数据</td>
-    </tr>
-    {% endfor %}
-</table>
-{% if date_filter_info.error %}
-<div class="date-error">
-    日期过滤条件无效，显示最近7天数据
-</div>
-{% elif date_filter_info.start_date %}
-<div class="date-range">
-    当前显示 {{ date_filter_info.start_date }} 至 {{ date_filter_info.end_date }} 的统计数据
-</div>
-{% endif %}
-<!-- 修改小时统计表格 -->
-<h2>接口调用统计（{{ selected_hour }}）</h2>
-<table>
-    <tr>
-        <th>用户</th>
-        <th>IP地址</th>
-        <th>接口</th>
-        <th>成功</th>
-        <th>失败</th>
-        <th>限流</th>
-        <th>总计</th>
-    </tr>
-    {% for stat in hourly_stats %}
-    <tr>
-        <td>{{ stat.username or '匿名' }}</td>
-        <td>{{ stat.ip }}</td>
-        <td>{{ stat.endpoint }}</td>
-        <td>{{ stat.success_count }}</td>
-        <td>{{ stat.fail_count }}</td>
-        <td>{{ stat.rate_limited_count }}</td>
-        <td>{{ stat.total_count }}</td>
-    </tr>
-    {% else %}
-    <tr>
-        <td colspan="7">暂无数据</td>
-    </tr>
-    {% endfor %}
-    <tr class="total-row">
-        <td colspan="3">总计</td>
-        <td>{{ total_success }}</td>
-        <td>{{ total_fail }}</td>
-        <td>{{ total_rate_limited }}</td>
-        <td>{{ total_count }}</td>
-    </tr>
-</table>
-    
-    <h2>任务耗时分布（{{ selected_hour }}）</h2>
-    <table>
-        <tr>
-            <th>耗时区间</th>
-            <th>任务数量</th>
-        </tr>
-        {% for stat in duration_stats %}
-        <tr>
-            <td>{{ stat.duration_range }}</td>
-            <td>{{ stat.count }}</td>
-        </tr>
-        {% else %}
-        <tr>
-            <td colspan="2">暂无数据</td>
-        </tr>
-        {% endfor %}
-    </table>
-</body>
-<script>
-    // 自动刷新逻辑
-    setInterval(() => {
-        if(document.getElementById('autoRefresh').checked) {
-            loadStats(document.querySelector('.hour-selector').value);
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-logo">VL</div>
+            <span>使用统计看板</span>
+        </div>
+        <nav class="nav">
+            <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
+            <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
+            <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
+        </nav>
+    </header>
+
+    <main class="container">
+        <section class="card">
+            <div class="card-head">
+                <h2>查询条件</h2>
+                <p>统计时区为 UTC+8，明细按 “用户 + IP + 接口” 聚合。</p>
+            </div>
+            <div class="card-body">
+                <div class="controls">
+                    <div class="field">
+                        <label for="hourSelect">统计小时 (UTC+8)</label>
+                        <select id="hourSelect"></select>
+                    </div>
+                    <div class="field">
+                        <label for="detailSearch">明细关键字</label>
+                        <input id="detailSearch" type="text" placeholder="用户名 / IP / 接口">
+                    </div>
+                    <div class="field">
+                        <label for="statusFilter">状态过滤</label>
+                        <select id="statusFilter">
+                            <option value="all">全部</option>
+                            <option value="failed">失败 > 0</option>
+                            <option value="rate_limited">限流 > 0</option>
+                            <option value="success">成功 > 0</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="rowLimit">明细行数</label>
+                        <select id="rowLimit">
+                            <option value="50">50</option>
+                            <option value="100" selected>100</option>
+                            <option value="300">300</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="refreshSec">自动刷新</label>
+                        <select id="refreshSec">
+                            <option value="0">关闭</option>
+                            <option value="30">30秒</option>
+                            <option value="60" selected>60秒</option>
+                            <option value="120">120秒</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label>&nbsp;</label>
+                        <button id="refreshBtn" type="button">刷新数据</button>
+                    </div>
+                </div>
+                <div class="meta-row">
+                    <span id="rangeInfo">时间范围: -</span>
+                    <span id="generatedInfo">更新时间: -</span>
+                    <span id="limitInfo">明细上限: -</span>
+                    <span id="hourInfo">当前小时: -</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>概览指标</h2>
+            </div>
+            <div class="card-body">
+                <div class="kpi-grid" id="summaryCards"></div>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>七日趋势 <span class="chip">按天聚合</span></h2>
+            </div>
+            <div class="card-body">
+                <div id="dailyTableWrap"></div>
+            </div>
+        </section>
+
+        <section class="grid-2">
+            <section class="card">
+                <div class="card-head">
+                    <h2>接口调用排行 <span class="chip">当前小时</span></h2>
+                </div>
+                <div class="card-body">
+                    <div id="endpointTableWrap"></div>
+                </div>
+            </section>
+            <section class="card">
+                <div class="card-head">
+                    <h2>耗时分布 <span class="chip">当前小时</span></h2>
+                </div>
+                <div class="card-body">
+                    <div id="durationTableWrap"></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>请求明细 <span class="chip">当前筛选可导出</span></h2>
+            </div>
+            <div class="card-body">
+                <div id="detailTableWrap"></div>
+                <div class="tips">
+                    <span>说明：明细仅展示服务端返回的 Top 数据，默认已按调用量降序。</span>
+                    <button id="exportCsvBtn" type="button">导出当前明细 CSV</button>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div class="loading-mask" id="loadingMask">正在加载统计数据...</div>
+
+    <script>
+        const API_URL = "{{ request.url_for('stats_data_ui') }}";
+        const initialHour = "{{ selected_hour or '' }}";
+        const state = {
+            data: null,
+            filteredDetails: [],
+            timer: null
+        };
+
+        function escapeHtml(text) {
+            return String(text ?? "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
         }
-    }, 60000);
-</script>
+
+        function fmtNum(value) {
+            return Number(value || 0).toLocaleString();
+        }
+
+        function setLoading(show) {
+            document.getElementById("loadingMask").style.display = show ? "flex" : "none";
+        }
+
+        function buildHourOptions(hours, selectedHour) {
+            const select = document.getElementById("hourSelect");
+            if (!hours || hours.length === 0) {
+                select.innerHTML = '<option value="">暂无数据</option>';
+                return;
+            }
+            select.innerHTML = hours.map((hour) => {
+                const selected = hour === selectedHour ? "selected" : "";
+                return `<option value="${escapeHtml(hour)}" ${selected}>${escapeHtml(hour)}</option>`;
+            }).join("");
+        }
+
+        function renderSummary(summary) {
+            const wrap = document.getElementById("summaryCards");
+            wrap.innerHTML = `
+                <div class="kpi"><div class="label">总请求</div><div class="value">${fmtNum(summary.total_count)}</div></div>
+                <div class="kpi"><div class="label">成功</div><div class="value ok">${fmtNum(summary.total_success)}</div></div>
+                <div class="kpi"><div class="label">失败</div><div class="value bad">${fmtNum(summary.total_fail)}</div></div>
+                <div class="kpi"><div class="label">限流</div><div class="value warn">${fmtNum(summary.total_rate_limited)}</div></div>
+                <div class="kpi"><div class="label">成功率</div><div class="value">${summary.success_rate || 0}%</div></div>
+                <div class="kpi"><div class="label">失败率</div><div class="value">${summary.fail_rate || 0}%</div></div>
+            `;
+        }
+
+        function renderDaily(dailyStats) {
+            const wrap = document.getElementById("dailyTableWrap");
+            if (!dailyStats || dailyStats.length === 0) {
+                wrap.innerHTML = '<div class="empty">暂无七日数据</div>';
+                return;
+            }
+
+            const maxTotal = Math.max(...dailyStats.map((x) => x.daily_total || 0), 1);
+            const rows = dailyStats.map((day) => {
+                const pct = Math.round(((day.daily_total || 0) / maxTotal) * 100);
+                return `
+                    <tr>
+                        <td class="mono">${escapeHtml(day.day)}</td>
+                        <td class="right">${fmtNum(day.daily_success)}</td>
+                        <td class="right">${fmtNum(day.daily_fail)}</td>
+                        <td class="right">${fmtNum(day.daily_rate_limited)}</td>
+                        <td class="right"><strong>${fmtNum(day.daily_total)}</strong></td>
+                        <td><div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div></td>
+                    </tr>
+                `;
+            }).join("");
+
+            wrap.innerHTML = `
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>日期</th>
+                                <th class="right">成功</th>
+                                <th class="right">失败</th>
+                                <th class="right">限流</th>
+                                <th class="right">总计</th>
+                                <th>趋势</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        function renderEndpoints(rows) {
+            const wrap = document.getElementById("endpointTableWrap");
+            if (!rows || rows.length === 0) {
+                wrap.innerHTML = '<div class="empty">当前小时暂无接口调用</div>';
+                return;
+            }
+
+            const maxTotal = Math.max(...rows.map((x) => x.total_count || 0), 1);
+            const htmlRows = rows.map((row, idx) => {
+                const pct = Math.round(((row.total_count || 0) / maxTotal) * 100);
+                return `
+                    <tr ${idx === 0 ? 'class="highlight"' : ""}>
+                        <td>${idx + 1}</td>
+                        <td class="mono">${escapeHtml(row.endpoint)}</td>
+                        <td class="right">${fmtNum(row.total_count)}</td>
+                        <td class="right ok">${fmtNum(row.success_count)}</td>
+                        <td class="right bad">${fmtNum(row.fail_count)}</td>
+                        <td><div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div></td>
+                    </tr>
+                `;
+            }).join("");
+
+            wrap.innerHTML = `
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>接口</th>
+                                <th class="right">总计</th>
+                                <th class="right">成功</th>
+                                <th class="right">失败</th>
+                                <th>占比</th>
+                            </tr>
+                        </thead>
+                        <tbody>${htmlRows}</tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        function renderDuration(rows) {
+            const wrap = document.getElementById("durationTableWrap");
+            if (!rows || rows.length === 0) {
+                wrap.innerHTML = '<div class="empty">当前小时暂无耗时数据</div>';
+                return;
+            }
+
+            const maxCount = Math.max(...rows.map((x) => x.count || 0), 1);
+            const htmlRows = rows.map((row) => {
+                const pct = Math.round(((row.count || 0) / maxCount) * 100);
+                return `
+                    <tr>
+                        <td class="mono">${escapeHtml(row.duration_range)}</td>
+                        <td class="right">${fmtNum(row.count)}</td>
+                        <td><div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div></td>
+                    </tr>
+                `;
+            }).join("");
+
+            wrap.innerHTML = `
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>耗时区间</th>
+                                <th class="right">数量</th>
+                                <th>分布</th>
+                            </tr>
+                        </thead>
+                        <tbody>${htmlRows}</tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        function applyDetailFilter() {
+            const data = state.data;
+            const wrap = document.getElementById("detailTableWrap");
+            if (!data || !data.hourly_stats) {
+                wrap.innerHTML = '<div class="empty">暂无明细数据</div>';
+                return;
+            }
+
+            const keyword = document.getElementById("detailSearch").value.trim().toLowerCase();
+            const status = document.getElementById("statusFilter").value;
+            const rowLimit = Number(document.getElementById("rowLimit").value || 100);
+
+            const filtered = data.hourly_stats.filter((row) => {
+                const text = `${row.username} ${row.ip} ${row.endpoint}`.toLowerCase();
+                if (keyword && !text.includes(keyword)) return false;
+                if (status === "failed" && !(row.fail_count > 0)) return false;
+                if (status === "rate_limited" && !(row.rate_limited_count > 0)) return false;
+                if (status === "success" && !(row.success_count > 0)) return false;
+                return true;
+            }).slice(0, rowLimit);
+
+            state.filteredDetails = filtered;
+
+            if (filtered.length === 0) {
+                wrap.innerHTML = '<div class="empty">没有匹配的明细数据</div>';
+                return;
+            }
+
+            const rows = filtered.map((row, idx) => `
+                <tr>
+                    <td>${idx + 1}</td>
+                    <td>${escapeHtml(row.username)}</td>
+                    <td class="mono">${escapeHtml(row.ip)}</td>
+                    <td class="mono">${escapeHtml(row.endpoint)}</td>
+                    <td class="right ok">${fmtNum(row.success_count)}</td>
+                    <td class="right bad">${fmtNum(row.fail_count)}</td>
+                    <td class="right warn">${fmtNum(row.rate_limited_count)}</td>
+                    <td class="right"><strong>${fmtNum(row.total_count)}</strong></td>
+                </tr>
+            `).join("");
+
+            wrap.innerHTML = `
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>用户</th>
+                                <th>IP</th>
+                                <th>接口</th>
+                                <th class="right">成功</th>
+                                <th class="right">失败</th>
+                                <th class="right">限流</th>
+                                <th class="right">总计</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        function renderMeta(data) {
+            const info = data.date_filter_info || {};
+            document.getElementById("rangeInfo").textContent = `时间范围: ${info.start_date || "-"} ~ ${info.end_date || "-"}`;
+            document.getElementById("generatedInfo").textContent = `更新时间: ${data.meta?.generated_at || "-"}`;
+            document.getElementById("limitInfo").textContent = `明细上限: ${data.meta?.max_detail_rows || "-"}`;
+            document.getElementById("hourInfo").textContent = `当前小时: ${data.selected_hour || "-"}`;
+        }
+
+        function exportCurrentCsv() {
+            const rows = state.filteredDetails || [];
+            if (rows.length === 0) {
+                alert("当前没有可导出的明细数据");
+                return;
+            }
+
+            const headers = ["username", "ip", "endpoint", "success_count", "fail_count", "rate_limited_count", "total_count"];
+            const lines = [headers.join(",")];
+            rows.forEach((row) => {
+                const values = headers.map((key) => {
+                    const value = String(row[key] ?? "");
+                    return `"${value.replace(/"/g, '""')}"`;
+                });
+                lines.push(values.join(","));
+            });
+
+            const csv = "\ufeff" + lines.join("\n");
+            const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = `stats_detail_${(state.data?.selected_hour || "latest").replace(/[ :]/g, "_")}.csv`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }
+
+        async function fetchStats(hourValue) {
+            const hour = typeof hourValue === "string" ? hourValue : document.getElementById("hourSelect").value;
+            const url = hour ? `${API_URL}?hour=${encodeURIComponent(hour)}` : API_URL;
+            setLoading(true);
+            try {
+                const res = await fetch(url, { credentials: "same-origin" });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+
+                state.data = data;
+                buildHourOptions(data.hours || [], data.selected_hour || "");
+                renderSummary(data.summary || {});
+                renderDaily(data.daily_stats || []);
+                renderEndpoints(data.top_endpoints || []);
+                renderDuration(data.duration_stats || []);
+                renderMeta(data);
+                applyDetailFilter();
+            } catch (err) {
+                console.error(err);
+                document.getElementById("summaryCards").innerHTML = '<div class="empty">加载失败，请重试</div>';
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        function setupAutoRefresh() {
+            const sec = Number(document.getElementById("refreshSec").value || 0);
+            if (state.timer) {
+                clearInterval(state.timer);
+                state.timer = null;
+            }
+            if (sec > 0) {
+                state.timer = setInterval(() => fetchStats(), sec * 1000);
+            }
+        }
+
+        function bindEvents() {
+            document.getElementById("hourSelect").addEventListener("change", () => fetchStats());
+            document.getElementById("refreshBtn").addEventListener("click", () => fetchStats());
+            document.getElementById("detailSearch").addEventListener("input", applyDetailFilter);
+            document.getElementById("statusFilter").addEventListener("change", applyDetailFilter);
+            document.getElementById("rowLimit").addEventListener("change", applyDetailFilter);
+            document.getElementById("refreshSec").addEventListener("change", setupAutoRefresh);
+            document.getElementById("exportCsvBtn").addEventListener("click", exportCurrentCsv);
+        }
+
+        async function init() {
+            bindEvents();
+            await fetchStats(initialHour);
+            setupAutoRefresh();
+        }
+
+        init();
+    </script>
+</body>
 </html>

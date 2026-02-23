@@ -1,241 +1,593 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>User Management</title>
+    <title>用户管理 - VoiceLink Server</title>
     <style>
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
+        :root {
+            --bg: #f6f8fc;
+            --card: #ffffff;
+            --line: #dde5f2;
+            --text: #182235;
+            --muted: #66758f;
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --danger: #dc2626;
+            --danger-hover: #b91c1c;
+            --tag-bg: #eff4ff;
+            --tag-text: #2d4eb2;
+            --ok-bg: #ecfdf3;
+            --ok-text: #166534;
+            --bad-bg: #fff1f2;
+            --bad-text: #b42318;
         }
-        /* 新增导航栏样式 */
-        .nav {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            background: white;
-            padding: 15px 30px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-            z-index: 1000;
-            display: flex;
-            gap: 25px;
-            border-bottom: 1px solid #eee;
-        }
-
-        .nav a {
-            text-decoration: none;
-            color: #333;
-            font-weight: 500;
-            transition: color 0.3s ease;
-            padding: 5px 10px;
-            border-radius: 4px;
-        }
-
-        .nav a:hover {
-            color: #007bff;
-            background: #f8f9fa;
-        }
-
-        /* 调整原有布局 */
+        * { box-sizing: border-box; }
         body {
-            font-family: Arial, sans-serif;
-            min-height: 100vh;
-            display: flex;
-            background: #f0f2f5;
-            padding-top: 60px; /* 为导航栏留出空间 */
+            margin: 0;
+            font-family: "Manrope", "Noto Sans SC", "Segoe UI", sans-serif;
+            color: var(--text);
+            background: var(--bg);
         }
-
-        .sidebar {
-            width: 350px;
-            background: white;
-            padding: 20px;
-            height: calc(100vh - 60px); /* 计算高度 */
-            overflow-y: auto;
-            position: fixed;
-            left: 0;
-            top: 60px; /* 下移导航栏高度 */
-        }
-
-        .main-content {
-            flex: 1;
-            margin-left: 350px;
-            padding: 30px;
-            background: #f8f9fa;
-            min-height: calc(100vh - 60px);
-            margin-top: 60px; /* 保持主内容对齐 */
-        }
-
-        /* 右侧内容区域 */
-        .main-content {
-            flex: 1;
-            margin-left: 350px;
-            padding: 30px;
-            background: #f8f9fa;
-            min-height: 100vh;
-        }
-
-        /* 表单样式 */
-        .form-group {
-            margin-bottom: 15px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .form-group label {
-            width: 120px;
-            text-align: right;
-        }
-
-        input[type="text"],
-        input[type="password"],
-        input[type="date"] {
-            flex: 1;
-            padding: 8px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }
-
-        /* 用户列表样式 */
-        .user-list {
-            list-style: none;
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            padding: 20px;
-        }
-
-        .user-item {
-            padding: 15px;
-            border-bottom: 1px solid #eee;
+        .topbar {
+            position: sticky;
+            top: 0;
+            z-index: 20;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            padding: 12px 20px;
+            background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(7px);
+            border-bottom: 1px solid var(--line);
         }
-
-        .alert {
-            padding: 10px;
-            background: #e3f4ff;
-            border-radius: 4px;
-            margin: 15px 0;
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 800;
         }
-
+        .brand-logo {
+            width: 32px;
+            height: 32px;
+            border-radius: 9px;
+            display: grid;
+            place-items: center;
+            color: #fff;
+            font-size: 13px;
+            background: linear-gradient(135deg, #2563eb, #1e3a8a);
+        }
+        .nav {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .nav a {
+            text-decoration: none;
+            color: #10203d;
+            border: 1px solid var(--line);
+            background: #fff;
+            border-radius: 9px;
+            padding: 7px 11px;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        .nav a:hover { background: #eff6ff; border-color: #c9d8f9; }
+        .layout {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 18px;
+            display: grid;
+            grid-template-columns: 390px 1fr;
+            gap: 14px;
+            align-items: start;
+        }
+        .form-panel {
+            position: sticky;
+            top: 72px;
+            max-height: calc(100vh - 88px);
+            overflow: auto;
+        }
+        .list-panel {
+            min-width: 0;
+        }
+        @media (max-width: 1080px) {
+            .layout { grid-template-columns: 1fr; }
+            .form-panel {
+                position: static;
+                max-height: none;
+                overflow: visible;
+            }
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            box-shadow: 0 4px 14px rgba(17, 24, 39, 0.05);
+        }
+        .card-head {
+            border-bottom: 1px solid #edf2fb;
+            padding: 14px 16px;
+        }
+        .card-head h2 {
+            margin: 0;
+            font-size: 17px;
+        }
+        .card-head p {
+            margin: 6px 0 0;
+            color: var(--muted);
+            font-size: 12px;
+        }
+        .card-body { padding: 14px 16px 16px; }
+        .form-grid {
+            display: grid;
+            gap: 11px;
+        }
+        .field { display: grid; gap: 6px; }
+        .field label {
+            font-size: 12px;
+            color: #334155;
+            font-weight: 700;
+        }
+        input[type="text"],
+        input[type="password"],
+        input[type="date"] {
+            width: 100%;
+            height: 38px;
+            border: 1px solid var(--line);
+            border-radius: 9px;
+            padding: 0 10px;
+            font-size: 13px;
+            color: var(--text);
+            background: #fff;
+            outline: none;
+        }
+        input:focus {
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+        }
+        .check-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 9px;
+        }
+        .check-item {
+            border: 1px solid var(--line);
+            border-radius: 9px;
+            padding: 8px 10px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 13px;
+            color: #334155;
+            background: #fbfdff;
+        }
+        .check-item input[type="checkbox"] {
+            width: 15px;
+            height: 15px;
+        }
+        .btn-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 9px;
+            margin-top: 2px;
+        }
         button {
-            padding: 6px 12px;
-            background: #007bff;
-            color: white;
-            border: none;
-            border-radius: 4px;
+            height: 39px;
+            border: 0;
+            border-radius: 9px;
+            font-size: 13px;
+            font-weight: 700;
             cursor: pointer;
         }
-
-        button:hover {
-            background: #0056b3;
+        .btn-primary {
+            background: linear-gradient(135deg, var(--primary), #1d4ed8);
+            color: #fff;
         }
-
-        /* 响应式设计 */
-        @media (max-width: 768px) {
-            .sidebar {
-                width: 100%;
-                position: static;
-                height: auto;
-            }
-            
-            .main-content {
-                margin-left: 0;
-            }
-            
-            body {
-                flex-direction: column;
-            }
+        .btn-primary:hover { background: linear-gradient(135deg, var(--primary-hover), #1e40af); }
+        .btn-ghost {
+            border: 1px solid var(--line);
+            background: #fff;
+            color: #334155;
+        }
+        .btn-ghost:hover { background: #f8fbff; }
+        .flash-list {
+            margin: 0;
+            padding: 0;
+            list-style: none;
+            display: grid;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .flash-list li {
+            border: 1px solid #c9ddff;
+            background: #eef5ff;
+            color: #194592;
+            border-radius: 9px;
+            padding: 8px 10px;
+            font-size: 13px;
+        }
+        .filters {
+            display: grid;
+            grid-template-columns: 1fr 130px 130px;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(140px, 1fr));
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        .stats-item {
+            border: 1px solid #edf2fb;
+            border-radius: 10px;
+            padding: 10px;
+            background: #fcfdff;
+        }
+        .stats-item .label {
+            font-size: 12px;
+            color: var(--muted);
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+        .stats-item .value {
+            font-size: 24px;
+            line-height: 1.1;
+            font-weight: 800;
+        }
+        @media (max-width: 760px) {
+            .filters { grid-template-columns: 1fr; }
+            .stats-grid { grid-template-columns: 1fr 1fr; }
+        }
+        select {
+            width: 100%;
+            height: 38px;
+            border: 1px solid var(--line);
+            border-radius: 9px;
+            padding: 0 10px;
+            font-size: 13px;
+            color: var(--text);
+            background: #fff;
+            outline: none;
+        }
+        .table-wrap {
+            border: 1px solid #edf2fb;
+            border-radius: 12px;
+            overflow: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+            min-width: 760px;
+        }
+        th, td {
+            padding: 9px 10px;
+            border-bottom: 1px solid #f1f5fb;
+            text-align: left;
+            white-space: nowrap;
+        }
+        th {
+            font-size: 12px;
+            color: var(--muted);
+            background: #f9fbff;
+            font-weight: 700;
+        }
+        .role-tag {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: var(--tag-bg);
+            color: var(--tag-text);
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .status-tag {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .status-active { background: var(--ok-bg); color: var(--ok-text); }
+        .status-inactive { background: var(--bad-bg); color: var(--bad-text); }
+        .actions {
+            display: flex;
+            gap: 7px;
+        }
+        .btn-mini {
+            height: 30px;
+            border-radius: 8px;
+            padding: 0 10px;
+            font-size: 12px;
+        }
+        .btn-edit {
+            border: 1px solid #bfdbfe;
+            background: #eff6ff;
+            color: #1e40af;
+        }
+        .btn-delete {
+            background: var(--danger);
+            color: #fff;
+        }
+        .btn-delete:hover { background: var(--danger-hover); }
+        .meta-row {
+            margin-top: 12px;
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: wrap;
+            color: var(--muted);
+            font-size: 12px;
+        }
+        .empty {
+            text-align: center;
+            color: var(--muted);
+            padding: 15px 8px;
         }
     </style>
 </head>
 <body>
- <!-- 新增导航栏 -->
-  <nav class="nav">
-    <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
-    <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
-    <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
-  </nav>
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-logo">VL</div>
+            <span>后台管理</span>
+        </div>
+        <nav class="nav">
+            <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
+            <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
+            <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
+        </nav>
+    </header>
 
-    <!-- 左侧表单区 -->
-    <div class="sidebar">
-        <h2>User Management</h2>
-
-        <h3 style="margin: 0 0 15px;">Add/Update User</h3>
-        <form method="POST">
-            <div class="form-group">
-                <label for="new_username">Username:</label>
-                <input type="text" id="new_username" name="new_username" required>
+    <main class="layout">
+        <section class="card form-panel">
+            <div class="card-head">
+                <h2>新增 / 更新用户</h2>
+                <p>点右侧“编辑”可快速回填表单，默认是新增模式。</p>
             </div>
+            <div class="card-body">
+                {% if messages %}
+                <ul class="flash-list">
+                    {% for message in messages %}
+                    <li>{{ message }}</li>
+                    {% endfor %}
+                </ul>
+                {% endif %}
 
-            <div class="form-group">
-                <label for="new_password">Password:</label>
-                <input type="password" id="new_password" name="new_password">
-            </div>
+                <form method="POST" id="userForm">
+                    <div class="form-grid">
+                        <div class="field">
+                            <label for="new_username">用户名</label>
+                            <input type="text" id="new_username" name="new_username" required>
+                        </div>
+                        <div class="field">
+                            <label for="new_password">密码</label>
+                            <input type="password" id="new_password" name="new_password" placeholder="新增必填，更新可留空">
+                        </div>
+                        <div class="field">
+                            <label for="new_limit_rule">限流规则</label>
+                            <input type="text" id="new_limit_rule" name="new_limit_rule" placeholder="例如: 10000/day;1000/hour">
+                        </div>
+                        <div class="field">
+                            <label for="expiration_date">到期日期</label>
+                            <input type="date" id="expiration_date" name="expiration_date">
+                        </div>
 
-            <div class="form-group">
-                <label for="new_is_admin">Is Admin:</label>
-                <input type="checkbox" id="new_is_admin" name="new_is_admin">
-            </div>
+                        <div class="check-row">
+                            <label class="check-item" for="new_is_admin">
+                                <span>管理员权限</span>
+                                <input type="checkbox" id="new_is_admin" name="new_is_admin">
+                            </label>
+                            <label class="check-item" for="is_active">
+                                <span>账号启用</span>
+                                <input type="checkbox" id="is_active" name="is_active" checked>
+                            </label>
+                        </div>
 
-            <div class="form-group">
-                <label for="new_limit_rule">Limit Rule:</label>
-                <input type="text" id="new_limit_rule" name="new_limit_rule">
-            </div>
+                        <label class="check-item" for="is_update">
+                            <span>更新模式（勾选后按用户名更新）</span>
+                            <input type="checkbox" id="is_update" name="is_update">
+                        </label>
 
-            <div class="form-group">
-                <label for="expiration_date">Expiration Date:</label>
-                <input type="date" id="expiration_date" name="expiration_date">
-            </div>
-
-            <div class="form-group">
-                <label for="is_active">Active:</label>
-                <input type="checkbox" id="is_active" name="is_active" checked>
-            </div>
-
-            <div class="form-group">
-                <label for="is_update">Is Update:</label>
-                <input type="checkbox" id="is_update" name="is_update">
-            </div>
-
-            <button type="submit" style="width: 100%;margin-top: 15px;">Submit</button>
-        </form>
-
-        {% if messages %}
-            {% for message in messages %}
-                <div class="alert">{{ message }}</div>
-            {% endfor %}
-        {% endif %}
-    </div>
-
-    <!-- 右侧用户列表 -->
-    <div class="main-content">
-        <h3>Existing Users</h3>
-        <ul class="user-list">
-            {% for user in users %}
-                <li class="user-item">
-                    <div>
-                        <strong>{{ user.username }}</strong>
-                        <div style="color: #666; font-size: 0.9em; margin-top: 5px;">
-                            Admin: {{ user.is_admin }} | 
-                            Limit: {{ user.limit_rule }} | 
-                            Status: <span style="color: {{ 'green' if user.is_active else 'red' }}">{{ 'Active' if user.is_active else 'Inactive' }}</span> | 
-                            Expires: {{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else 'Never' }}
+                        <div class="btn-row">
+                            <button class="btn-primary" type="submit">提交</button>
+                            <button class="btn-ghost" type="button" id="resetFormBtn">重置表单</button>
                         </div>
                     </div>
-                    <form action="{{ request.url_for('delete_user_ui') }}" method="post">
-                        <input type="hidden" name="id" value="{{user.id}}">
-                        <button type="submit" style="background: #dc3545;">Delete</button>
-                    </form>
-                </li>
-            {% endfor %}
-        </ul>
-    </div>
+                </form>
+            </div>
+        </section>
+
+        <section class="card list-panel">
+            <div class="card-head">
+                <h2>用户列表</h2>
+                <p>支持本地搜索与过滤，删除操作会立即生效。</p>
+            </div>
+            <div class="card-body">
+                <div class="stats-grid">
+                    <div class="stats-item">
+                        <div class="label">总用户数</div>
+                        <div class="value">{{ user_stats.total_users }}</div>
+                    </div>
+                    <div class="stats-item">
+                        <div class="label">非长期总用户数</div>
+                        <div class="value">{{ user_stats.non_permanent_users }}</div>
+                    </div>
+                    <div class="stats-item">
+                        <div class="label">启用状态用户数</div>
+                        <div class="value">{{ user_stats.active_users }}</div>
+                    </div>
+                    <div class="stats-item">
+                        <div class="label">7天内到期(启用)</div>
+                        <div class="value">{{ user_stats.expiring_in_7_days }}</div>
+                    </div>
+                </div>
+
+                <div class="filters">
+                    <input type="text" id="searchInput" placeholder="搜索用户名 / 限流规则 / 到期日">
+                    <select id="roleFilter">
+                        <option value="all">全部角色</option>
+                        <option value="admin">仅管理员</option>
+                        <option value="user">仅普通用户</option>
+                    </select>
+                    <select id="statusFilter">
+                        <option value="all">全部状态</option>
+                        <option value="active">仅启用</option>
+                        <option value="inactive">仅停用</option>
+                    </select>
+                </div>
+
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>用户名</th>
+                                <th>角色</th>
+                                <th>状态</th>
+                                <th>限流规则</th>
+                                <th>到期日</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="userTableBody">
+                            {% for user in users %}
+                            <tr
+                                data-username="{{ user.username }}"
+                                data-is-admin="{{ '1' if user.is_admin else '0' }}"
+                                data-is-active="{{ '1' if user.is_active else '0' }}"
+                                data-limit-rule="{{ user.limit_rule or '' }}"
+                                data-expiration="{{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else '' }}"
+                            >
+                                <td><strong>{{ user.username }}</strong></td>
+                                <td>
+                                    {% if user.is_admin %}
+                                    <span class="role-tag">管理员</span>
+                                    {% else %}
+                                    <span class="role-tag">普通用户</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if user.is_active %}
+                                    <span class="status-tag status-active">启用</span>
+                                    {% else %}
+                                    <span class="status-tag status-inactive">停用</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ user.limit_rule or '-' }}</td>
+                                <td>{{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else '长期有效' }}</td>
+                                <td>
+                                    <div class="actions">
+                                        <button type="button" class="btn-mini btn-edit js-edit-btn">编辑</button>
+                                        <form action="{{ request.url_for('delete_user_ui') }}" method="post" onsubmit="return confirm('确认删除用户 {{ user.username }} ?')">
+                                            <input type="hidden" name="id" value="{{ user.id }}">
+                                            <button type="submit" class="btn-mini btn-delete">删除</button>
+                                        </form>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                    {% if users|length == 0 %}
+                    <div class="empty">暂无用户数据</div>
+                    {% endif %}
+                </div>
+
+                <div class="meta-row">
+                    <span id="visibleCount">显示 0 / 0</span>
+                    <span>提示：点击“编辑”会自动勾选“更新模式”。</span>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script>
+        const searchInput = document.getElementById("searchInput");
+        const roleFilter = document.getElementById("roleFilter");
+        const statusFilter = document.getElementById("statusFilter");
+        const userTableBody = document.getElementById("userTableBody");
+        const visibleCount = document.getElementById("visibleCount");
+        const resetFormBtn = document.getElementById("resetFormBtn");
+
+        const formRefs = {
+            username: document.getElementById("new_username"),
+            password: document.getElementById("new_password"),
+            isAdmin: document.getElementById("new_is_admin"),
+            limitRule: document.getElementById("new_limit_rule"),
+            expirationDate: document.getElementById("expiration_date"),
+            isActive: document.getElementById("is_active"),
+            isUpdate: document.getElementById("is_update")
+        };
+
+        function resetForm() {
+            formRefs.username.value = "";
+            formRefs.password.value = "";
+            formRefs.isAdmin.checked = false;
+            formRefs.limitRule.value = "";
+            formRefs.expirationDate.value = "";
+            formRefs.isActive.checked = true;
+            formRefs.isUpdate.checked = false;
+        }
+
+        function fillFormFromRow(row) {
+            formRefs.username.value = row.dataset.username || "";
+            formRefs.password.value = "";
+            formRefs.isAdmin.checked = row.dataset.isAdmin === "1";
+            formRefs.limitRule.value = row.dataset.limitRule || "";
+            formRefs.expirationDate.value = row.dataset.expiration || "";
+            formRefs.isActive.checked = row.dataset.isActive === "1";
+            formRefs.isUpdate.checked = true;
+            window.scrollTo({ top: 0, behavior: "smooth" });
+        }
+
+        function matchRole(row, role) {
+            const isAdmin = row.dataset.isAdmin === "1";
+            if (role === "admin") return isAdmin;
+            if (role === "user") return !isAdmin;
+            return true;
+        }
+
+        function matchStatus(row, status) {
+            const isActive = row.dataset.isActive === "1";
+            if (status === "active") return isActive;
+            if (status === "inactive") return !isActive;
+            return true;
+        }
+
+        function applyFilters() {
+            const keyword = searchInput.value.trim().toLowerCase();
+            const role = roleFilter.value;
+            const status = statusFilter.value;
+            const rows = Array.from(userTableBody.querySelectorAll("tr"));
+
+            let shown = 0;
+            rows.forEach((row) => {
+                const text = `${row.dataset.username} ${row.dataset.limitRule} ${row.dataset.expiration}`.toLowerCase();
+                const okKeyword = !keyword || text.includes(keyword);
+                const okRole = matchRole(row, role);
+                const okStatus = matchStatus(row, status);
+                const visible = okKeyword && okRole && okStatus;
+                row.style.display = visible ? "" : "none";
+                if (visible) shown += 1;
+            });
+            visibleCount.textContent = `显示 ${shown} / ${rows.length}`;
+        }
+
+        document.querySelectorAll(".js-edit-btn").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const row = btn.closest("tr");
+                if (row) fillFormFromRow(row);
+            });
+        });
+
+        searchInput.addEventListener("input", applyFilters);
+        roleFilter.addEventListener("change", applyFilters);
+        statusFilter.addEventListener("change", applyFilters);
+        resetFormBtn.addEventListener("click", resetForm);
+
+        applyFilters();
+    </script>
 </body>
 </html>

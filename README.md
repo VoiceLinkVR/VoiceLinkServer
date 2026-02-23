@@ -258,6 +258,14 @@ Response:
 | LIMIT_ENABLE | Enable rate limiting | False |
 | LIMITER_REDIS_URL | Redis connection URL | - |
 | TRANSLATOR_SERVICES_LIST | Translation services list | bing,modernMt,cloudTranslation |
+| UPDATE_PUBLIC_BASE_URL | Public base URL for update files (optional) | - |
+| UPDATE_STATIC_ROOT | Static root folder for update assets | src/data/update/files |
+| UPDATE_MANIFEST_PATH | App update manifest path | src/data/update/update_manifest.json |
+| MODEL_MANIFEST_PATH | Model catalog manifest path | src/data/update/models_manifest.json |
+| TRANSLATION_PROFILE_MANIFEST_PATH | Translation profile manifest path | src/data/update/translation_profile_manifest.json |
+| TRANSLATOR_RUNTIME_MANIFEST_PATH | Translator runtime manifest path | src/data/update/translator_runtime_manifest.json |
+| TRANSLATION_CAPABILITIES_CACHE_SECONDS | Translator capability cache TTL (seconds) | 1800 |
+| TRANSLATION_CAPABILITY_TIMEOUT | Capability fetch timeout per engine (seconds) | 4.0 |
 | ENABLE_WEB_TRANSLATORS | Enable online translation services | True |
 | JWT_SECRET_KEY | JWT secret key (change in production) | voicelinkvr-secret-key |
 | SQL_PATH | Database connection string | sqlite:///data/db/users.db |

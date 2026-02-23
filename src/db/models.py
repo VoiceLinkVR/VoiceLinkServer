@@ -1,6 +1,9 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float
-from .base import Base
 from datetime import datetime
+
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float
+
+from .base import Base
+
 
 class User(Base):
     __tablename__ = "user"
@@ -10,8 +13,9 @@ class User(Base):
     password = Column(String(80), nullable=False)
     is_admin = Column(Boolean, default=False)
     limit_rule = Column(String(100), nullable=True)
-    expiration_date = Column(DateTime, nullable=True)  # 有效期字段
-    is_active = Column(Boolean, default=True)  # 激活状态字段
+    expiration_date = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+
 
 class RequestLog(Base):
     __tablename__ = "request_log"
@@ -19,7 +23,7 @@ class RequestLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), nullable=True)
     ip = Column(String(45), nullable=False)
-    endpoint = Column(String(100), nullable=False)
-    timestamp = Column(DateTime, default=datetime.now)
+    endpoint = Column(String(100), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.now, index=True)
     duration = Column(Float, nullable=False)
-    status = Column(String(20), nullable=False)  # 状态字段
+    status = Column(String(20), nullable=False, index=True)

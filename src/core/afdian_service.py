@@ -28,7 +28,13 @@ class AfdianService:
     def _to_compact_json(payload: Dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
-    def build_custom_id(self, username: str, password: str, action: str) -> str:
+    def build_custom_id(
+        self,
+        username: str,
+        password: str,
+        action: str,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> str:
         payload = {
             "v": 1,
             "username": username,
@@ -37,6 +43,11 @@ class AfdianService:
             "ts": int(time.time()),
             "nonce": uuid.uuid4().hex[:16],
         }
+        if extra_payload:
+            for key, value in extra_payload.items():
+                if key in payload:
+                    continue
+                payload[key] = value
         token = self._fernet.encrypt(self._to_compact_json(payload).encode("utf-8"))
         return token.decode("utf-8")
 

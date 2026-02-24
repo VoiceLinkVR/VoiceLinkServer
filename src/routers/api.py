@@ -1,11 +1,14 @@
 import emoji
 import httpx
+import re
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form, Body, Response
 # 移除 OAuth2PasswordRequestForm 的导入
 # from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
+from sqlalchemy import func, case
 from pydantic import BaseModel
+from typing import Optional
 
 from core.dependencies import (
     get_db,
@@ -13,10 +16,11 @@ from core.dependencies import (
     verify_password,
     get_current_user_for_status,
     is_user_expired,
+    get_effective_user_limit_rule,
 )
 from core.rate_limiter import enforce_user_rate_limit
 from core.config import settings
-from db.models import User
+from db.models import User, RequestLog
 from core.services import (
     whisperclient, errorFilter, do_translate, translate_local,
     supportedLanguagesList, whisperSupportedLanguageList, SENSEVOICE_URL, packaged_opus_stream_to_wav_bytes,
@@ -28,6 +32,24 @@ from core.logging_config import logger
 from schemas.user import UserLogin
 
 router = APIRouter()
+DAY_LIMIT_RULE_PATTERN = re.compile(r"^\s*(\d+)\s*/\s*day\s*$", re.IGNORECASE)
+
+
+def _extract_daily_limit(limit_rule: str) -> Optional[int]:
+    if not limit_rule:
+        return None
+    for part in (segment.strip() for segment in limit_rule.split(";") if segment.strip()):
+        matched = DAY_LIMIT_RULE_PATTERN.match(part)
+        if matched:
+            return int(matched.group(1))
+    return None
+
+
+def _is_test_user(username: str) -> bool:
+    configured = (settings.LIMIT_PUBLIC_TEST_USER or "").strip()
+    if configured and username == configured:
+        return True
+    return username.lower() == "testuser"
 
 # --- API 路由 ---
 
@@ -71,6 +93,12 @@ async def login(db: Session = Depends(get_db), user_credentials: UserLogin = Bod
 
 @router.get("/account/status")
 async def account_status(current_user: User = Depends(get_current_user_for_status)):
+    if _is_test_user(current_user.username):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "test_user_unsupported", "message": "测试账户不支持查询账户到期信息"},
+        )
+
     expires_at = current_user.expiration_date
     boost_expires_at = current_user.boost_expiration_date
     now = datetime.now(timezone.utc)
@@ -107,6 +135,75 @@ async def account_status(current_user: User = Depends(get_current_user_for_statu
         "boost_expiration_utc": boost_expiration_utc,
         "boost_remaining_seconds": boost_remaining_seconds,
         "boost_limit_rule": current_user.boost_limit_rule,
+    }
+
+
+@router.get("/account/usage")
+async def account_usage(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_for_status),
+):
+    if _is_test_user(current_user.username):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "test_user_unsupported", "message": "测试账户不支持查询用量和到期信息"},
+        )
+
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
+    day_end = day_start.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    usage_row = (
+        db.query(
+            func.sum(case((RequestLog.status == "success", 1), else_=0)).label("success_count"),
+            func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("failed_count"),
+            func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+            func.count().label("total_count"),
+        )
+        .filter(
+            RequestLog.username == current_user.username,
+            RequestLog.timestamp >= day_start,
+            RequestLog.timestamp <= day_end,
+        )
+        .first()
+    )
+
+    success_count = int((usage_row.success_count if usage_row and usage_row.success_count is not None else 0) or 0)
+    failed_count = int((usage_row.failed_count if usage_row and usage_row.failed_count is not None else 0) or 0)
+    rate_limited_count = int((usage_row.rate_limited_count if usage_row and usage_row.rate_limited_count is not None else 0) or 0)
+    total_count = int((usage_row.total_count if usage_row and usage_row.total_count is not None else 0) or 0)
+
+    limit_rule = get_effective_user_limit_rule(current_user) or ""
+    daily_limit = _extract_daily_limit(limit_rule)
+    remaining_daily = None if daily_limit is None else max(0, daily_limit - success_count)
+
+    expires_at = current_user.expiration_date
+    expiration_utc = None
+    remaining_seconds = None
+    is_expired = False
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at.astimezone(timezone.utc)
+        expiration_utc = expires_at.isoformat().replace("+00:00", "Z")
+        remaining_seconds = int((expires_at - now).total_seconds())
+        is_expired = remaining_seconds <= 0
+
+    return {
+        "username": current_user.username,
+        "is_test_user": False,
+        "is_active": bool(current_user.is_active),
+        "is_expired": is_expired,
+        "expiration_utc": expiration_utc,
+        "remaining_seconds": remaining_seconds,
+        "limit_rule": limit_rule,
+        "daily_limit": daily_limit,
+        "remaining_daily": remaining_daily,
+        "daily_success_count": success_count,
+        "daily_failed_count": failed_count,
+        "daily_rate_limited_count": rate_limited_count,
+        "daily_total_count": total_count,
     }
 
 @router.post("/whisper/transcriptions")

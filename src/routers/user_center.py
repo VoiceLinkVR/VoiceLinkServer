@@ -2,7 +2,7 @@ import json
 import re
 from decimal import Decimal, ROUND_FLOOR
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -17,15 +17,23 @@ from db.models import PaymentOrder, User
 router = APIRouter()
 
 
-SUPPORTED_ACTIONS = {"renew_1m", "boost_1m"}
 DAY_LIMIT_RULE_PATTERN = re.compile(r"^\s*(\d+)\s*/\s*day\s*$", re.IGNORECASE)
 NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
+ACTION_ALIASES = {
+    "renew_1m": "renew",
+    "boost_1m": "upgrade",
+    "renew": "renew",
+    "upgrade": "upgrade",
+}
+PRICE_EPSILON = 0.0001
 
 
 class PaymentLinkRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6, max_length=100)
-    action: str = Field("renew_1m")
+    action: str = Field("renew")
+    months: int = Field(1, ge=1, le=24)
+    plan_price: Optional[float] = None
     custom_price: Optional[float] = None
 
 
@@ -107,39 +115,91 @@ def _extract_daily_limit(limit_rule: Optional[str]) -> Optional[int]:
     return None
 
 
-def _build_boost_limit_rule(base_rule: Optional[str], daily_increment: int) -> str:
-    increment = max(0, int(daily_increment))
-    parts = [segment.strip() for segment in (base_rule or "").split(";") if segment.strip()]
+def _normalize_action(raw_action: Optional[str]) -> str:
+    action = (raw_action or "").strip().lower()
+    normalized = ACTION_ALIASES.get(action)
+    if not normalized:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported action")
+    return normalized
 
+
+def _normalize_months(raw_months: object) -> int:
+    try:
+        months = int(raw_months)
+    except (TypeError, ValueError):
+        months = 1
+    return max(1, min(24, months))
+
+
+def _normalize_plan_price(raw_price: Optional[float]) -> float:
+    price = _safe_parse_amount(raw_price)
+    if price is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="plan_price is invalid")
+
+    step = max(0.01, float(settings.AFDIAN_BOOST_PRICE_STEP))
+    if price + PRICE_EPSILON < step:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"套餐月价最低为 {step:.2f}",
+        )
+
+    units = float(Decimal(str(price / step)).to_integral_value(rounding=ROUND_FLOOR))
+    normalized = round(units * step, 2)
+    if normalized + PRICE_EPSILON < step:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"套餐月价最低为 {step:.2f}",
+        )
+    return normalized
+
+
+def _calculate_daily_limit_from_price(plan_price: float) -> int:
+    step = max(0.01, float(settings.AFDIAN_BOOST_PRICE_STEP))
+    increment = max(1, int(settings.AFDIAN_BOOST_DAILY_INCREMENT))
+    units = int((Decimal(str(plan_price)) / Decimal(str(step))).to_integral_value(rounding=ROUND_FLOOR))
+    return max(1, units) * increment
+
+
+def _calculate_price_from_daily_limit(daily_limit: Optional[int]) -> Optional[float]:
+    if daily_limit is None or daily_limit <= 0:
+        return None
+    increment = max(1, int(settings.AFDIAN_BOOST_DAILY_INCREMENT))
+    step = max(0.01, float(settings.AFDIAN_BOOST_PRICE_STEP))
+    units = max(1, int((Decimal(str(daily_limit)) / Decimal(str(increment))).to_integral_value(rounding=ROUND_FLOOR)))
+    return round(float(Decimal(units) * Decimal(str(step))), 2)
+
+
+def _infer_plan_price_from_rule(limit_rule: Optional[str]) -> float:
+    daily_limit = _extract_daily_limit(limit_rule)
+    inferred = _calculate_price_from_daily_limit(daily_limit)
+    if inferred is not None:
+        return inferred
+    return round(max(0.01, float(settings.AFDIAN_BOOST_PRICE_STEP)), 2)
+
+
+def _replace_daily_limit_rule(base_rule: Optional[str], daily_limit: int) -> str:
+    desired_daily = max(1, int(daily_limit))
+    parts = [segment.strip() for segment in (base_rule or "").split(";") if segment.strip()]
     if not parts:
-        return f"{increment}/day"
+        return f"{desired_daily}/day"
 
     updated_parts = []
-    day_replaced = False
+    replaced = False
     for part in parts:
         matched = DAY_LIMIT_RULE_PATTERN.match(part)
-        if matched and not day_replaced:
-            current_daily = int(matched.group(1))
-            updated_parts.append(f"{current_daily + increment}/day")
-            day_replaced = True
+        if matched and not replaced:
+            updated_parts.append(f"{desired_daily}/day")
+            replaced = True
         else:
             updated_parts.append(part)
 
-    if not day_replaced:
-        updated_parts.insert(0, f"{increment}/day")
-
+    if not replaced:
+        updated_parts.insert(0, f"{desired_daily}/day")
     return ";".join(updated_parts)
 
 
-def _calculate_boost_quota(amount: float) -> Tuple[int, int]:
-    unit_price = max(0.01, float(settings.AFDIAN_BOOST_PRICE_STEP))
-    unit_increment = max(1, int(settings.AFDIAN_BOOST_DAILY_INCREMENT))
-
-    amount_decimal = Decimal(str(amount))
-    unit_decimal = Decimal(str(unit_price))
-    units = int((amount_decimal / unit_decimal).to_integral_value(rounding=ROUND_FLOOR))
-    daily_increment = max(0, units) * unit_increment
-    return units, daily_increment
+def _build_limit_rule_for_plan(base_rule: Optional[str], plan_price: float) -> str:
+    return _replace_daily_limit_rule(base_rule, _calculate_daily_limit_from_price(plan_price))
 
 
 def _find_local_order(
@@ -184,22 +244,8 @@ def _ensure_order_record(
 
 @router.post("/payment-link")
 async def create_payment_link(payload: PaymentLinkRequest, db: Session = Depends(get_db)):
-    action = (payload.action or "renew_1m").strip().lower()
-    if action not in SUPPORTED_ACTIONS:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported action")
-
-    donation_amount = (
-        float(settings.AFDIAN_CUSTOM_PRICE)
-        if payload.custom_price is None
-        else float(payload.custom_price)
-    )
-    if donation_amount <= 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="custom_price must be positive")
-    if action == "boost_1m" and donation_amount < float(settings.AFDIAN_BOOST_PRICE_STEP):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"boost_1m 最低金额为 {float(settings.AFDIAN_BOOST_PRICE_STEP):.2f}",
-        )
+    action = _normalize_action(payload.action)
+    months = _normalize_months(payload.months)
 
     username = payload.username.strip()
     password = payload.password
@@ -207,7 +253,33 @@ async def create_payment_link(payload: PaymentLinkRequest, db: Session = Depends
     if user and not verify_password(password, user.password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
 
-    custom_id = afdian_service.build_custom_id(username, password, action)
+    current_price = _infer_plan_price_from_rule(user.limit_rule) if user else _infer_plan_price_from_rule(settings.AFDIAN_DEFAULT_LIMIT_RULE)
+    if payload.plan_price is not None:
+        plan_price = _normalize_plan_price(payload.plan_price)
+    elif payload.custom_price is not None and action == "upgrade":
+        plan_price = _normalize_plan_price(payload.custom_price)
+    else:
+        plan_price = current_price
+
+    if action == "renew" and user and plan_price > current_price + PRICE_EPSILON:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="续费不支持升级套餐，请选择升级操作")
+    if action == "upgrade" and user and plan_price <= current_price + PRICE_EPSILON:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="升级套餐必须高于当前套餐，不支持降级或同级升级")
+
+    donation_amount = round(plan_price * months, 2)
+    if donation_amount <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="custom_price must be positive")
+
+    custom_id = afdian_service.build_custom_id(
+        username,
+        password,
+        action,
+        extra_payload={
+            "months": months,
+            "plan_price": plan_price,
+            "requested_amount": donation_amount,
+        },
+    )
     donation_url = afdian_service.build_donation_url(custom_id, donation_amount)
 
     pending = _ensure_order_record(db, order_no=None, out_trade_no=None, custom_id=custom_id)
@@ -225,6 +297,9 @@ async def create_payment_link(payload: PaymentLinkRequest, db: Session = Depends
         "custom_id": custom_id,
         "remark": custom_id,
         "action": action,
+        "months": months,
+        "plan_price": plan_price,
+        "custom_price": donation_amount,
     }
 
 
@@ -266,11 +341,10 @@ async def activate_order(payload: ActivateRequest, db: Session = Depends(get_db)
 
     username = str(custom_payload.get("username") or "").strip()
     password = str(custom_payload.get("password") or "")
-    action = str(custom_payload.get("action") or "").strip().lower()
+    action = _normalize_action(str(custom_payload.get("action") or "").strip().lower())
+    months = _normalize_months(custom_payload.get("months") or 1)
     if not username or not password:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="custom_id 信息不完整")
-    if action not in SUPPORTED_ACTIONS:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="custom_id action 不支持")
 
     user = db.query(User).filter(User.username == username).first()
     if user is None:
@@ -289,40 +363,54 @@ async def activate_order(payload: ActivateRequest, db: Session = Depends(get_db)
     if amount is None:
         amount = _safe_parse_amount(getattr(local_order, "amount", None))
 
-    boost_units: Optional[int] = None
-    boost_daily_increment: Optional[int] = None
+    plan_price_raw = custom_payload.get("plan_price")
+    if plan_price_raw is None and amount is not None:
+        plan_price_raw = round(amount / max(1, months), 2)
+    if plan_price_raw is None:
+        plan_price_raw = _infer_plan_price_from_rule(user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE)
+    plan_price = _normalize_plan_price(float(plan_price_raw))
 
-    if action == "renew_1m":
-        user.expiration_date = _extend_date(user.expiration_date, int(settings.AFDIAN_RENEW_DAYS))
+    if amount is None:
+        amount = round(plan_price * months, 2)
+
+    requested_amount_raw = custom_payload.get("requested_amount")
+    requested_amount = _safe_parse_amount(requested_amount_raw)
+    if requested_amount is None:
+        requested_amount = round(plan_price * months, 2)
+    if amount + PRICE_EPSILON < requested_amount:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="订单支付金额不足，无法完成激活")
+
+    current_price = _infer_plan_price_from_rule(user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE)
+    converted_remaining_days: Optional[float] = None
+
+    if action == "renew":
+        if plan_price > current_price + PRICE_EPSILON:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="续费不支持升级套餐，请选择升级操作")
+
+        final_plan_price = current_price if user.id is not None else plan_price
+        extend_days = int(settings.AFDIAN_RENEW_DAYS) * months
+        user.expiration_date = _extend_date(user.expiration_date, extend_days)
+        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE, final_plan_price)
+        user.boost_expiration_date = None
+        user.boost_limit_rule = None
         user.is_active = True
-    elif action == "boost_1m":
+    elif action == "upgrade":
         if amount is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="订单金额解析失败，无法计算提额档位")
+        if plan_price <= current_price + PRICE_EPSILON:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="升级套餐必须高于当前套餐，不支持降级或同级升级")
 
-        boost_units, boost_daily_increment = _calculate_boost_quota(amount)
-        if not boost_daily_increment:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"订单金额不足 {float(settings.AFDIAN_BOOST_PRICE_STEP):.2f}，无法提升日请求上限",
-            )
+        now_utc = _utc_now_naive()
+        current_expiration = _normalize_naive_utc(user.expiration_date) or now_utc
+        remaining_seconds = max(0.0, (current_expiration - now_utc).total_seconds())
+        converted_seconds = remaining_seconds * (current_price / plan_price)
+        converted_remaining_days = round(converted_seconds / 86400.0, 2)
+        purchased_days = int(settings.AFDIAN_RENEW_DAYS) * months
 
-        user.boost_expiration_date = _extend_date(
-            getattr(user, "boost_expiration_date", None),
-            int(settings.AFDIAN_BOOST_DAYS),
-        )
-        if settings.AFDIAN_BOOST_LIMIT_RULE:
-            user.boost_limit_rule = settings.AFDIAN_BOOST_LIMIT_RULE
-        else:
-            base_rule = (user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE or "").strip()
-            calculated_rule = _build_boost_limit_rule(base_rule, boost_daily_increment)
-            current_boost_daily = _extract_daily_limit(user.boost_limit_rule)
-            calculated_daily = _extract_daily_limit(calculated_rule)
-            if not (
-                current_boost_daily is not None
-                and calculated_daily is not None
-                and current_boost_daily > calculated_daily
-            ):
-                user.boost_limit_rule = calculated_rule
+        user.expiration_date = now_utc + timedelta(seconds=converted_seconds) + timedelta(days=purchased_days)
+        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE, plan_price)
+        user.boost_expiration_date = None
+        user.boost_limit_rule = None
         user.is_active = True
 
     local_order.order_no = order_no
@@ -340,9 +428,11 @@ async def activate_order(payload: ActivateRequest, db: Session = Depends(get_db)
             "order": order,
             "query_payload": raw_query_payload,
             "custom_payload": custom_payload,
-            "boost_units": boost_units,
-            "boost_daily_increment": boost_daily_increment,
-            "boost_limit_rule": getattr(user, "boost_limit_rule", None),
+            "months": months,
+            "plan_price": plan_price,
+            "requested_amount": requested_amount,
+            "limit_rule": user.limit_rule,
+            "converted_remaining_days": converted_remaining_days,
         }
     )
 
@@ -362,9 +452,10 @@ async def activate_order(payload: ActivateRequest, db: Session = Depends(get_db)
         "order_no": order_no,
         "action": action,
         "amount": amount,
-        "boost_units": boost_units,
-        "boost_daily_increment": boost_daily_increment,
-        "boost_limit_rule": getattr(user, "boost_limit_rule", None),
+        "months": months,
+        "plan_price": plan_price,
+        "limit_rule": user.limit_rule,
+        "converted_remaining_days": converted_remaining_days,
         "new_expiration_utc": _to_utc_iso(user.expiration_date),
         "boost_expiration_utc": _to_utc_iso(getattr(user, "boost_expiration_date", None)),
     }

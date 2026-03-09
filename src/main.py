@@ -41,12 +41,20 @@ def check_and_update_db():
             if 'status' not in log_columns:
                 db.execute(text('ALTER TABLE request_log ADD COLUMN status VARCHAR(20) DEFAULT "pending"'))
                 logger.info("Added status to request_log table")
+            if 'resource_cost' not in log_columns:
+                db.execute(text('ALTER TABLE request_log ADD COLUMN resource_cost INTEGER DEFAULT 0'))
+                logger.info("Added resource_cost to request_log table")
+            if 'resource_deducted' not in log_columns:
+                db.execute(text('ALTER TABLE request_log ADD COLUMN resource_deducted BOOLEAN DEFAULT 0'))
+                logger.info("Added resource_deducted to request_log table")
 
             existing_indexes = {idx.get('name') for idx in inspector.get_indexes('request_log')}
             index_defs = [
                 ('idx_request_log_timestamp', 'CREATE INDEX idx_request_log_timestamp ON request_log (timestamp)'),
                 ('idx_request_log_timestamp_endpoint', 'CREATE INDEX idx_request_log_timestamp_endpoint ON request_log (timestamp, endpoint)'),
-                ('idx_request_log_timestamp_status', 'CREATE INDEX idx_request_log_timestamp_status ON request_log (timestamp, status)')
+                ('idx_request_log_timestamp_status', 'CREATE INDEX idx_request_log_timestamp_status ON request_log (timestamp, status)'),
+                ('idx_request_log_username_timestamp', 'CREATE INDEX idx_request_log_username_timestamp ON request_log (username, timestamp)'),
+                ('idx_request_log_timestamp_resource_deducted', 'CREATE INDEX idx_request_log_timestamp_resource_deducted ON request_log (timestamp, resource_deducted)')
             ]
             for index_name, create_sql in index_defs:
                 if index_name not in existing_indexes:
@@ -105,7 +113,7 @@ app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET_KEY)
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
     start_time = time.time()
-    log_data = {'status': 'failed'}
+    log_data = {'status': 'failed', 'resource_cost': 0, 'resource_deducted': False}
     request.state.rate_limit_contexts = []
 
     client_ip = get_client_ip(request)
@@ -177,10 +185,18 @@ async def request_logging_middleware(request: Request, call_next):
         response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
     finally:
-        if rate_limiter.enabled and not rate_limit_triggered:
-            status_for_limits = response_status_code or 500
+        status_for_limits = response_status_code or 500
+        if rate_limiter.enabled:
             for context in getattr(request.state, "rate_limit_contexts", []):
-                if context.should_deduct(status_for_limits):
+                should_deduct = context.should_deduct(status_for_limits)
+                if (
+                    not rate_limit_triggered
+                    and should_deduct
+                    and getattr(context, "context_type", "") == "user"
+                ):
+                    log_data['resource_cost'] += getattr(context, "normalized_cost", 1)
+                    log_data['resource_deducted'] = True
+                if not rate_limit_triggered and should_deduct:
                     context.commit()
 
         session_for_log = db or SessionLocal()
@@ -190,7 +206,9 @@ async def request_logging_middleware(request: Request, call_next):
                 ip=client_ip,
                 endpoint=request.url.path,
                 duration=log_data.get('duration', 0),
-                status=log_data.get('status', 'failed')
+                status=log_data.get('status', 'failed'),
+                resource_cost=log_data.get('resource_cost', 0),
+                resource_deducted=log_data.get('resource_deducted', False),
             )
             session_for_log.add(log)
             session_for_log.commit()

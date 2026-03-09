@@ -29,6 +29,8 @@ class RequestLog(Base):
     timestamp = Column(DateTime, default=datetime.now, index=True)
     duration = Column(Float, nullable=False)
     status = Column(String(20), nullable=False, index=True)
+    resource_cost = Column(Integer, nullable=False, default=0, index=True)
+    resource_deducted = Column(Boolean, nullable=False, default=False, index=True)
 
 
 class PaymentOrder(Base):

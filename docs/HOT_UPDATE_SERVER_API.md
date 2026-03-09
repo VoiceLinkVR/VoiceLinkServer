@@ -81,7 +81,7 @@
 }
 ```
 
-> 注：`/api/translations/capabilities` 会直接从 translators 库生成引擎与语言映射，并带缓存。
+> 注：`/api/translations/capabilities` 会直接从 translators 库生成引擎与语言映射，并在启用 `GEMMA_TRANSLATE_ENABLED` 时追加 `translategemma` 能力信息，结果带缓存。当前 `translategemma` 仅接入 `llama-server` 文本翻译接口，`sourceLanguage=auto` 不受支持。
 
 ---
 

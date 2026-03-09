@@ -1,0 +1,145 @@
+﻿name: ${COMPOSE_PROJECT_NAME:-voicelinkvr}
+
+services:
+  redis:
+    profiles: ["redis"]
+    image: ${REDIS_IMAGE:-redis:latest}
+    container_name: ${REDIS_CONTAINER_NAME:-redis}
+    restart: unless-stopped
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - ${REDIS_DATA_PATH:-./redisFiles/data}:/data
+      - ${REDIS_CONFIG_PATH:-./redisFiles/redis.conf}:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+
+  faster-whisper:
+    profiles: ["faster-whisper"]
+    image: ${FASTER_WHISPER_IMAGE:-fedirz/faster-whisper-server:latest-cuda}
+    container_name: ${FASTER_WHISPER_CONTAINER_NAME:-faster-whisper}
+    restart: unless-stopped
+    ports:
+      - "${FASTER_WHISPER_HOST_PORT:-8000}:8000"
+    environment:
+      WHISPER__TTL: ${FASTER_WHISPER_TTL:--1}
+      WHISPER__NUM_WORKERS: ${FASTER_WHISPER_NUM_WORKERS:-10}
+      WHISPER__CPU_THREADS: ${FASTER_WHISPER_CPU_THREADS:-40}
+    gpus: all
+
+  whisper-trt:
+    profiles: ["whisper-trt"]
+    image: ${WHISPER_TRT_IMAGE:-ghcr.io/your-org/whisperlive-trt-gemma:latest}
+    container_name: ${WHISPER_TRT_CONTAINER_NAME:-whisper-trt}
+    restart: unless-stopped
+    ports:
+      - "${WHISPER_TRT_WS_HOST_PORT:-9090}:9090"
+      - "${WHISPER_TRT_REST_HOST_PORT:-18100}:8000"
+    environment:
+      ENABLE_REST: ${WHISPER_TRT_ENABLE_REST:-true}
+      REST_PORT: ${WHISPER_TRT_REST_PORT:-8000}
+      TRT_MULTILINGUAL: ${WHISPER_TRT_MULTILINGUAL:-true}
+      TRANSLATE_SERVICE_URL: ${TRANSLATE_SERVICE_URL:-http://gemma-translate:8080}
+      AUTO_BUILD_TRT_MODEL: ${AUTO_BUILD_TRT_MODEL:-true}
+      TRT_BUILD_MODEL_NAME: ${TRT_BUILD_MODEL_NAME:-large-v3}
+      TRT_WEIGHT_ONLY_PRECISION: ${TRT_WEIGHT_ONLY_PRECISION:-float16}
+      CONTEXT_FMHA_MODE: ${CONTEXT_FMHA_MODE:-auto}
+      BERT_ATTENTION_PLUGIN_MODE: ${BERT_ATTENTION_PLUGIN_MODE:-auto}
+      GPT_ATTENTION_PLUGIN_MODE: ${GPT_ATTENTION_PLUGIN_MODE:-auto}
+      TRT_PY_SESSION: ${TRT_PY_SESSION:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://127.0.0.1:18100,http://localhost:18100}
+      TRT_BUILD_INFERENCE_PRECISION: ${TRT_BUILD_INFERENCE_PRECISION:-float16}
+      TRT_BUILD_MAX_BATCH_SIZE: ${TRT_BUILD_MAX_BATCH_SIZE:-1}
+      TRT_BUILD_MAX_BEAM_WIDTH: ${TRT_BUILD_MAX_BEAM_WIDTH:-1}
+      TRT_BUILD_ENCODER_MAX_INPUT_LEN: ${TRT_BUILD_ENCODER_MAX_INPUT_LEN:-3000}
+      TRT_BUILD_ENCODER_MAX_SEQ_LEN: ${TRT_BUILD_ENCODER_MAX_SEQ_LEN:-3000}
+      TRT_BUILD_DECODER_MAX_SEQ_LEN: ${TRT_BUILD_DECODER_MAX_SEQ_LEN:-225}
+      TRT_BUILD_DECODER_MAX_INPUT_LEN: ${TRT_BUILD_DECODER_MAX_INPUT_LEN:-32}
+      TRT_BUILD_DECODER_MAX_ENCODER_INPUT_LEN: ${TRT_BUILD_DECODER_MAX_ENCODER_INPUT_LEN:-3000}
+      TRT_BUILD_DECODER_MAX_NUM_TOKENS: ${TRT_BUILD_DECODER_MAX_NUM_TOKENS:-}
+      TRT_RUNTIME_MAX_BATCH_SIZE: ${TRT_RUNTIME_MAX_BATCH_SIZE:-1}
+      TRT_RUNTIME_MAX_INPUT_LEN: ${TRT_RUNTIME_MAX_INPUT_LEN:-3000}
+      TRT_RUNTIME_MAX_OUTPUT_LEN: ${TRT_RUNTIME_MAX_OUTPUT_LEN:-64}
+      TRT_RUNTIME_MAX_BEAM_WIDTH: ${TRT_RUNTIME_MAX_BEAM_WIDTH:-1}
+      TRT_KV_CACHE_FREE_GPU_MEMORY_FRACTION: ${TRT_KV_CACHE_FREE_GPU_MEMORY_FRACTION:-0.55}
+      TRT_CROSS_KV_CACHE_FRACTION: ${TRT_CROSS_KV_CACHE_FRACTION:-0.30}
+    volumes:
+      - ${WL_CACHE_DIR:-./.cache/whisper-trt}/assets:/app/TensorRT-LLM-examples/whisper/assets
+      - ${WL_CACHE_DIR:-./.cache/whisper-trt}/engine:/app/TensorRT-LLM-examples/whisper/whisper_large-v3_float16
+      - ${WL_CACHE_DIR:-./.cache/whisper-trt}/weights:/app/TensorRT-LLM-examples/whisper/whisper_large-v3_weights_float16
+      - ${WL_CACHE_DIR:-./.cache/whisper-trt}/pip:/root/.cache/pip
+    gpus: all
+
+  sensevoice:
+    profiles: ["sensevoice"]
+    image: ${SENSEVOICE_IMAGE:-ghcr.io/your-org/sensevoice-oneapi:latest}
+    container_name: ${SENSEVOICE_CONTAINER_NAME:-sensevoice}
+    restart: unless-stopped
+    ports:
+      - "${SENSEVOICE_HOST_PORT:-8800}:8000"
+    environment:
+      DEVICE_TYPE: ${SENSEVOICE_DEVICE_TYPE:-cuda:0}
+      use_itn: ${SENSEVOICE_USE_ITN:-True}
+      ncpu: ${SENSEVOICE_NCPU:-8}
+      VAD_ENABLE: ${SENSEVOICE_VAD_ENABLE:-False}
+    gpus: all
+
+  gemma-translate:
+    profiles: ["gemma"]
+    image: ${GEMMA_TRANSLATE_IMAGE:-ghcr.io/your-org/translategemma-llama-server:latest}
+    container_name: ${GEMMA_TRANSLATE_CONTAINER_NAME:-gemma-translate}
+    restart: unless-stopped
+    ports:
+      - "${GEMMA_TRANSLATE_BIND_IP:-127.0.0.1}:${GEMMA_TRANSLATE_HOST_PORT:-8080}:8080"
+    volumes:
+      - ${GEMMA_MODEL_ROOT:-D:/models}:/models
+    environment:
+      MODEL_NAME: ${GEMMA_MODEL_NAME:-translategemma-12b-it-MP-GGUF}
+      LLAMA_N_GPU_LAYERS: ${LLAMA_N_GPU_LAYERS:--1}
+      LLAMA_N_PARALLEL: ${LLAMA_N_PARALLEL:-2}
+      LLAMA_N_CTX: ${LLAMA_N_CTX:-3072}
+      LLAMA_FLASH_ATTN: ${LLAMA_FLASH_ATTN:-on}
+      LLAMA_PORT: 8080
+      LLAMA_EXTRA_ARGS: ${LLAMA_EXTRA_ARGS:-}
+    gpus: all
+
+  voicelink:
+    image: ${VOICELINK_IMAGE:-boyqiu0010/voice-link-vr-server:latest}
+    container_name: ${VOICELINK_CONTAINER_NAME:-voicelink}
+    restart: unless-stopped
+    ports:
+      - "${VOICELINK_HOST_PORT:-8980}:8980"
+    volumes:
+      - ${VOICELINK_DATA_VOLUME:-voice-link-vr-server-local}:/usr/src/app/data:rw
+    environment:
+      WHISPER_HOST: ${WHISPER_HOST:-faster-whisper}
+      WHISPER_PORT: ${WHISPER_PORT:-8000}
+      WHISPER_BACKEND: ${WHISPER_BACKEND:-faster-whisper}
+      WHISPER_TRT_HOST: ${WHISPER_TRT_HOST:-whisper-trt}
+      WHISPER_TRT_PORT: ${WHISPER_TRT_PORT:-8000}
+      SENSEVOICE_HOST: ${SENSEVOICE_HOST:-sensevoice}
+      SENSEVOICE_PORT: ${SENSEVOICE_PORT:-8000}
+      FILTER_WEB_URL: ${FILTER_WEB_URL:-https://gitee.com/voice-link-vr/VoiceLinkServer/raw/main/src/filter.json}
+      THREADS_NUM: ${THREADS_NUM:-50}
+      LIMIT_ENABLE: ${LIMIT_ENABLE:-True}
+      LIMIT_PUBLIC_TEST_USER: ${LIMIT_PUBLIC_TEST_USER:-testuser}
+      SQLALCHEMY_POOL_SIZE: ${SQLALCHEMY_POOL_SIZE:-0}
+      TRANSLATOR_SERVICES_LIST: ${TRANSLATOR_SERVICES_LIST:-bing,modernMt,cloudTranslation,caiyun,alibaba,youdao}
+      LIMITER_REDIS_URL: ${LIMITER_REDIS_URL:-redis://redis:6379/0}
+      TTS_TOKEN: ${TTS_TOKEN:-}
+      TTS_URL: ${TTS_URL:-}
+      ENABLE_WEB_TRANSLATORS: ${ENABLE_WEB_TRANSLATORS:-True}
+      GEMMA_TRANSLATE_ENABLED: ${GEMMA_TRANSLATE_ENABLED:-False}
+      GEMMA_TRANSLATE_URL: ${GEMMA_TRANSLATE_URL:-gemma-translate:8080}
+      GEMMA_TRANSLATE_API_MODE: ${GEMMA_TRANSLATE_API_MODE:-openai}
+      GEMMA_TRANSLATE_MODEL: ${GEMMA_TRANSLATE_MODEL:-translategemma-12b-it-MP-GGUF}
+      GEMMA_TRANSLATE_TIMEOUT: ${GEMMA_TRANSLATE_TIMEOUT:-10.0}
+      GEMMA_TRANSLATE_MAX_TOKENS: ${GEMMA_TRANSLATE_MAX_TOKENS:-500}
+      GEMMA_TRANSLATE_FALLBACK: ${GEMMA_TRANSLATE_FALLBACK:-True}
+      LATEST_VERSION: ${LATEST_VERSION:-v0.6.0-fix1}
+      PACKAGE_BASE_URL: ${PACKAGE_BASE_URL:-https://cloudflarestorage.boyqiu001.top/VRCLS-windows-}
+      PACKAGE_TYPE: ${PACKAGE_TYPE:-.exe}
+      SQL_PATH: ${SQL_PATH:-}
+
+volumes:
+  voice-link-vr-server-local:
+    name: ${VOICELINK_DATA_VOLUME:-voice-link-vr-server-local}

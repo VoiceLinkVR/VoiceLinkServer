@@ -10,12 +10,12 @@ project_root = os.path.dirname(current_dir)
 class Settings(BaseSettings):
     WHISPER_HOST: str = "127.0.0.1"
     WHISPER_PORT: int = 8000
+    WHISPER_BACKEND: str = "faster-whisper"
+    WHISPER_TRT_HOST: str = "127.0.0.1"
+    WHISPER_TRT_PORT: int = 8000
     SENSEVOICE_HOST: str = "127.0.0.1"
     SENSEVOICE_PORT: int = 8800
     WHISPER_APIKEY: str = "something"
-    LIBRETRANSLATE_HOST: str = "127.0.0.1"
-    LIBRETRANSLATE_PORT: int = 5000
-    LIBRETRANSLATE_APIKEY: str = ""
     JWT_SECRET_KEY: str = "wVLAF_13N6XL_QmP.DjkKsV"
     SESSION_SECRET_KEY: str = "wVddLAF_13dsdddN6XL_QmP.DjkKsV"
     JWT_ACCESS_TOKEN_EXPIRES_MINUTES: int = 10080  # 7 days
@@ -27,14 +27,16 @@ class Settings(BaseSettings):
     SQL_POOL_RECYCLE: int = 3600
     FILTER_WEB_URL: Optional[str] = "https://raw.githubusercontent.com/VoiceLinkVR/VoiceLinkServer/refs/heads/main/src/filter.json"
     LIMIT_ENABLE: bool = True
+    LEGACY_CLIENT_COMPAT: bool = False
     LIMIT_PUBLIC_TEST_USER: Optional[str] = None
     ENABLE_WEB_TRANSLATORS: bool = False
     TRANSLATOR_SERVICE: str = "alibaba"
     TRANSLATOR_SERVICES_LIST: str = "bing,iciba,alibaba,MyMemory,google"  # 翻译供应商列表，按优先级排序
     TRANSLATION_TIMEOUT: float = 1.5  # 翻译请求超时时间（秒）
     GEMMA_TRANSLATE_ENABLED: bool = False
-    GEMMA_TRANSLATE_URL: str = "127.0.0.1:28180"
-    GEMMA_TRANSLATE_MODEL: str = "translategemma-12b-it-Q4_K_M"
+    GEMMA_TRANSLATE_URL: str = "127.0.0.1:8080"
+    GEMMA_TRANSLATE_API_MODE: str = "openai"  # new llama-server deployment supports OpenAI-compatible API only
+    GEMMA_TRANSLATE_MODEL: str = "translategemma-12b-it-MP-GGUF"
     GEMMA_TRANSLATE_TIMEOUT: float = 10.0
     GEMMA_TRANSLATE_MAX_TOKENS: int = 500
     GEMMA_TRANSLATE_FALLBACK: bool = True
@@ -80,8 +82,6 @@ settings = Settings()
 
 # Construct URLs from settings
 WHISPER_URL = f"http://{settings.WHISPER_HOST}:{settings.WHISPER_PORT}/v1/"
+WHISPER_TRT_URL = f"http://{settings.WHISPER_TRT_HOST}:{settings.WHISPER_TRT_PORT}"
 SENSEVOICE_URL = f"http://{settings.SENSEVOICE_HOST}:{settings.SENSEVOICE_PORT}/v1/audio/transcriptions"
-LOCAL_TRANS_BASE_URL = f"http://{settings.LIBRETRANSLATE_HOST}:{settings.LIBRETRANSLATE_PORT}/"
-LOCAL_TRANS_URL = f"{LOCAL_TRANS_BASE_URL}translate"
-LOCAL_LANGUAGE_URL = f"{LOCAL_TRANS_BASE_URL}languages"
 GEMMA_TRANSLATE_BASE_URL = f"http://{settings.GEMMA_TRANSLATE_URL}"

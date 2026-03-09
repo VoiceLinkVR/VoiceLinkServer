@@ -8,6 +8,7 @@ from urllib.parse import urljoin
 from fastapi import Request
 
 from core.config import settings
+from core.gemma_translate_service import get_gemma_capability_entry
 from core.logging_config import logger
 
 DEFAULT_UPDATE_MANIFEST = {
@@ -185,9 +186,13 @@ def get_translation_capabilities() -> Dict[str, Any]:
     if cached and now - cached_ts < settings.TRANSLATION_CAPABILITIES_CACHE_SECONDS:
         return cached
 
+    engines = _load_translators_capabilities()
+    if settings.GEMMA_TRANSLATE_ENABLED:
+        engines.append(get_gemma_capability_entry())
+
     payload = {
         "version": time.strftime("%Y%m%d"),
-        "engines": _load_translators_capabilities(),
+        "engines": engines,
     }
 
     _capabilities_cache["timestamp"] = now

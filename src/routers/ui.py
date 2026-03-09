@@ -8,9 +8,10 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import text, func, case, desc
 from sqlalchemy.orm import Session
 
+from core.afdian_service import afdian_service
 from core.dependencies import get_db, hash_password, verify_password, get_admin_user_from_session
 from core.logging_config import logger
-from db.models import User, RequestLog
+from db.models import User, RequestLog, PaymentOrder
 
 router = APIRouter(
     tags=["UI Management"],
@@ -30,6 +31,164 @@ EXCLUDED_ENDPOINTS = [
     "/api/translators/runtime",
     "/api/translations/capabilities",
 ]
+
+AFDIAN_ACTION_LABELS = {
+    "renew": "续费",
+    "upgrade": "升级",
+}
+
+
+def _format_local_datetime(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return (value + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_local_timestamp(timestamp_value: Any) -> Optional[str]:
+    try:
+        ts = int(timestamp_value)
+    except (TypeError, ValueError):
+        return None
+
+    if ts <= 0:
+        return None
+
+    return (datetime.utcfromtimestamp(ts) + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_money(value: Any) -> Optional[str]:
+    try:
+        return f"CNY {float(value):.2f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _mask_custom_id(value: Optional[str]) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 28:
+        return text
+    return f"{text[:16]}...{text[-10:]}"
+
+
+def _build_afdian_summary_text(order: PaymentOrder, parsed: Dict[str, Any]) -> str:
+    parts: List[str] = []
+
+    action = str(parsed.get("action") or "").strip().lower()
+    if action:
+        parts.append(AFDIAN_ACTION_LABELS.get(action, action))
+
+    months = parsed.get("months")
+    try:
+        months_value = int(months)
+    except (TypeError, ValueError):
+        months_value = None
+    if months_value:
+        parts.append(f"{months_value}个月")
+
+    plan_price = _format_money(parsed.get("plan_price"))
+    if plan_price:
+        parts.append(f"单价 {plan_price}")
+
+    requested_amount = _format_money(parsed.get("requested_amount"))
+    if requested_amount:
+        parts.append(f"总额 {requested_amount}")
+
+    generated_at = _format_local_timestamp(parsed.get("ts"))
+    if generated_at:
+        parts.append(generated_at)
+
+    status = (order.status or "").strip()
+    if status:
+        parts.append(status)
+
+    return " ".join(parts)
+
+
+def _build_afdian_order_meta(order: Optional[PaymentOrder]) -> Optional[Dict[str, Any]]:
+    if order is None:
+        return None
+
+    custom_id = (order.custom_id or order.remark or "").strip()
+    base_meta = {
+        "status": (order.status or "-").strip() or "-",
+        "status_label": (order.status or "-").strip() or "-",
+        "updated_at": _format_local_datetime(order.updated_at),
+        "created_at": _format_local_datetime(order.created_at),
+        "out_trade_no": (order.out_trade_no or "").strip(),
+        "custom_id_preview": _mask_custom_id(custom_id),
+        "custom_id_length": len(custom_id),
+        "parsed": False,
+        "search_text": " ".join(
+            part for part in [order.username or "", order.status or "", custom_id] if part
+        ),
+    }
+
+    if not custom_id:
+        return base_meta
+
+    try:
+        parsed = afdian_service.parse_custom_id(custom_id)
+    except ValueError as exc:
+        base_meta["error"] = str(exc)
+        return base_meta
+
+    generated_at = _format_local_timestamp(parsed.get("ts"))
+    action = str(parsed.get("action") or "").strip().lower()
+    plan_price = _format_money(parsed.get("plan_price"))
+    requested_amount = _format_money(parsed.get("requested_amount"))
+    try:
+        months = int(parsed.get("months"))
+    except (TypeError, ValueError):
+        months = None
+
+    summary = _build_afdian_summary_text(order, parsed)
+    search_text_parts = [
+        order.username or "",
+        AFDIAN_ACTION_LABELS.get(action, action),
+        str(months or ""),
+        plan_price or "",
+        requested_amount or "",
+        generated_at or "",
+        order.status or "",
+        custom_id,
+    ]
+
+    base_meta.update(
+        {
+            "parsed": True,
+            "action": action,
+            "action_label": AFDIAN_ACTION_LABELS.get(action, action or "-"),
+            "months": months,
+            "plan_price": plan_price,
+            "requested_amount": requested_amount,
+            "generated_at": generated_at,
+            "expired": afdian_service.is_custom_id_expired(parsed),
+            "summary": summary,
+            "search_text": " ".join(part for part in search_text_parts if part),
+        }
+    )
+    return base_meta
+
+
+def _build_latest_afdian_orders(db: Session, usernames: List[str]) -> Dict[str, PaymentOrder]:
+    if not usernames:
+        return {}
+
+    orders = (
+        db.query(PaymentOrder)
+        .filter(PaymentOrder.username.in_(usernames))
+        .order_by(PaymentOrder.username.asc(), PaymentOrder.updated_at.desc(), PaymentOrder.id.desc())
+        .all()
+    )
+
+    latest_orders: Dict[str, PaymentOrder] = {}
+    for order in orders:
+        username = (order.username or "").strip()
+        if username and username not in latest_orders:
+            latest_orders[username] = order
+    return latest_orders
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -78,6 +237,14 @@ async def manage_users_ui(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse(url=request.url_for("login_ui_get"))
 
     users = db.query(User).all()
+    latest_orders = _build_latest_afdian_orders(db, [user.username for user in users])
+    user_rows = [
+        {
+            "user": user,
+            "afdian": _build_afdian_order_meta(latest_orders.get(user.username)),
+        }
+        for user in users
+    ]
     now = datetime.now()
     soon = now + timedelta(days=7)
     user_stats = {
@@ -99,7 +266,7 @@ async def manage_users_ui(request: Request, db: Session = Depends(get_db)):
     messages = request.session.pop("flash_messages", [])
     return templates.TemplateResponse(
         "manage_users.html",
-        {"request": request, "users": users, "messages": messages, "user_stats": user_stats}
+        {"request": request, "users": users, "user_rows": user_rows, "messages": messages, "user_stats": user_stats}
     )
 
 
@@ -239,6 +406,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
     total_success = 0
     total_fail = 0
     total_rate_limited = 0
+    total_resource_cost = 0
     total_count = 0
     hourly_stats = []
     duration_stats = []
@@ -257,6 +425,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
                 func.sum(case((RequestLog.status == "success", 1), else_=0)).label("total_success"),
                 func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("total_fail"),
                 func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("total_rate_limited"),
+                func.sum(RequestLog.resource_cost).label("total_resource_cost"),
                 func.count().label("total_count"),
             )
             .filter(*base_filters)
@@ -266,6 +435,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
             total_success = summary_row.total_success or 0
             total_fail = summary_row.total_fail or 0
             total_rate_limited = summary_row.total_rate_limited or 0
+            total_resource_cost = summary_row.total_resource_cost or 0
             total_count = summary_row.total_count or 0
 
         total_count_col = func.count().label("total_count")
@@ -277,6 +447,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
                 func.sum(case((RequestLog.status == "success", 1), else_=0)).label("success_count"),
                 func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("fail_count"),
                 func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+                func.sum(RequestLog.resource_cost).label("resource_cost"),
                 total_count_col,
             )
             .filter(*base_filters)
@@ -293,6 +464,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
                 func.sum(case((RequestLog.status == "success", 1), else_=0)).label("success_count"),
                 func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("fail_count"),
                 func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+                func.sum(RequestLog.resource_cost).label("resource_cost"),
                 endpoint_total_col,
             )
             .filter(*base_filters)
@@ -358,6 +530,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
             func.sum(case((RequestLog.status == "success", 1), else_=0)).label("daily_success"),
             func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("daily_fail"),
             func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("daily_rate_limited"),
+            func.sum(RequestLog.resource_cost).label("daily_resource_cost"),
             func.count().label("daily_total"),
         )
         .filter(RequestLog.timestamp >= utc_start_dt, RequestLog.timestamp < utc_end_dt)
@@ -377,6 +550,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
             "daily_success": row.daily_success or 0,
             "daily_fail": row.daily_fail or 0,
             "daily_rate_limited": row.daily_rate_limited or 0,
+            "daily_resource_cost": row.daily_resource_cost or 0,
             "daily_total": row.daily_total or 0,
         }
 
@@ -391,6 +565,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
                     "daily_success": 0,
                     "daily_fail": 0,
                     "daily_rate_limited": 0,
+                    "daily_resource_cost": 0,
                     "daily_total": 0,
                 },
             )
@@ -403,10 +578,12 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
             "total_success": total_success,
             "total_fail": total_fail,
             "total_rate_limited": total_rate_limited,
+            "total_resource_cost": total_resource_cost,
             "total_count": total_count,
             "success_rate": round((total_success / total_count) * 100, 2) if total_count else 0,
             "fail_rate": round((total_fail / total_count) * 100, 2) if total_count else 0,
             "rate_limited_rate": round((total_rate_limited / total_count) * 100, 2) if total_count else 0,
+            "resource_per_request": round((total_resource_cost / total_count), 2) if total_count else 0,
         },
         "date_filter_info": {
             "start_date": local_start_day.strftime("%Y-%m-%d"),
@@ -423,6 +600,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
                 "success_count": row.success_count or 0,
                 "fail_count": row.fail_count or 0,
                 "rate_limited_count": row.rate_limited_count or 0,
+                "resource_cost": row.resource_cost or 0,
                 "total_count": row.endpoint_total or 0,
             }
             for row in top_endpoints
@@ -435,6 +613,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
                 "success_count": row.success_count or 0,
                 "fail_count": row.fail_count or 0,
                 "rate_limited_count": row.rate_limited_count or 0,
+                "resource_cost": row.resource_cost or 0,
                 "total_count": row.total_count or 0,
             }
             for row in hourly_stats

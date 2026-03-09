@@ -11,7 +11,7 @@ from io import BytesIO
 from openai import OpenAI, AsyncOpenAI
 import opuslib
 import emoji
-from core.config import settings, WHISPER_URL, SENSEVOICE_URL, LOCAL_TRANS_URL, LOCAL_LANGUAGE_URL
+from core.config import settings, WHISPER_URL, WHISPER_TRT_URL, SENSEVOICE_URL
 from core.gemma_translate_service import gemma_translate, is_gemma_translation_supported
 from core.logging_config import logger
 from core.text_compressor import compress_repeated_chars
@@ -62,7 +62,6 @@ LANG_CANONICAL_MAPPING = {
     "zh-tw": "zt",
     "zh-hk": "zt",
     "zh-mo": "zt",
-    "auto": "auto",
 }
 
 
@@ -83,9 +82,11 @@ def _is_same_translation_lang(source_lang: str, target_lang: str) -> bool:
     target = _canonical_lang_code(target_lang)
     if not source or not target:
         return False
-    if source == "auto" or target == "auto":
-        return source == target
     return source == target
+
+
+def _is_auto_translation_lang(lang: str) -> bool:
+    return (lang or "").strip().lower() == "auto"
 
 
 # --- 初始化函数 ---
@@ -201,6 +202,58 @@ async def async_translate_audio(audio_file: bytes) -> str:
         raise
 
 
+def _normalize_target_language_for_trt(language: str) -> str:
+    normalized = (language or "").strip().lower()
+    if normalized == "auto":
+        raise ValueError("TRT translation no longer supports source/target language 'auto'")
+    if not normalized:
+        return "en"
+    return normalized
+
+
+async def async_transcribe_trt(audio_file: bytes, language: str = 'zh') -> str:
+    """
+    使用 WhisperLive-TRT 后端进行语音识别（含自动翻译）。
+
+    TRT 的 language 参数语义是目标语言，不支持 auto。
+    """
+    target_language = _normalize_target_language_for_trt(language)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            files = {'file': ('audio.wav', audio_file, 'audio/wav')}
+            data = {
+                'language': target_language,
+                'response_format': 'json',
+            }
+            response = await client.post(
+                f"{WHISPER_TRT_URL}/v1/audio/transcriptions",
+                files=files,
+                data=data,
+            )
+            response.raise_for_status()
+            result = response.json()
+            text = result.get("text", "")
+            if not isinstance(text, str):
+                logger.warning("[ASYNC_TRANSCRIBE_TRT] Unexpected text payload type: %s", type(text))
+                return ""
+            return text
+    except Exception as e:
+        logger.error(f"[ASYNC_TRANSCRIBE_TRT] TRT语音识别失败: {e}")
+        raise
+
+
+async def do_transcribe(audio_file: bytes, language: str = "zh") -> str:
+    if settings.WHISPER_BACKEND == "whisper-trt":
+        return await async_transcribe_trt(audio_file, language=language)
+    return await async_transcribe(audio_file, language=language)
+
+
+async def do_translate_audio(audio_file: bytes) -> str:
+    if settings.WHISPER_BACKEND == "whisper-trt":
+        return await async_transcribe_trt(audio_file, language="en")
+    return await async_translate_audio(audio_file)
+
+
 def do_translate(text: str, from_: str, to: str):
     """
     同步翻译函数，多供应商支持故障转移和超时控制
@@ -209,6 +262,9 @@ def do_translate(text: str, from_: str, to: str):
     # 获取供应商列表
     if not text or not text.strip():
         return ""
+
+    if _is_auto_translation_lang(from_) or _is_auto_translation_lang(to):
+        raise ValueError("Translation no longer supports source/target language 'auto'")
 
     if _is_same_translation_lang(from_, to):
         logger.info(
@@ -282,31 +338,6 @@ def do_translate(text: str, from_: str, to: str):
     logger.error(f"[TRANSLATE] 翻译失败，所有供应商不可用 - 返回原文")
     return text
 
-
-async def translate_local(text: str, source: str, target: str) -> str:
-    if not text or not text.strip():
-        return ""
-    if _is_same_translation_lang(source, target):
-        logger.info(
-            "[TRANSLATE-LOCAL] Skip translation for same language pair: source=%s, target=%s",
-            source,
-            target,
-        )
-        return text
-
-    params = {
-        "q": text, "source": source, "target": target, "format": "text",
-        "api_key": settings.LIBRETRANSLATE_APIKEY
-    }
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(LOCAL_TRANS_URL, params=params)
-            response.raise_for_status()
-            result = response.json()
-            return result.get('translatedText', text)
-        except Exception as e:
-            logger.error(f"Local translation failed: {e}")
-            return text
 
 def packaged_opus_stream_to_wav_bytes(packaged_opus_data: bytes, sample_rate: int) -> bytes:
     # (此函数逻辑复杂且纯粹，直接从 server.py 复制)

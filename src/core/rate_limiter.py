@@ -61,6 +61,8 @@ class RateLimitContext:
     limit_items: List
     key: str
     scope: Optional[str] = None
+    context_type: str = "generic"
+    cost: int = 1
     deduct_when: Callable[[int], bool] = lambda status: True
     checked: bool = field(default=False, init=False)
 
@@ -68,11 +70,15 @@ class RateLimitContext:
     def composite_key(self) -> str:
         return f"{self.scope}:{self.key}" if self.scope else self.key
 
+    @property
+    def normalized_cost(self) -> int:
+        return max(1, int(self.cost or 1))
+
     def check(self) -> None:
         if not self.limiter.enabled or not self.limit_items:
             return
         for item in self.limit_items:
-            if not self.limiter.strategy.test(item, self.composite_key):
+            if not self.limiter.strategy.test(item, self.composite_key, cost=self.normalized_cost):
                 raise RateLimitExceeded(
                     limit=self.limit_string,
                     scope=self.scope,
@@ -86,7 +92,7 @@ class RateLimitContext:
             return
         for item in self.limit_items:
             try:
-                self.limiter.strategy.hit(item, self.composite_key)
+                self.limiter.strategy.hit(item, self.composite_key, cost=self.normalized_cost)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error(f"[RATE-LIMITER] 提交限速计数失败 (key={self.composite_key}, limit={item}): {exc}")
 
@@ -96,6 +102,9 @@ class RateLimitContext:
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning(f"[RATE-LIMITER] deduct_when 回调异常，默认扣减。错误: {exc}")
             return True
+
+    def set_cost(self, cost: int) -> None:
+        self.cost = max(1, int(cost or 1))
 
 
 class RateLimiter:
@@ -123,6 +132,8 @@ class RateLimiter:
         limit_string: str,
         key: str,
         scope: Optional[str] = None,
+        context_type: str = "generic",
+        cost: int = 1,
         deduct_when: Optional[Callable[[int], bool]] = None,
     ) -> Optional[RateLimitContext]:
         if not self.enabled:
@@ -137,6 +148,8 @@ class RateLimiter:
             limit_items=limit_items,
             key=key,
             scope=scope,
+            context_type=context_type,
+            cost=cost,
             deduct_when=deduct_when or (lambda status: True),
         )
 
@@ -146,6 +159,7 @@ class RateLimiter:
             limit_string=DEFAULT_GLOBAL_LIMIT,
             key=key,
             scope=SHARED_LIMIT_SCOPE,
+            context_type="global",
             deduct_when=lambda status: True,
         )
 
@@ -176,6 +190,7 @@ async def enforce_user_rate_limit(
             limit_string=limit_rule,
             key=f"{get_client_ip(request)}:{datetime.now().strftime('%Y-%m-%d')}",
             scope=SHARED_LIMIT_SCOPE,
+            context_type="user",
             deduct_when=lambda status: True,
         )
     else:
@@ -184,6 +199,7 @@ async def enforce_user_rate_limit(
             limit_string=limit_rule,
             key=daily_key,
             scope=f"user:{current_user.username}",
+            context_type="user",
             deduct_when=lambda status: status == 200,
         )
 
@@ -196,3 +212,18 @@ async def enforce_user_rate_limit(
         pending.append(context)
 
     return current_user
+
+
+def set_user_context_cost(request: Request, cost: int) -> None:
+    """
+    调整当前请求的用户限速扣减权重，并立即按新权重复检。
+    """
+    if not rate_limiter.enabled:
+        return
+
+    desired_cost = max(1, int(cost or 1))
+    for context in getattr(request.state, "rate_limit_contexts", []):
+        if getattr(context, "context_type", "") != "user":
+            continue
+        context.set_cost(desired_cost)
+        context.check()

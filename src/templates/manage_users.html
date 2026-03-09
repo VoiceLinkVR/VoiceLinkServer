@@ -296,6 +296,45 @@
             display: flex;
             gap: 7px;
         }
+        .afdian-info {
+            min-width: 240px;
+            display: grid;
+            gap: 4px;
+            line-height: 1.45;
+        }
+        .afdian-main {
+            color: var(--text);
+            font-size: 12px;
+        }
+        .afdian-sub {
+            color: var(--muted);
+            font-size: 12px;
+            word-break: break-all;
+        }
+        .afdian-badges {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+        .afdian-badge {
+            display: inline-flex;
+            align-items: center;
+            height: 22px;
+            padding: 0 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            background: #f1f5f9;
+            color: #334155;
+        }
+        .afdian-badge-warning {
+            background: #fff7ed;
+            color: #c2410c;
+        }
+        .afdian-badge-error {
+            background: #fff1f2;
+            color: #b42318;
+        }
         .btn-mini {
             height: 30px;
             border-radius: 8px;
@@ -448,17 +487,21 @@
                                 <th>状态</th>
                                 <th>限流规则</th>
                                 <th>到期日</th>
+                                <th>爱发电信息</th>
                                 <th>操作</th>
                             </tr>
                         </thead>
                         <tbody id="userTableBody">
-                            {% for user in users %}
+                            {% for row in user_rows %}
+                            {% set user = row.user %}
+                            {% set afdian = row.afdian %}
                             <tr
                                 data-username="{{ user.username }}"
                                 data-is-admin="{{ '1' if user.is_admin else '0' }}"
                                 data-is-active="{{ '1' if user.is_active else '0' }}"
                                 data-limit-rule="{{ user.limit_rule or '' }}"
                                 data-expiration="{{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else '' }}"
+                                data-afdian="{{ afdian.search_text if afdian else '' }}"
                             >
                                 <td><strong>{{ user.username }}</strong></td>
                                 <td>
@@ -477,6 +520,45 @@
                                 </td>
                                 <td>{{ user.limit_rule or '-' }}</td>
                                 <td>{{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else '长期有效' }}</td>
+                                <td>
+                                    {% if afdian %}
+                                    <div class="afdian-info">
+                                        <div class="afdian-badges">
+                                            <span class="afdian-badge">{{ afdian.status_label }}</span>
+                                            {% if afdian.parsed and afdian.action_label %}
+                                            <span class="afdian-badge">{{ afdian.action_label }}</span>
+                                            {% endif %}
+                                            {% if afdian.parsed and afdian.expired %}
+                                            <span class="afdian-badge afdian-badge-warning">Expired</span>
+                                            {% endif %}
+                                            {% if not afdian.parsed %}
+                                            <span class="afdian-badge afdian-badge-error">Parse failed</span>
+                                            {% endif %}
+                                        </div>
+                                        {% if afdian.parsed %}
+                                        <div class="afdian-main">
+                                            {{ afdian.months or '-' }} months / {{ afdian.plan_price or '-' }} / {{ afdian.requested_amount or '-' }}
+                                        </div>
+                                        <div class="afdian-sub">
+                                            Generated: {{ afdian.generated_at or afdian.created_at or '-' }}
+                                        </div>
+                                        {% else %}
+                                        <div class="afdian-main">Cannot parse current Afdian token</div>
+                                        {% if afdian.error %}
+                                        <div class="afdian-sub">Reason: {{ afdian.error }}</div>
+                                        {% endif %}
+                                        {% endif %}
+                                        {% if afdian.out_trade_no %}
+                                        <div class="afdian-sub">Out trade no: {{ afdian.out_trade_no }}</div>
+                                        {% endif %}
+                                        {% if afdian.custom_id_preview %}
+                                        <div class="afdian-sub">Token preview: {{ afdian.custom_id_preview }}</div>
+                                        {% endif %}
+                                    </div>
+                                    {% else %}
+                                    -
+                                    {% endif %}
+                                </td>
                                 <td>
                                     <div class="actions">
                                         <button type="button" class="btn-mini btn-edit js-edit-btn">编辑</button>
@@ -564,7 +646,7 @@
 
             let shown = 0;
             rows.forEach((row) => {
-                const text = `${row.dataset.username} ${row.dataset.limitRule} ${row.dataset.expiration}`.toLowerCase();
+                const text = `${row.dataset.username} ${row.dataset.limitRule} ${row.dataset.expiration} ${row.dataset.afdian || ""}`.toLowerCase();
                 const okKeyword = !keyword || text.includes(keyword);
                 const okRole = matchRole(row, role);
                 const okStatus = matchStatus(row, status);

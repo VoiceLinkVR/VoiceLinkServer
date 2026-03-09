@@ -38,15 +38,16 @@ python test_translate.py
 
 ### Docker Deployment
 ```bash
-# CPU-only deployment
-docker-compose -f docker-compose-cpu.yml up -d
+# Single compose entrypoint
+cp .env.example .env
 
-# CUDA deployment (requires CUDA 12.2+)
-docker-compose -f docker-compose-cuda.yml up -d
+# Pull configured images
 
-# China mirror deployments
-docker-compose -f docker-compose-cpu-cn.yml up -d
-docker-compose -f docker-compose-cuda-cn.yml up -d
+docker compose pull
+
+# Start selected services from COMPOSE_PROFILES
+
+docker compose up -d
 ```
 
 ### Production Server
@@ -69,26 +70,26 @@ uvicorn src.main:app --host 0.0.0.0 --port 8980 --workers 4
 ### Directory Structure
 ```
 src/
-├── core/           # Core functionality
-│   ├── config.py   # Pydantic settings management
-│   ├── dependencies.py # FastAPI dependency injection
-│   ├── services.py # Business logic (translation, audio processing)
-│   ├── rate_limiter.py  # Rate limiting with Redis/memory backend
-│   ├── logging_config.py # Logging configuration
-│   ├── text_compressor.py # Text compression utilities
-│   └── translation_service.py # Translation service abstraction
-├── db/             # Database layer
-│   ├── base.py     # SQLAlchemy base configuration
-│   └── models.py   # ORM models (User, RequestLog)
-├── routers/        # API routes
-│   ├── api.py      # Main API endpoints (/api/*)
-│   ├── manage_api.py # Admin API endpoints (/manageapi/*)
-│   └── ui.py       # Web interface routes (/ui/*)
-├── schemas/        # Pydantic data models
-├── templates/      # HTML templates
-├── static/         # Static files
-├── main.py         # FastAPI app entry point
-└── requirements.txt # Python dependencies
+鈹溾攢鈹€ core/           # Core functionality
+鈹?  鈹溾攢鈹€ config.py   # Pydantic settings management
+鈹?  鈹溾攢鈹€ dependencies.py # FastAPI dependency injection
+鈹?  鈹溾攢鈹€ services.py # Business logic (translation, audio processing)
+鈹?  鈹溾攢鈹€ rate_limiter.py  # Rate limiting with Redis/memory backend
+鈹?  鈹溾攢鈹€ logging_config.py # Logging configuration
+鈹?  鈹溾攢鈹€ text_compressor.py # Text compression utilities
+鈹?  鈹斺攢鈹€ translation_service.py # Translation service abstraction
+鈹溾攢鈹€ db/             # Database layer
+鈹?  鈹溾攢鈹€ base.py     # SQLAlchemy base configuration
+鈹?  鈹斺攢鈹€ models.py   # ORM models (User, RequestLog)
+鈹溾攢鈹€ routers/        # API routes
+鈹?  鈹溾攢鈹€ api.py      # Main API endpoints (/api/*)
+鈹?  鈹溾攢鈹€ manage_api.py # Admin API endpoints (/manageapi/*)
+鈹?  鈹斺攢鈹€ ui.py       # Web interface routes (/ui/*)
+鈹溾攢鈹€ schemas/        # Pydantic data models
+鈹溾攢鈹€ templates/      # HTML templates
+鈹溾攢鈹€ static/         # Static files
+鈹溾攢鈹€ main.py         # FastAPI app entry point
+鈹斺攢鈹€ requirements.txt # Python dependencies
 ```
 
 ### Key Dependencies
@@ -194,5 +195,5 @@ Key environment variables for configuration:
 - **Service Dependencies**: Ensure Whisper and LibreTranslate services are running
 - **First Admin**: First login creates admin account automatically
 - **User Expiration**: Daily cron job disables expired users at midnight UTC
-- 这个项目不要本地验证，让我手动验证
-- 请不需要执行测试，我会手动测试并将测试结果发给你
+- 杩欎釜椤圭洰涓嶈鏈湴楠岃瘉锛岃鎴戞墜鍔ㄩ獙璇?
+- 璇蜂笉闇€瑕佹墽琛屾祴璇曪紝鎴戜細鎵嬪姩娴嬭瘯骞跺皢娴嬭瘯缁撴灉鍙戠粰浣

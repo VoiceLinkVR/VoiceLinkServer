@@ -11,6 +11,55 @@ LANG_CODE_MAPPING = {
     "zh-hans": "zh",
 }
 
+LANGUAGE_NAMES = {
+    "ar": "Arabic",
+    "az": "Azerbaijani",
+    "bg": "Bulgarian",
+    "bn": "Bengali",
+    "ca": "Catalan",
+    "cs": "Czech",
+    "da": "Danish",
+    "de": "German",
+    "el": "Greek",
+    "en": "English",
+    "eo": "Esperanto",
+    "es": "Spanish",
+    "et": "Estonian",
+    "eu": "Basque",
+    "fa": "Persian",
+    "fi": "Finnish",
+    "fr": "French",
+    "ga": "Irish",
+    "gl": "Galician",
+    "he": "Hebrew",
+    "hi": "Hindi",
+    "hu": "Hungarian",
+    "id": "Indonesian",
+    "it": "Italian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "lt": "Lithuanian",
+    "lv": "Latvian",
+    "ms": "Malay",
+    "nb": "Norwegian Bokmal",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "pt": "Portuguese",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "sk": "Slovak",
+    "sl": "Slovenian",
+    "sq": "Albanian",
+    "sv": "Swedish",
+    "th": "Thai",
+    "tl": "Tagalog",
+    "tr": "Turkish",
+    "uk": "Ukrainian",
+    "ur": "Urdu",
+    "zh": "Chinese",
+    "zh-Hant": "Traditional Chinese",
+}
+
 VOICE_LINK_GEMMA_LANG_CODES = {
     "ar", "az", "bg", "bn", "ca", "cs", "da", "de", "el", "en",
     "eo", "es", "et", "eu", "fa", "fi", "fr", "ga", "gl", "he",
@@ -75,8 +124,8 @@ def get_gemma_capability_entry() -> Dict[str, Any]:
     return {
         "engine": "translategemma",
         "languages": language_map,
-        "endpoint": "/v1/chat/completions",
-        "apiMode": "openai",
+        "endpoint": "/completion" if _resolve_api_mode() != "openai" else "/v1/chat/completions",
+        "apiMode": _resolve_api_mode(),
     }
 
 
@@ -94,6 +143,25 @@ def _resolve_max_new_tokens(text: str, max_new_tokens: Optional[int]) -> int:
         return max(1, min(max_new_tokens, 2000))
     estimated = max(len(text) * 3, settings.GEMMA_TRANSLATE_MAX_TOKENS)
     return max(1, min(estimated, 2000))
+
+
+def _resolve_api_mode() -> str:
+    mode = (settings.GEMMA_TRANSLATE_API_MODE or "completion").strip().lower()
+    if mode in {"completion", "openai", "auto"}:
+        return mode
+    logger.warning("[GEMMA_TRANSLATE] unknown API mode '%s', fallback to completion", settings.GEMMA_TRANSLATE_API_MODE)
+    return "completion"
+
+
+def _language_name(lang_code: str) -> str:
+    normalized = _normalize_lang_code(lang_code)
+    if normalized in LANGUAGE_NAMES:
+        return LANGUAGE_NAMES[normalized]
+    if "-" in normalized:
+        base = normalized.split("-", 1)[0]
+        if base in LANGUAGE_NAMES:
+            return LANGUAGE_NAMES[base]
+    return normalized
 
 
 def _post_process(text: str) -> str:
@@ -118,6 +186,8 @@ def _apply_extra_params(payload: Dict[str, Any], extra_params: Optional[Dict[str
 
     for key, value in extra_params.items():
         if value is None:
+            continue
+        if key == "chat_template_kwargs":
             continue
         if (
             key == "chat_template_kwargs"
@@ -151,6 +221,45 @@ def _build_openai_payload(
         },
         "max_tokens": _resolve_max_new_tokens(text, max_new_tokens),
         "temperature": 0.2,
+    }
+
+    resolved_model = model if model is not None else settings.GEMMA_TRANSLATE_MODEL
+    if resolved_model:
+        payload["model"] = resolved_model
+
+    return _apply_extra_params(payload, extra_params)
+
+
+def _build_completion_prompt(text: str, source_lang: str, target_lang: str) -> str:
+    mapped_source = _map_lang_code(source_lang)
+    mapped_target = _map_lang_code(target_lang)
+    source_name = _language_name(source_lang)
+    target_name = _language_name(target_lang)
+    return (
+        f"<start_of_turn>user\n"
+        f"You are a professional {source_name} ({mapped_source}) to {target_name} ({mapped_target}) translator. "
+        f"Your goal is to accurately convey the meaning and nuances of the original {source_name} text while adhering "
+        f"to {target_name} grammar, vocabulary, and cultural sensitivities.\n"
+        f"Produce only the {target_name} translation, without any additional explanations or commentary. Please "
+        f"translate the following {source_name} text into {target_name}:\n\n\n"
+        f"{text}<end_of_turn>\n"
+        f"<start_of_turn>model\n"
+    )
+
+
+def _build_completion_payload(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    model: Optional[str],
+    max_new_tokens: Optional[int],
+    extra_params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "prompt": _build_completion_prompt(text, source_lang, target_lang),
+        "n_predict": _resolve_max_new_tokens(text, max_new_tokens),
+        "temperature": 0.2,
+        "cache_prompt": True,
     }
 
     resolved_model = model if model is not None else settings.GEMMA_TRANSLATE_MODEL
@@ -207,6 +316,17 @@ def _extract_openai_translation(response_data: Any) -> Optional[str]:
     return None
 
 
+def _extract_completion_translation(response_data: Any) -> Optional[str]:
+    if not isinstance(response_data, dict):
+        return None
+
+    content = response_data.get("content")
+    if content is None:
+        return None
+
+    return _post_process(_content_to_text(content))
+
+
 def _log_request_context(prefix: str, source_lang: str, target_lang: str, mapped_source: str, mapped_target: str, text: str) -> None:
     logger.info(
         "%s request %s(%s)->%s(%s), text_len=%s",
@@ -217,6 +337,74 @@ def _log_request_context(prefix: str, source_lang: str, target_lang: str, mapped
         mapped_target,
         len(text),
     )
+
+
+def _try_completion_sync(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    model: Optional[str],
+    max_new_tokens: Optional[int],
+    extra_params: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    payload = _build_completion_payload(text, source_lang, target_lang, model, max_new_tokens, extra_params)
+    mapped_source = _map_lang_code(source_lang)
+    mapped_target = _map_lang_code(target_lang)
+    translate_url = f"{_resolve_base_url()}/completion"
+    prefix = "[GEMMA_TRANSLATE][COMPLETION]"
+
+    try:
+        _log_request_context(prefix, source_lang, target_lang, mapped_source, mapped_target, text)
+        with httpx.Client(timeout=settings.GEMMA_TRANSLATE_TIMEOUT) as client:
+            response = client.post(translate_url, json=payload)
+            response.raise_for_status()
+            translated = _extract_completion_translation(response.json())
+            if translated is None:
+                logger.warning("%s invalid response payload from %s", prefix, translate_url)
+            return translated
+    except httpx.TimeoutException:
+        logger.warning("%s timeout calling %s", prefix, translate_url)
+        return None
+    except httpx.HTTPStatusError as exc:
+        logger.warning("%s http error: %s, body=%s", prefix, exc.response.status_code, exc.response.text[:300])
+        return None
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("%s unexpected error: %s", prefix, exc)
+        return None
+
+
+async def _try_completion_async(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    model: Optional[str],
+    max_new_tokens: Optional[int],
+    extra_params: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    payload = _build_completion_payload(text, source_lang, target_lang, model, max_new_tokens, extra_params)
+    mapped_source = _map_lang_code(source_lang)
+    mapped_target = _map_lang_code(target_lang)
+    translate_url = f"{_resolve_base_url()}/completion"
+    prefix = "[GEMMA_TRANSLATE][COMPLETION]"
+
+    try:
+        _log_request_context(prefix, source_lang, target_lang, mapped_source, mapped_target, text)
+        async with httpx.AsyncClient(timeout=settings.GEMMA_TRANSLATE_TIMEOUT) as client:
+            response = await client.post(translate_url, json=payload)
+            response.raise_for_status()
+            translated = _extract_completion_translation(response.json())
+            if translated is None:
+                logger.warning("%s invalid response payload from %s", prefix, translate_url)
+            return translated
+    except httpx.TimeoutException:
+        logger.warning("%s timeout calling %s", prefix, translate_url)
+        return None
+    except httpx.HTTPStatusError as exc:
+        logger.warning("%s http error: %s, body=%s", prefix, exc.response.status_code, exc.response.text[:300])
+        return None
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("%s unexpected error: %s", prefix, exc)
+        return None
 
 
 def _try_openai_sync(
@@ -308,6 +496,15 @@ def gemma_translate(
         )
         return None
 
+    mode = _resolve_api_mode()
+    if mode == "completion":
+        return _try_completion_sync(text, source_lang, target_lang, model, max_new_tokens, extra_params)
+    if mode == "openai":
+        return _try_openai_sync(text, source_lang, target_lang, model, max_new_tokens, extra_params)
+
+    translated = _try_completion_sync(text, source_lang, target_lang, model, max_new_tokens, extra_params)
+    if translated is not None:
+        return translated
     return _try_openai_sync(text, source_lang, target_lang, model, max_new_tokens, extra_params)
 
 
@@ -330,4 +527,13 @@ async def async_gemma_translate(
         )
         return None
 
+    mode = _resolve_api_mode()
+    if mode == "completion":
+        return await _try_completion_async(text, source_lang, target_lang, model, max_new_tokens, extra_params)
+    if mode == "openai":
+        return await _try_openai_async(text, source_lang, target_lang, model, max_new_tokens, extra_params)
+
+    translated = await _try_completion_async(text, source_lang, target_lang, model, max_new_tokens, extra_params)
+    if translated is not None:
+        return translated
     return await _try_openai_async(text, source_lang, target_lang, model, max_new_tokens, extra_params)

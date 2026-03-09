@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     TRANSLATION_TIMEOUT: float = 1.5  # 翻译请求超时时间（秒）
     GEMMA_TRANSLATE_ENABLED: bool = False
     GEMMA_TRANSLATE_URL: str = "127.0.0.1:8080"
-    GEMMA_TRANSLATE_API_MODE: str = "openai"  # new llama-server deployment supports OpenAI-compatible API only
+    GEMMA_TRANSLATE_API_MODE: str = "completion"  # recommended mode for translategemma on llama-server without jinja
     GEMMA_TRANSLATE_MODEL: str = "translategemma-12b-it-MP-GGUF"
     GEMMA_TRANSLATE_TIMEOUT: float = 10.0
     GEMMA_TRANSLATE_MAX_TOKENS: int = 500

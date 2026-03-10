@@ -67,9 +67,9 @@ def _get_resource_increment_per_step() -> int:
     return max(1, int(settings.AFDIAN_BOOST_DAILY_INCREMENT or 1500))
 
 
-def _build_payment_guide_token(payload: Dict[str, Any]) -> str:
+def _build_payment_guide_token(username: str, payload: Dict[str, Any]) -> str:
     return afdian_service.build_custom_id(
-        username="user-center",
+        username=username,
         password="guide",
         action="payment_guide",
         extra_payload=payload,
@@ -94,8 +94,7 @@ async def payment_guide(payload: PaymentGuideRequest, db: Session = Depends(get_
     username = payload.username.strip()
     if _is_test_user(username):
         return {
-            "username": username,
-            "is_test_user": True,
+                "is_test_user": True,
             "status": "test_user",
         }
 
@@ -221,7 +220,6 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
 
     guide_payload = {
         "v": 1,
-        "username": username,
         "ts": int(datetime.now(timezone.utc).timestamp()),
         "current_price": round(float(current_price), 2),
         "price_step": price_step,
@@ -229,7 +227,7 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
         "effective_rule": effective_rule,
         "is_expired": is_expired,
     }
-    guide_token = _build_payment_guide_token(guide_payload)
+    guide_token = _build_payment_guide_token(username, guide_payload)
 
     renew_option = {
         "allowed": True,
@@ -266,7 +264,6 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
     anchor_reason = "expired_downgrade_allowed" if downgrade_option["allowed"] else "current"
 
     return {
-        "username": username,
         "is_test_user": _is_test_user(username),
         "is_expired": is_expired,
         "status": "ok",
@@ -650,7 +647,6 @@ async def activate_order(payload: ActivateRequest, db: Session = Depends(get_db)
     return {
         "message": "激活成功",
         "idempotent": False,
-        "username": username,
         "out_trade_no": out_trade_no,
         "order_no": order_no,
         "action": action,

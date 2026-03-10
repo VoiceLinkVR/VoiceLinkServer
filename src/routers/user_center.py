@@ -44,7 +44,7 @@ def _is_test_user(username: str) -> bool:
 
 class PaymentLinkRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
-    password: str = Field(..., min_length=6, max_length=100)
+    password: str = Field(..., min_length=1, max_length=100)
     action: str = Field("renew")
     months: int = Field(1, ge=1, le=24)
     target_monthly_price: Optional[float] = None
@@ -55,7 +55,7 @@ class PaymentLinkRequest(BaseModel):
 
 class PaymentGuideRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
-    password: str = Field(..., min_length=6, max_length=100)
+    password: str = Field(..., min_length=1, max_length=100)
 
 
 def _get_price_step() -> float:
@@ -94,7 +94,8 @@ async def payment_guide(payload: PaymentGuideRequest, db: Session = Depends(get_
     username = payload.username.strip()
     if _is_test_user(username):
         return {
-                "is_test_user": True,
+            "username": username,
+            "is_test_user": True,
             "status": "test_user",
         }
 
@@ -210,12 +211,17 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
     resource_step = _get_resource_increment_per_step()
     current_price, effective_rule = _get_user_price_and_limit_rule(user)
 
+    is_registered = user is not None
+
+    if not is_registered:
+        current_price = float(price_step)
+
     is_expired = False
     if user is not None:
         is_expired, _ = is_user_expired(user)
 
-    allowed_actions = ["renew", "upgrade"]
-    if _is_downgrade_allowed(user, is_expired, current_price):
+    allowed_actions = ["renew", "upgrade"] if is_registered else ["renew"]
+    if is_registered and _is_downgrade_allowed(user, is_expired, current_price):
         allowed_actions.append("downgrade")
 
     guide_payload = {
@@ -239,34 +245,61 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
         "target_resource_quota_preview": _calculate_daily_limit_from_price(current_price),
     }
 
+    if not is_registered:
+        # First-time purchase: let user pick a plan monthly price (>= step).
+        renew_option = {
+            "allowed": True,
+            "readonly": False,
+            "default_monthly_price": float(price_step),
+            "min_monthly_price": float(price_step),
+            "max_monthly_price": None,
+            "step": price_step,
+            "target_resource_quota_preview": _calculate_daily_limit_from_price(float(price_step)),
+        }
+
     upgrade_option = {
-        "allowed": True,
+        "allowed": bool(is_registered),
         "readonly": False,
         "default_monthly_price": round(float(max(current_price + price_step, price_step)), 2),
         "min_monthly_price": round(float(max(current_price + price_step, price_step)), 2),
         "max_monthly_price": None,
         "step": price_step,
+        "target_resource_quota_preview": _calculate_daily_limit_from_price(float(max(current_price + price_step, price_step))),
     }
 
+    downgrade_allowed = bool(is_registered) and _is_downgrade_allowed(user, is_expired, current_price)
     downgrade_option = {
-        "allowed": _is_downgrade_allowed(user, is_expired, current_price),
+        "allowed": downgrade_allowed,
         "readonly": False,
         "default_monthly_price": round(float(max(price_step, current_price - price_step)), 2),
         "min_monthly_price": float(price_step),
         "max_monthly_price": round(float(max(price_step, current_price - price_step)), 2),
         "step": price_step,
+        "target_resource_quota_preview": _calculate_daily_limit_from_price(float(max(price_step, current_price - price_step))),
     }
 
     display_monthly_price = round(float(current_price), 2)
-    display_plan_name = f"￥{display_monthly_price:.2f}/月"
-    display_resource_summary = f"{_calculate_daily_limit_from_price(current_price)}/day"
+    display_plan_name = (
+        f"￥{display_monthly_price:.2f}/月" if is_registered else "首次开通（自选档位）"
+    )
+    display_resource_summary = (
+        f"{_calculate_daily_limit_from_price(current_price)}/day"
+        if is_registered
+        else f"起步 {_calculate_daily_limit_from_price(float(price_step))}/day"
+    )
 
-    anchor_reason = "expired_downgrade_allowed" if downgrade_option["allowed"] else "current"
+    anchor_reason = (
+        "unregistered"
+        if not is_registered
+        else ("expired_downgrade_allowed" if downgrade_allowed else "current")
+    )
 
     return {
+        "username": username,
         "is_test_user": _is_test_user(username),
+        "is_registered": is_registered,
         "is_expired": is_expired,
-        "status": "ok",
+        "status": "unregistered" if not is_registered else "ok",
         "price_step": price_step,
         "resource_increment_per_step": resource_step,
         "display_plan_name": display_plan_name,

@@ -38,7 +38,7 @@ docker compose up -d
 - `WHISPER_BACKEND=faster-whisper` or `WHISPER_BACKEND=whisper-trt`
 - `TRANSLATE_SERVICE_URL=http://gemma-translate:8080`
 - `GEMMA_TRANSLATE_ENABLED=True` when enabling the Gemma service path
-- `GEMMA_TRANSLATE_API_MODE=completion` is recommended for the current TranslateGemma deployment; use `openai` only as a rollback path
+- `GEMMA_TRANSLATE_API_MODE=completion` is required for the current TranslateGemma deployment (llama-server `--no-jinja`, `POST /completion`)
 - `sourceLanguage=auto` is no longer supported for Gemma/text translation requests
 - `WHISPER_TRT_REST_HOST_PORT=18100` by default to avoid conflicting with Faster-Whisper on `8000`
 
@@ -307,7 +307,7 @@ The table above is a quick summary. The following section is the complete refere
 |----------|-------------|---------|
 | `GEMMA_TRANSLATE_ENABLED` | Enable TranslateGemma/OpenAI-compatible translation path | `False` |
 | `GEMMA_TRANSLATE_URL` | TranslateGemma base host and port | `127.0.0.1:8080` |
-| `GEMMA_TRANSLATE_API_MODE` | API mode for Gemma service: `completion`, `openai`, or `auto` | `completion` |
+| `GEMMA_TRANSLATE_API_MODE` | API mode for Gemma service (forced): `completion` | `completion` |
 | `GEMMA_TRANSLATE_MODEL` | Model name sent to the Gemma service | `translategemma-12b-it-MP-GGUF` |
 | `GEMMA_TRANSLATE_TIMEOUT` | Gemma request timeout in seconds | `10.0` |
 | `GEMMA_TRANSLATE_MAX_TOKENS` | Max generated tokens for Gemma translation calls | `500` |

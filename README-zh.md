@@ -38,7 +38,7 @@ docker compose up -d
 - `WHISPER_BACKEND=faster-whisper` 或 `WHISPER_BACKEND=whisper-trt`
 - `TRANSLATE_SERVICE_URL=http://gemma-translate:8080`
 - 启用 Gemma 路径时，将 `GEMMA_TRANSLATE_ENABLED=True`
-- `GEMMA_TRANSLATE_API_MODE=openai`，当前 Gemma 部署只支持 `llama-server` 的 `POST /v1/chat/completions`
+- `GEMMA_TRANSLATE_API_MODE=completion`（必选），当前 Gemma 部署按 `llama-server --no-jinja` 走 `POST /completion`
 - Gemma/文本翻译请求不再支持 `sourceLanguage=auto`
 - 默认把 `WHISPER_TRT_REST_HOST_PORT` 设为 `18100`，避免和 Faster-Whisper 的 `8000` 端口冲突
 
@@ -307,7 +307,7 @@ data={"targetLanguage":""}
 |------|------|--------|
 | `GEMMA_TRANSLATE_ENABLED` | 是否启用 TranslateGemma / OpenAI 兼容翻译链路 | `False` |
 | `GEMMA_TRANSLATE_URL` | TranslateGemma 服务地址和端口 | `127.0.0.1:8080` |
-| `GEMMA_TRANSLATE_API_MODE` | Gemma 接口模式，当前为 `openai` | `openai` |
+| `GEMMA_TRANSLATE_API_MODE` | Gemma 接口模式（强制）：`completion` | `completion` |
 | `GEMMA_TRANSLATE_MODEL` | 发送给 Gemma 服务的模型名 | `translategemma-12b-it-MP-GGUF` |
 | `GEMMA_TRANSLATE_TIMEOUT` | Gemma 请求超时时间，单位秒 | `10.0` |
 | `GEMMA_TRANSLATE_MAX_TOKENS` | Gemma 翻译时允许生成的最大 token 数 | `500` |

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from core.afdian_service import afdian_service
 from core.dependencies import get_db, hash_password, verify_password, get_admin_user_from_session
 from core.logging_config import logger
-from db.models import User, RequestLog, PaymentOrder
+from db.models import User, RequestLog
 
 router = APIRouter(
     tags=["UI Management"],
@@ -33,15 +33,9 @@ EXCLUDED_ENDPOINTS = [
 ]
 
 AFDIAN_ACTION_LABELS = {
-    "renew": "续费",
-    "upgrade": "升级",
+    "renew": "renew",
+    "upgrade": "upgrade",
 }
-
-
-def _format_local_datetime(value: Optional[datetime]) -> Optional[str]:
-    if value is None:
-        return None
-    return (value + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _format_local_timestamp(timestamp_value: Any) -> Optional[str]:
@@ -63,132 +57,33 @@ def _format_money(value: Any) -> Optional[str]:
         return None
 
 
-def _mask_custom_id(value: Optional[str]) -> str:
-    text = (value or "").strip()
-    if not text:
-        return ""
-    if len(text) <= 28:
-        return text
-    return f"{text[:16]}...{text[-10:]}"
-
-
-def _build_afdian_summary_text(order: PaymentOrder, parsed: Dict[str, Any]) -> str:
-    parts: List[str] = []
+def _build_afdian_token_result(token: str) -> Dict[str, Any]:
+    parsed = afdian_service.parse_custom_id(token)
 
     action = str(parsed.get("action") or "").strip().lower()
-    if action:
-        parts.append(AFDIAN_ACTION_LABELS.get(action, action))
-
-    months = parsed.get("months")
     try:
-        months_value = int(months)
-    except (TypeError, ValueError):
-        months_value = None
-    if months_value:
-        parts.append(f"{months_value}个月")
-
-    plan_price = _format_money(parsed.get("plan_price"))
-    if plan_price:
-        parts.append(f"单价 {plan_price}")
-
-    requested_amount = _format_money(parsed.get("requested_amount"))
-    if requested_amount:
-        parts.append(f"总额 {requested_amount}")
-
-    generated_at = _format_local_timestamp(parsed.get("ts"))
-    if generated_at:
-        parts.append(generated_at)
-
-    status = (order.status or "").strip()
-    if status:
-        parts.append(status)
-
-    return " ".join(parts)
-
-
-def _build_afdian_order_meta(order: Optional[PaymentOrder]) -> Optional[Dict[str, Any]]:
-    if order is None:
-        return None
-
-    custom_id = (order.custom_id or order.remark or "").strip()
-    base_meta = {
-        "status": (order.status or "-").strip() or "-",
-        "status_label": (order.status or "-").strip() or "-",
-        "updated_at": _format_local_datetime(order.updated_at),
-        "created_at": _format_local_datetime(order.created_at),
-        "out_trade_no": (order.out_trade_no or "").strip(),
-        "custom_id_preview": _mask_custom_id(custom_id),
-        "custom_id_length": len(custom_id),
-        "parsed": False,
-        "search_text": " ".join(
-            part for part in [order.username or "", order.status or "", custom_id] if part
-        ),
-    }
-
-    if not custom_id:
-        return base_meta
-
-    try:
-        parsed = afdian_service.parse_custom_id(custom_id)
-    except ValueError as exc:
-        base_meta["error"] = str(exc)
-        return base_meta
-
-    generated_at = _format_local_timestamp(parsed.get("ts"))
-    action = str(parsed.get("action") or "").strip().lower()
-    plan_price = _format_money(parsed.get("plan_price"))
-    requested_amount = _format_money(parsed.get("requested_amount"))
-    try:
-        months = int(parsed.get("months"))
+        months = int(parsed.get("months")) if parsed.get("months") is not None else None
     except (TypeError, ValueError):
         months = None
 
-    summary = _build_afdian_summary_text(order, parsed)
-    search_text_parts = [
-        order.username or "",
-        AFDIAN_ACTION_LABELS.get(action, action),
-        str(months or ""),
-        plan_price or "",
-        requested_amount or "",
-        generated_at or "",
-        order.status or "",
-        custom_id,
-    ]
-
-    base_meta.update(
-        {
-            "parsed": True,
-            "action": action,
-            "action_label": AFDIAN_ACTION_LABELS.get(action, action or "-"),
+    return {
+        "token_length": len(token),
+        "expired": afdian_service.is_custom_id_expired(parsed),
+        "fields": {
+            "version": parsed.get("v"),
+            "username": parsed.get("username"),
+            "password": parsed.get("password"),
+            "action": action or None,
+            "action_label": AFDIAN_ACTION_LABELS.get(action, action or None),
             "months": months,
-            "plan_price": plan_price,
-            "requested_amount": requested_amount,
-            "generated_at": generated_at,
-            "expired": afdian_service.is_custom_id_expired(parsed),
-            "summary": summary,
-            "search_text": " ".join(part for part in search_text_parts if part),
-        }
-    )
-    return base_meta
-
-
-def _build_latest_afdian_orders(db: Session, usernames: List[str]) -> Dict[str, PaymentOrder]:
-    if not usernames:
-        return {}
-
-    orders = (
-        db.query(PaymentOrder)
-        .filter(PaymentOrder.username.in_(usernames))
-        .order_by(PaymentOrder.username.asc(), PaymentOrder.updated_at.desc(), PaymentOrder.id.desc())
-        .all()
-    )
-
-    latest_orders: Dict[str, PaymentOrder] = {}
-    for order in orders:
-        username = (order.username or "").strip()
-        if username and username not in latest_orders:
-            latest_orders[username] = order
-    return latest_orders
+            "plan_price": _format_money(parsed.get("plan_price")),
+            "requested_amount": _format_money(parsed.get("requested_amount")),
+            "timestamp": parsed.get("ts"),
+            "generated_at_local": _format_local_timestamp(parsed.get("ts")),
+            "nonce": parsed.get("nonce"),
+        },
+        "payload": parsed,
+    }
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -237,14 +132,6 @@ async def manage_users_ui(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse(url=request.url_for("login_ui_get"))
 
     users = db.query(User).all()
-    latest_orders = _build_latest_afdian_orders(db, [user.username for user in users])
-    user_rows = [
-        {
-            "user": user,
-            "afdian": _build_afdian_order_meta(latest_orders.get(user.username)),
-        }
-        for user in users
-    ]
     now = datetime.now()
     soon = now + timedelta(days=7)
     user_stats = {
@@ -266,8 +153,30 @@ async def manage_users_ui(request: Request, db: Session = Depends(get_db)):
     messages = request.session.pop("flash_messages", [])
     return templates.TemplateResponse(
         "manage_users.html",
-        {"request": request, "users": users, "user_rows": user_rows, "messages": messages, "user_stats": user_stats}
+        {"request": request, "users": users, "messages": messages, "user_stats": user_stats}
     )
+
+
+@router.post("/manage_users/parse_afdian_token", response_class=JSONResponse)
+async def parse_afdian_token_ui(
+    request: Request,
+    db: Session = Depends(get_db),
+    token: str = Form(...),
+):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+
+    token = (token or "").strip()
+    if not token:
+        return JSONResponse(status_code=400, content={"detail": "token is required"})
+
+    try:
+        payload = _build_afdian_token_result(token)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    return JSONResponse(content=jsonable_encoder(payload))
 
 
 @router.post("/manage_users", response_class=RedirectResponse)

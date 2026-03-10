@@ -74,8 +74,9 @@
         }
         .nav a:hover { background: #eff6ff; border-color: #c9d8f9; }
         .layout {
-            max-width: 1400px;
-            margin: 0 auto;
+            width: 100%;
+            max-width: none;
+            margin: 0;
             padding: 18px;
             display: grid;
             grid-template-columns: 390px 1fr;
@@ -141,6 +142,23 @@
             color: var(--text);
             background: #fff;
             outline: none;
+        }
+        textarea {
+            width: 100%;
+            min-height: 88px;
+            border: 1px solid var(--line);
+            border-radius: 9px;
+            padding: 10px;
+            font-size: 12px;
+            color: var(--text);
+            background: #fff;
+            outline: none;
+            resize: vertical;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+        }
+        textarea:focus {
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
         }
         input:focus {
             border-color: #93c5fd;
@@ -260,7 +278,6 @@
             width: 100%;
             border-collapse: collapse;
             font-size: 13px;
-            min-width: 760px;
         }
         th, td {
             padding: 9px 10px;
@@ -296,44 +313,55 @@
             display: flex;
             gap: 7px;
         }
-        .afdian-info {
-            min-width: 240px;
+        .divider {
+            border: 0;
+            border-top: 1px solid #edf2fb;
+            margin: 14px 0;
+        }
+        .tool-head {
             display: grid;
             gap: 4px;
-            line-height: 1.45;
+            margin-bottom: 10px;
         }
-        .afdian-main {
-            color: var(--text);
+        .tool-title {
+            font-size: 14px;
+            font-weight: 800;
+            margin: 0;
+        }
+        .tool-desc {
+            margin: 0;
             font-size: 12px;
-        }
-        .afdian-sub {
             color: var(--muted);
+        }
+        .tool-result {
+            border: 1px solid #edf2fb;
+            background: #fcfdff;
+            border-radius: 12px;
+            padding: 10px;
+            display: grid;
+            gap: 8px;
+        }
+        .tool-result pre {
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
             font-size: 12px;
-            word-break: break-all;
+            line-height: 1.4;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
         }
-        .afdian-badges {
-            display: flex;
-            gap: 6px;
-            flex-wrap: wrap;
+        .tool-kv {
+            display: grid;
+            grid-template-columns: 140px 1fr;
+            gap: 6px 10px;
+            font-size: 12px;
+            line-height: 1.4;
         }
-        .afdian-badge {
-            display: inline-flex;
-            align-items: center;
-            height: 22px;
-            padding: 0 8px;
-            border-radius: 999px;
-            font-size: 11px;
+        .tool-kv .k {
+            color: var(--muted);
             font-weight: 700;
-            background: #f1f5f9;
-            color: #334155;
         }
-        .afdian-badge-warning {
-            background: #fff7ed;
-            color: #c2410c;
-        }
-        .afdian-badge-error {
-            background: #fff1f2;
-            color: #b42318;
+        .tool-kv .v {
+            word-break: break-all;
         }
         .btn-mini {
             height: 30px;
@@ -436,6 +464,28 @@
                         </div>
                     </div>
                 </form>
+
+                <hr class="divider">
+
+                <div class="tool-head">
+                    <h3 class="tool-title">Afdian Token Parser</h3>
+                    <p class="tool-desc">Paste token/custom_id here to decode fields (admin only).</p>
+                </div>
+
+                <div class="form-grid">
+                    <div class="field">
+                        <label for="afdian_token">Token</label>
+                        <textarea id="afdian_token" placeholder="Paste token here..."></textarea>
+                    </div>
+                    <div class="btn-row">
+                        <button class="btn-primary" type="button" id="afdianParseBtn">Parse</button>
+                        <button class="btn-ghost" type="button" id="afdianClearBtn">Clear</button>
+                    </div>
+                    <div class="tool-result" id="afdianResult" style="display:none;">
+                        <div class="tool-kv" id="afdianKv"></div>
+                        <pre id="afdianRaw"></pre>
+                    </div>
+                </div>
             </div>
         </section>
 
@@ -487,21 +537,17 @@
                                 <th>状态</th>
                                 <th>限流规则</th>
                                 <th>到期日</th>
-                                <th>爱发电信息</th>
                                 <th>操作</th>
                             </tr>
                         </thead>
                         <tbody id="userTableBody">
-                            {% for row in user_rows %}
-                            {% set user = row.user %}
-                            {% set afdian = row.afdian %}
+                            {% for user in users %}
                             <tr
                                 data-username="{{ user.username }}"
                                 data-is-admin="{{ '1' if user.is_admin else '0' }}"
                                 data-is-active="{{ '1' if user.is_active else '0' }}"
                                 data-limit-rule="{{ user.limit_rule or '' }}"
                                 data-expiration="{{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else '' }}"
-                                data-afdian="{{ afdian.search_text if afdian else '' }}"
                             >
                                 <td><strong>{{ user.username }}</strong></td>
                                 <td>
@@ -520,45 +566,6 @@
                                 </td>
                                 <td>{{ user.limit_rule or '-' }}</td>
                                 <td>{{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else '长期有效' }}</td>
-                                <td>
-                                    {% if afdian %}
-                                    <div class="afdian-info">
-                                        <div class="afdian-badges">
-                                            <span class="afdian-badge">{{ afdian.status_label }}</span>
-                                            {% if afdian.parsed and afdian.action_label %}
-                                            <span class="afdian-badge">{{ afdian.action_label }}</span>
-                                            {% endif %}
-                                            {% if afdian.parsed and afdian.expired %}
-                                            <span class="afdian-badge afdian-badge-warning">Expired</span>
-                                            {% endif %}
-                                            {% if not afdian.parsed %}
-                                            <span class="afdian-badge afdian-badge-error">Parse failed</span>
-                                            {% endif %}
-                                        </div>
-                                        {% if afdian.parsed %}
-                                        <div class="afdian-main">
-                                            {{ afdian.months or '-' }} months / {{ afdian.plan_price or '-' }} / {{ afdian.requested_amount or '-' }}
-                                        </div>
-                                        <div class="afdian-sub">
-                                            Generated: {{ afdian.generated_at or afdian.created_at or '-' }}
-                                        </div>
-                                        {% else %}
-                                        <div class="afdian-main">Cannot parse current Afdian token</div>
-                                        {% if afdian.error %}
-                                        <div class="afdian-sub">Reason: {{ afdian.error }}</div>
-                                        {% endif %}
-                                        {% endif %}
-                                        {% if afdian.out_trade_no %}
-                                        <div class="afdian-sub">Out trade no: {{ afdian.out_trade_no }}</div>
-                                        {% endif %}
-                                        {% if afdian.custom_id_preview %}
-                                        <div class="afdian-sub">Token preview: {{ afdian.custom_id_preview }}</div>
-                                        {% endif %}
-                                    </div>
-                                    {% else %}
-                                    -
-                                    {% endif %}
-                                </td>
                                 <td>
                                     <div class="actions">
                                         <button type="button" class="btn-mini btn-edit js-edit-btn">编辑</button>
@@ -592,6 +599,12 @@
         const userTableBody = document.getElementById("userTableBody");
         const visibleCount = document.getElementById("visibleCount");
         const resetFormBtn = document.getElementById("resetFormBtn");
+        const afdianParseBtn = document.getElementById("afdianParseBtn");
+        const afdianClearBtn = document.getElementById("afdianClearBtn");
+        const afdianTokenInput = document.getElementById("afdian_token");
+        const afdianResult = document.getElementById("afdianResult");
+        const afdianKv = document.getElementById("afdianKv");
+        const afdianRaw = document.getElementById("afdianRaw");
 
         const formRefs = {
             username: document.getElementById("new_username"),
@@ -646,7 +659,7 @@
 
             let shown = 0;
             rows.forEach((row) => {
-                const text = `${row.dataset.username} ${row.dataset.limitRule} ${row.dataset.expiration} ${row.dataset.afdian || ""}`.toLowerCase();
+                const text = `${row.dataset.username} ${row.dataset.limitRule} ${row.dataset.expiration}`.toLowerCase();
                 const okKeyword = !keyword || text.includes(keyword);
                 const okRole = matchRole(row, role);
                 const okStatus = matchStatus(row, status);
@@ -655,6 +668,65 @@
                 if (visible) shown += 1;
             });
             visibleCount.textContent = `显示 ${shown} / ${rows.length}`;
+        }
+
+        function renderKv(target, fields) {
+            target.innerHTML = "";
+            Object.keys(fields).forEach((key) => {
+                const value = fields[key];
+                const rowKey = document.createElement("div");
+                rowKey.className = "k";
+                rowKey.textContent = key;
+                const rowVal = document.createElement("div");
+                rowVal.className = "v";
+                rowVal.textContent = value === null || value === undefined ? "-" : String(value);
+                target.appendChild(rowKey);
+                target.appendChild(rowVal);
+            });
+        }
+
+        async function parseAfdianToken() {
+            const token = (afdianTokenInput.value || "").trim();
+            if (!token) {
+                afdianResult.style.display = "none";
+                return;
+            }
+
+            afdianParseBtn.disabled = true;
+            afdianParseBtn.textContent = "Parsing...";
+            try {
+                const formData = new FormData();
+                formData.append("token", token);
+                const resp = await fetch("{{ request.url_for('parse_afdian_token_ui') }}", {
+                    method: "POST",
+                    body: formData,
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    throw new Error(data.detail || "parse failed");
+                }
+
+                const fields = data.fields || {};
+                fields.expired = data.expired;
+                fields.token_length = data.token_length;
+                renderKv(afdianKv, fields);
+                afdianRaw.textContent = JSON.stringify(data.payload || data, null, 2);
+                afdianResult.style.display = "grid";
+            } catch (err) {
+                renderKv(afdianKv, { error: err.message || String(err) });
+                afdianRaw.textContent = "";
+                afdianResult.style.display = "grid";
+            } finally {
+                afdianParseBtn.disabled = false;
+                afdianParseBtn.textContent = "Parse";
+            }
+        }
+
+        function clearAfdianToken() {
+            afdianTokenInput.value = "";
+            afdianResult.style.display = "none";
+            afdianKv.innerHTML = "";
+            afdianRaw.textContent = "";
         }
 
         document.querySelectorAll(".js-edit-btn").forEach((btn) => {
@@ -668,6 +740,8 @@
         roleFilter.addEventListener("change", applyFilters);
         statusFilter.addEventListener("change", applyFilters);
         resetFormBtn.addEventListener("click", resetForm);
+        afdianParseBtn.addEventListener("click", parseAfdianToken);
+        afdianClearBtn.addEventListener("click", clearAfdianToken);
 
         applyFilters();
     </script>

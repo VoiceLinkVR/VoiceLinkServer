@@ -18,13 +18,23 @@ from core.dependencies import (
     is_user_expired,
     get_effective_user_limit_rule,
 )
+from core.quota_service import (
+    QUOTA_SOURCE_ADDON,
+    QUOTA_SOURCE_DAILY,
+    build_quota_snapshot,
+    is_new_quota_mode_enabled,
+)
 from core.rate_limiter import enforce_user_rate_limit, set_user_context_cost
 from core.config import settings
 from db.models import User, RequestLog
 from core.services import (
     errorFilter, do_translate,
     supportedLanguagesList, whisperSupportedLanguageList, SENSEVOICE_URL, packaged_opus_stream_to_wav_bytes,
-    compress_repeated_chars, do_transcribe, do_translate_audio
+    compress_repeated_chars, do_transcribe, do_translate_audio,
+    get_runtime_translation_source_languages, get_runtime_translation_target_languages,
+    is_runtime_translation_source_supported, is_runtime_translation_target_supported,
+    normalize_translation_language_code,
+    detect_translation_source_language,
 )
 from core.logging_config import logger
 # 导入用于接收JSON体的Pydantic模型
@@ -70,7 +80,75 @@ def _reject_auto_language(field_name: str, language: str) -> None:
     if (language or "").strip().lower() == "auto":
         raise HTTPException(status_code=400, detail=f"{field_name} 'auto' is no longer supported")
 
+
+def _validate_runtime_target_language(field_name: str, language: str, allow_none: bool = False) -> str:
+    normalized = (language or "").strip()
+    if allow_none and normalized == "none":
+        return normalized
+    if normalized.lower() == "auto":
+        raise HTTPException(status_code=400, detail=f"{field_name} 'auto' is no longer supported")
+
+    canonical = normalize_translation_language_code(normalized)
+    if not is_runtime_translation_target_supported(canonical):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} error, please use following languages: {str(get_runtime_translation_target_languages())}",
+        )
+    return canonical
+
+
+def _validate_runtime_source_language(field_name: str, language: str, allow_none: bool = False) -> str:
+    normalized = (language or "").strip()
+    if allow_none and normalized == "none":
+        return normalized
+    if normalized.lower() == "auto":
+        raise HTTPException(status_code=400, detail=f"{field_name} 'auto' is no longer supported")
+
+    canonical = normalize_translation_language_code(normalized)
+    if not is_runtime_translation_source_supported(canonical):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} error, please use following languages: {str(get_runtime_translation_source_languages())}",
+        )
+    return canonical
+
+
+def _get_audio_translation_target_languages() -> list[str]:
+    languages = set(get_runtime_translation_target_languages())
+    if settings.WHISPER_BACKEND == "whisper-trt":
+        languages.update(whisperSupportedLanguageList)
+    return sorted(languages)
+
+
+def _validate_audio_target_language(field_name: str, language: str, allow_none: bool = False) -> str:
+    normalized = (language or "").strip()
+    if allow_none and normalized == "none":
+        return normalized
+    if normalized.lower() == "auto":
+        raise HTTPException(status_code=400, detail=f"{field_name} 'auto' is no longer supported")
+
+    canonical = normalize_translation_language_code(normalized)
+    if canonical in set(_get_audio_translation_target_languages()):
+        return canonical
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"{field_name} error, please use following languages: {str(_get_audio_translation_target_languages())}",
+    )
+
 # --- API 路由 ---
+
+def _daily_resource_cost_case():
+    if is_new_quota_mode_enabled():
+        return case((RequestLog.quota_source == QUOTA_SOURCE_DAILY, RequestLog.resource_cost), else_=0)
+    return RequestLog.resource_cost
+
+
+def _addon_resource_cost_case():
+    if is_new_quota_mode_enabled():
+        return case((RequestLog.quota_source == QUOTA_SOURCE_ADDON, RequestLog.resource_cost), else_=0)
+    return 0
+
 
 @router.post("/login")
 # 将函数签名修改为接收 UserLogin 模型作为请求体
@@ -133,7 +211,10 @@ async def latest_version_info():
 
 
 @router.get("/account/status")
-async def account_status(current_user: User = Depends(get_current_user_for_status)):
+async def account_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_for_status),
+):
     if _is_test_user(current_user.username):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -167,6 +248,8 @@ async def account_status(current_user: User = Depends(get_current_user_for_statu
         boost_expiration_utc = boost_expires_at.isoformat().replace("+00:00", "Z")
         boost_remaining_seconds = int((boost_expires_at - now).total_seconds())
 
+    quota_snapshot = build_quota_snapshot(db, current_user)
+
     return {
         "username": current_user.username,
         "is_active": bool(current_user.is_active),
@@ -176,6 +259,12 @@ async def account_status(current_user: User = Depends(get_current_user_for_statu
         "boost_expiration_utc": boost_expiration_utc,
         "boost_remaining_seconds": boost_remaining_seconds,
         "boost_limit_rule": current_user.boost_limit_rule,
+        "daily_limit": quota_snapshot.daily_limit,
+        "today_daily_resource_used": quota_snapshot.today_daily_used,
+        "remaining_daily": quota_snapshot.remaining_daily,
+        "addon_resource_balance": quota_snapshot.addon_resource_balance,
+        "addon_resource_total": quota_snapshot.addon_resource_total,
+        "addon_expiration_utc": quota_snapshot.addon_expiration_utc,
     }
 
 
@@ -229,6 +318,8 @@ async def account_usage(
             func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("failed_count"),
             func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
             func.sum(RequestLog.resource_cost).label("resource_cost_sum"),
+            func.sum(_daily_resource_cost_case()).label("daily_resource_cost_sum"),
+            func.sum(_addon_resource_cost_case()).label("addon_resource_cost_sum"),
             func.sum(case((RequestLog.resource_deducted == True, 1), else_=0)).label("deducted_request_count"),  # noqa: E712
             func.count().label("total_count"),
         )
@@ -244,11 +335,14 @@ async def account_usage(
     failed_count = int((usage_row.failed_count if usage_row and usage_row.failed_count is not None else 0) or 0)
     rate_limited_count = int((usage_row.rate_limited_count if usage_row and usage_row.rate_limited_count is not None else 0) or 0)
     resource_cost_sum = int((usage_row.resource_cost_sum if usage_row and usage_row.resource_cost_sum is not None else 0) or 0)
+    daily_resource_cost_sum = int((usage_row.daily_resource_cost_sum if usage_row and usage_row.daily_resource_cost_sum is not None else 0) or 0)
+    addon_resource_cost_sum = int((usage_row.addon_resource_cost_sum if usage_row and usage_row.addon_resource_cost_sum is not None else 0) or 0)
     deducted_request_count = int((usage_row.deducted_request_count if usage_row and usage_row.deducted_request_count is not None else 0) or 0)
     total_count = int((usage_row.total_count if usage_row and usage_row.total_count is not None else 0) or 0)
 
     limit_rule = get_effective_user_limit_rule(current_user) or ""
     daily_limit = _extract_daily_limit(limit_rule)
+    quota_snapshot = build_quota_snapshot(db, current_user)
 
     date_expr = func.date(RequestLog.timestamp)
     daily_rows = (
@@ -258,6 +352,8 @@ async def account_usage(
             func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("daily_failed_count"),
             func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("daily_rate_limited_count"),
             func.sum(RequestLog.resource_cost).label("daily_resource_cost"),
+            func.sum(_daily_resource_cost_case()).label("daily_subscription_resource_cost"),
+            func.sum(_addon_resource_cost_case()).label("daily_addon_resource_cost"),
             func.sum(case((RequestLog.resource_deducted == True, 1), else_=0)).label("daily_deducted_request_count"),  # noqa: E712
             func.count().label("daily_total_count"),
         )
@@ -280,6 +376,8 @@ async def account_usage(
 
         day_success_count = int((row.daily_success_count or 0) or 0)
         day_resource_cost = int((row.daily_resource_cost or 0) or 0)
+        day_subscription_resource_cost = int((row.daily_subscription_resource_cost or 0) or 0)
+        day_addon_resource_cost = int((row.daily_addon_resource_cost or 0) or 0)
         daily_map[day_text] = {
             "date": day_text,
             "day": day_text,
@@ -287,10 +385,12 @@ async def account_usage(
             "daily_failed_count": int((row.daily_failed_count or 0) or 0),
             "daily_rate_limited_count": int((row.daily_rate_limited_count or 0) or 0),
             "daily_resource_cost": day_resource_cost,
+            "daily_subscription_resource_cost": day_subscription_resource_cost,
+            "daily_addon_resource_cost": day_addon_resource_cost,
             "daily_deducted_request_count": int((row.daily_deducted_request_count or 0) or 0),
             "daily_total_count": int((row.daily_total_count or 0) or 0),
             "daily_limit": daily_limit,
-            "remaining_daily": None if daily_limit is None else max(0, daily_limit - day_resource_cost),
+            "remaining_daily": None if daily_limit is None else max(0, daily_limit - day_subscription_resource_cost),
         }
 
     daily_stats = []
@@ -307,6 +407,8 @@ async def account_usage(
                     "daily_failed_count": 0,
                     "daily_rate_limited_count": 0,
                     "daily_resource_cost": 0,
+                    "daily_subscription_resource_cost": 0,
+                    "daily_addon_resource_cost": 0,
                     "daily_deducted_request_count": 0,
                     "daily_total_count": 0,
                     "daily_limit": daily_limit,
@@ -317,8 +419,8 @@ async def account_usage(
         cursor += timedelta(days=1)
 
     end_date_text = query_end_date.strftime("%Y-%m-%d")
-    end_day_resource_cost = int(daily_map.get(end_date_text, {}).get("daily_resource_cost", 0) or 0)
-    remaining_daily = None if daily_limit is None else max(0, daily_limit - end_day_resource_cost)
+    end_day_subscription_resource_cost = int(daily_map.get(end_date_text, {}).get("daily_subscription_resource_cost", 0) or 0)
+    remaining_daily = None if daily_limit is None else max(0, daily_limit - end_day_subscription_resource_cost)
 
     expires_at = current_user.expiration_date
     expiration_utc = None
@@ -346,11 +448,18 @@ async def account_usage(
         "daily_resource_limit": daily_limit,
         "remaining_resource": remaining_daily,
         "resource_used": resource_cost_sum,
+        "subscription_resource_used": daily_resource_cost_sum,
+        "addon_resource_used": addon_resource_cost_sum,
         "resource_deducted_request_count": deducted_request_count,
         "daily_success_count": success_count,
         "daily_failed_count": failed_count,
         "daily_rate_limited_count": rate_limited_count,
         "daily_total_count": total_count,
+        "today_daily_resource_used": quota_snapshot.today_daily_used,
+        "today_remaining_daily": quota_snapshot.remaining_daily,
+        "addon_resource_balance": quota_snapshot.addon_resource_balance,
+        "addon_resource_total": quota_snapshot.addon_resource_total,
+        "addon_expiration_utc": quota_snapshot.addon_expiration_utc,
         "query_start_date": query_start_date.strftime("%Y-%m-%d"),
         "query_end_date": query_end_date.strftime("%Y-%m-%d"),
         "daily_stats": daily_stats,
@@ -415,13 +524,7 @@ async def translate_to_other_language(
     targetLanguage: str = Form(...),
     current_user: User = Depends(enforce_user_rate_limit),
 ):
-    _reject_auto_language("targetLanguage", targetLanguage)
-
-    # supportedLanguagesList 现在是硬编码的固定列表，不需要动态初始化
-
-    if targetLanguage not in supportedLanguagesList:
-        # 与原有server.py保持一致的错误信息格式
-        raise HTTPException(status_code=400, detail=f"targetLanguage error, please use following languages: {str(supportedLanguagesList)}")
+    targetLanguage = _validate_audio_target_language("targetLanguage", targetLanguage)
     _apply_effective_resource_cost(request, 2)
     audio_file = await file.read()
     text = await do_transcribe(audio_file, language='zh')
@@ -461,23 +564,15 @@ async def multitranslate_to_other_language(
     logger.debug(f"[MULTITRANSLATE] whisper支持的语言列表: {whisperSupportedLanguageList}")
 
     _reject_auto_language("sourceLanguage", sourceLanguage)
-    _reject_auto_language("targetLanguage", targetLanguage)
-    if targetLanguage2 != "none":
-        _reject_auto_language("targetLanguage2", targetLanguage2)
-    if targetLanguage3 != "none":
-        _reject_auto_language("targetLanguage3", targetLanguage3)
+    targetLanguage = _validate_audio_target_language("targetLanguage", targetLanguage)
+    targetLanguage2 = _validate_audio_target_language("targetLanguage2", targetLanguage2, allow_none=True)
+    targetLanguage3 = _validate_audio_target_language("targetLanguage3", targetLanguage3, allow_none=True)
 
     if sourceLanguage not in whisperSupportedLanguageList:
         logger.warning(f"[MULTITRANSLATE] sourceLanguage错误: {sourceLanguage} 不在支持的列表中")
         logger.debug(f"[MULTITRANSLATE] 支持的语言列表: {whisperSupportedLanguageList}")
         # 参数错误返回400，避免客户端误判为token过期
         raise HTTPException(status_code=400, detail="sourceLanguage error")
-    if targetLanguage not in supportedLanguagesList:
-        logger.warning(f"[MULTITRANSLATE] targetLanguage错误: {targetLanguage} 不在支持的列表中")
-        logger.debug(f"[MULTITRANSLATE] 支持的目标语言列表: {supportedLanguagesList}")
-        # 参数错误返回400，避免客户端误判为token过期
-        raise HTTPException(status_code=400, detail=f"targetLanguage error, please use following languages: {str(supportedLanguagesList)}")
-
     translation_count = 1 + int(targetLanguage2 != "none") + int(targetLanguage3 != "none")
     _apply_effective_resource_cost(request, 1 + translation_count)
 
@@ -649,14 +744,9 @@ class WebTranslateRequest(BaseModel):
 
 
 def _validate_web_translate_language(field_name: str, language: str, allow_none: bool = False) -> str:
-    normalized = (language or "").strip()
-    if allow_none and normalized == "none":
-        return normalized
-    if normalized.lower() == "auto":
-        raise HTTPException(status_code=400, detail=f"{field_name} 'auto' is no longer supported")
-    if normalized not in supportedLanguagesList:
-        raise HTTPException(status_code=400, detail=f"{field_name} error, please use following languages: {str(supportedLanguagesList)}")
-    return normalized
+    if field_name == "sourceLanguage":
+        return _validate_runtime_source_language(field_name, language, allow_none=allow_none)
+    return _validate_runtime_target_language(field_name, language, allow_none=allow_none)
 
 @router.post("/func/webtranslate")
 async def web_translate(
@@ -664,16 +754,33 @@ async def web_translate(
     data: WebTranslateRequest,
     current_user: User = Depends(enforce_user_rate_limit),
 ):
-    source_language = _validate_web_translate_language("sourceLanguage", data.sourceLanguage)
+    requested_source_language = (data.sourceLanguage or "").strip()
+    if requested_source_language.lower() == "auto":
+        source_language = "auto"
+    else:
+        source_language = _validate_web_translate_language("sourceLanguage", requested_source_language)
     target_language = _validate_web_translate_language("targetLanguage", data.targetLanguage)
     target_language2 = _validate_web_translate_language("targetLanguage2", data.targetLanguage2, allow_none=True)
     target_language3 = _validate_web_translate_language("targetLanguage3", data.targetLanguage3, allow_none=True)
 
+    effective_source_language = source_language
+    if source_language == "auto":
+        effective_source_language = detect_translation_source_language(
+            data.text,
+            allowed_languages=get_runtime_translation_source_languages(),
+        )
+        logger.info(
+            "[WEBTRANSLATE] Auto-detected source language. requested=%s, detected=%s, target=%s",
+            requested_source_language,
+            effective_source_language,
+            target_language,
+        )
+
     translation_count = 1 + int(data.targetLanguage2 != "none") + int(data.targetLanguage3 != "none")
     _apply_effective_resource_cost(request, translation_count)
-    transText = do_translate(data.text, source_language, target_language)
+    transText = do_translate(data.text, effective_source_language, target_language)
     transText2 = ''
     transText3 = ''
-    if target_language2 != "none": transText2 = do_translate(data.text, source_language, target_language2)
-    if target_language3 != "none": transText3 = do_translate(data.text, source_language, target_language3)
+    if target_language2 != "none": transText2 = do_translate(data.text, effective_source_language, target_language2)
+    if target_language3 != "none": transText3 = do_translate(data.text, effective_source_language, target_language3)
     return {'text': data.text, 'translatedText': transText, 'translatedText2': transText2, 'translatedText3': transText3}

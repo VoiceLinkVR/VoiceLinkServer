@@ -11,7 +11,6 @@ import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
 from core.config import settings
-from core.logging_config import logger
 
 
 class AfdianService:
@@ -48,6 +47,7 @@ class AfdianService:
                 if key in payload:
                     continue
                 payload[key] = value
+
         token = self._fernet.encrypt(self._to_compact_json(payload).encode("utf-8"))
         return token.decode("utf-8")
 
@@ -82,8 +82,10 @@ class AfdianService:
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
 
         query["user_id"] = settings.AFDIAN_USER_ID
-        query["remark"] = custom_id
-        query["custom_id"] = custom_id
+        # Prefer the dedicated custom_order_id field. Webhook activation will
+        # query the order API again and read this field back from Afdian.
+        query["custom_order_id"] = custom_id
+
         price = settings.AFDIAN_CUSTOM_PRICE if custom_price is None else custom_price
         query["custom_price"] = f"{max(0.01, float(price)):.2f}"
 
@@ -91,16 +93,16 @@ class AfdianService:
         return urlunparse(parsed._replace(query=encoded_query))
 
     def _build_query_sign(self, params_json: str, ts: int) -> str:
-        base = f"{settings.AFDIAN_TOKEN}{params_json}{ts}{settings.AFDIAN_USER_ID}"
+        kv_string = f"params{params_json}ts{ts}user_id{settings.AFDIAN_USER_ID}"
+        base = f"{settings.AFDIAN_TOKEN}{kv_string}"
         return hashlib.md5(base.encode("utf-8")).hexdigest()
 
     async def query_order(self, out_trade_no: Optional[str] = None, page: int = 1) -> Dict[str, Any]:
         if not settings.AFDIAN_TOKEN:
             raise ValueError("AFDIAN_TOKEN is empty")
 
-        params: Dict[str, Any]
         if out_trade_no:
-            params = {"out_trade_no": out_trade_no}
+            params: Dict[str, Any] = {"out_trade_no": out_trade_no}
         else:
             params = {"page": max(1, page)}
 
@@ -138,13 +140,24 @@ class AfdianService:
         return []
 
     @staticmethod
+    def extract_webhook_order(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+
+        order = data.get("order")
+        if isinstance(order, dict):
+            return order
+
+        orders = data.get("orders")
+        if isinstance(orders, list):
+            return next((item for item in orders if isinstance(item, dict)), None)
+
+        return None
+
+    @staticmethod
     def get_order_no(order: Dict[str, Any]) -> str:
-        return str(
-            order.get("order_no")
-            or order.get("trade_no")
-            or order.get("id")
-            or ""
-        ).strip()
+        return str(order.get("order_no") or order.get("trade_no") or order.get("id") or "").strip()
 
     @staticmethod
     def get_out_trade_no(order: Dict[str, Any]) -> str:
@@ -153,6 +166,21 @@ class AfdianService:
     @staticmethod
     def get_custom_id(order: Dict[str, Any]) -> str:
         return str(order.get("custom_order_id") or order.get("custom_id") or order.get("remark") or "").strip()
+
+    @staticmethod
+    def get_explicit_custom_id(order: Dict[str, Any]) -> str:
+        return str(order.get("custom_order_id") or order.get("custom_id") or "").strip()
+
+    @staticmethod
+    def get_order_status(order: Dict[str, Any]) -> Optional[int]:
+        raw_status = order.get("status")
+        try:
+            return int(raw_status)
+        except (TypeError, ValueError):
+            return None
+
+    def is_paid_order(self, order: Dict[str, Any]) -> bool:
+        return self.get_order_status(order) == 2
 
     async def find_order(
         self,
@@ -164,6 +192,7 @@ class AfdianService:
             orders = self.extract_orders(payload)
             if not orders:
                 return None, payload
+
             matched = next(
                 (item for item in orders if self.get_out_trade_no(item) == out_trade_no),
                 orders[0],

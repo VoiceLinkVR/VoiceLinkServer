@@ -362,7 +362,7 @@ The table above is a quick summary. The following section is the complete refere
 |----------|-------------|---------|
 | `AFDIAN_USER_ID` | Afdian user ID | `db43f694299511ef821252540025c377` |
 | `AFDIAN_TOKEN` | Afdian API token | empty |
-| `AFDIAN_ORDER_CREATE_BASE_URL` | Afdian order creation page | `https://afdian.com/order/create` |
+| `AFDIAN_ORDER_CREATE_BASE_URL` | Afdian payment page base URL | `https://ifdian.net/p/9c65d9cc617011ed81c352540025c377` |
 | `AFDIAN_QUERY_ORDER_URL` | Afdian order query API | `https://afdian.com/api/open/query-order` |
 | `AFDIAN_CUSTOM_ID_KEY` | Secret used to sign/encrypt custom IDs | `change-me-to-32-byte-secret` |
 | `AFDIAN_CUSTOM_PRICE` | Base custom price | `5.0` |
@@ -374,6 +374,52 @@ The table above is a quick summary. The following section is the complete refere
 | `AFDIAN_BOOST_LIMIT_RULE` | Optional explicit quota rule for boost users | empty |
 | `AFDIAN_QUERY_SCAN_PAGES` | Number of order pages to scan per sync | `3` |
 | `AFDIAN_CUSTOM_ID_TTL_SECONDS` | Custom ID validity period in seconds | `604800` |
+| `AFDIAN_WEBHOOK_FORWARD_ENABLED` | Whether to transparently forward Afdian webhooks to the bot plugin | `False` |
+| `AFDIAN_WEBHOOK_FORWARD_URL` | Bot plugin webhook URL | empty |
+| `AFDIAN_WEBHOOK_FORWARD_TIMEOUT` | Forward timeout in seconds | `10.0` |
+| `AFDIAN_WEBHOOK_FORWARD_AUTHORIZATION` | Authorization header sent during forwarding | empty |
+
+#### Afdian webhook and Nginx reverse proxy
+
+The recommended flow is now:
+
+1. Afdian only calls the server webhook at `/api/user-center/afdian/webhook`
+2. The server immediately returns `{"ec":200,"em":""}` to acknowledge receipt
+3. The server then processes activation in the background and transparently forwards the original webhook JSON to the bot plugin
+
+Example configuration:
+
+```env
+AFDIAN_WEBHOOK_FORWARD_ENABLED=True
+AFDIAN_WEBHOOK_FORWARD_URL=http://127.0.0.1:6500/
+AFDIAN_WEBHOOK_FORWARD_TIMEOUT=10
+AFDIAN_WEBHOOK_FORWARD_AUTHORIZATION=
+```
+
+Example Nginx config:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name your-domain.example;
+
+    # Only expose the server webhook endpoint to Afdian
+    location = /api/user-center/afdian/webhook {
+        proxy_pass http://127.0.0.1:8980/api/user-center/afdian/webhook;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Set the endpoints like this:
+
+- Afdian webhook URL: `https://your-domain.example/api/user-center/afdian/webhook`
+- Server forwarding target `AFDIAN_WEBHOOK_FORWARD_URL`: the bot plugin's real reachable address, for example `http://127.0.0.1:6500/` or `http://192.168.1.10:6500/`
+
+If the bot plugin runs on the same machine or on a private network, it does not need its own public Nginx entry.
 
 #### Uvicorn startup variables
 
@@ -507,3 +553,38 @@ The repository still contains older Flask/Werkzeug files (`src/server.py`, `src/
 | `SQLALCHEMY_POOL_SIZE` | legacy/compose | Historical name, current FastAPI setting is `SQL_POOL_SIZE` |
 | `SQLALCHEMY_MAX_OVERFLOW` | legacy | Historical name, current FastAPI setting is `SQL_MAX_OVERFLOW` |
 | `THREADS_NUM` | legacy | Used by old Waitress startup script |
+
+### Afdian webhook reverse proxy correction
+
+If you only need one public webhook entry for Afdian, Nginx should reverse proxy directly to the server webhook endpoint, not to the bot plugin.
+
+Recommended settings:
+
+```env
+AFDIAN_WEBHOOK_FORWARD_ENABLED=True
+AFDIAN_WEBHOOK_FORWARD_URL=http://127.0.0.1:6500/
+AFDIAN_WEBHOOK_FORWARD_TIMEOUT=10
+AFDIAN_WEBHOOK_FORWARD_AUTHORIZATION=
+```
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name your-domain.example;
+
+    location = /api/user-center/afdian/webhook {
+        proxy_pass http://127.0.0.1:8980/api/user-center/afdian/webhook;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Use these values:
+
+- Afdian webhook URL: `https://your-domain.example/api/user-center/afdian/webhook`
+- `AFDIAN_WEBHOOK_FORWARD_URL`: the bot plugin's real reachable address, for example `http://127.0.0.1:6500/` or a private LAN address
+
+If the bot plugin runs on the same host or inside a private network, it does not need its own public Nginx endpoint.

@@ -2,31 +2,40 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
 from fastapi import Depends, Request
 from limits import parse
 from limits.storage import storage_from_string
 from limits.strategies import MovingWindowRateLimiter
+from sqlalchemy.orm import Session
 
 from core.config import settings
-from core.dependencies import get_current_user, get_effective_user_limit_rule
+from core.dependencies import get_current_user, get_db, get_effective_user_limit_rule
 from core.logging_config import logger
+from core.quota_service import prepare_quota_allocation
 from db.models import User
 
 DEFAULT_GLOBAL_LIMIT = "3000/hour"
 FALLBACK_USER_LIMIT = "800/day;8/minute"
 SHARED_LIMIT_SCOPE = "shared_limit_scope"
+USER_CENTER_LIMIT = "8/minute"
+USER_CENTER_SCOPE = "user_center"
+
+
+def _utc_day_bucket() -> str:
+    """Daily rate-limit buckets are aligned to UTC calendar days."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 class RateLimitExceeded(Exception):
-    """统一的限速异常，保持与旧版 server.py 一致的返回结构"""
+    """Unified rate-limit exception payload used by the FastAPI app."""
 
     def __init__(self, limit: str, scope: Optional[str], key: str, triggered_limit: str):
         super().__init__("Too many request")
-        self.limit = limit              # 原始规则字符串，例如 "10/day;1/minute"
-        self.triggered_limit = triggered_limit  # 真正超限的那一条，例如 "1 per 1 minute"
+        self.limit = limit
+        self.triggered_limit = triggered_limit
         self.scope = scope or ""
         self.key = key
 
@@ -37,12 +46,21 @@ def parse_limit_string(limit_string: str) -> List:
         try:
             limits.append(parse(raw))
         except Exception as exc:  # pylint: disable=broad-except
-            logger.error(f"[RATE-LIMITER] 无法解析限速规则 '{raw}'，跳过。错误: {exc}")
+            logger.error("[RATE-LIMITER] Failed to parse limit rule '%s': %s", raw, exc)
     return limits
 
 
+def _strip_day_limits(limit_string: str) -> str:
+    kept_parts: List[str] = []
+    for part in [segment.strip() for segment in limit_string.split(";") if segment.strip()]:
+        if "/day" in part.lower():
+            continue
+        kept_parts.append(part)
+    return ";".join(kept_parts)
+
+
 def get_client_ip(request: Request) -> str:
-    """与旧版 limit_key_func 行为保持一致的 IP 解析顺序"""
+    """Resolve the client IP using the same priority as the legacy server."""
     x_real_ip = request.headers.get("x-real-ip")
     x_forwarded_for = request.headers.get("x-forwarded-for")
     if x_real_ip:
@@ -94,13 +112,18 @@ class RateLimitContext:
             try:
                 self.limiter.strategy.hit(item, self.composite_key, cost=self.normalized_cost)
             except Exception as exc:  # pylint: disable=broad-except
-                logger.error(f"[RATE-LIMITER] 提交限速计数失败 (key={self.composite_key}, limit={item}): {exc}")
+                logger.error(
+                    "[RATE-LIMITER] Failed to commit rate-limit hit (key=%s, limit=%s): %s",
+                    self.composite_key,
+                    item,
+                    exc,
+                )
 
     def should_deduct(self, status_code: int) -> bool:
         try:
             return bool(self.deduct_when(status_code))
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f"[RATE-LIMITER] deduct_when 回调异常，默认扣减。错误: {exc}")
+            logger.warning("[RATE-LIMITER] deduct_when callback failed, defaulting to deduct: %s", exc)
             return True
 
     def set_cost(self, cost: int) -> None:
@@ -115,16 +138,16 @@ class RateLimiter:
         self.strategy = MovingWindowRateLimiter(self.storage)
 
         if self.enabled:
-            logger.info(f"[RATE-LIMITER] 已启用，存储: {self.storage_uri}")
+            logger.info("[RATE-LIMITER] Enabled with storage: %s", self.storage_uri)
         else:
-            logger.info("[RATE-LIMITER] 已禁用（LIMIT_ENABLE=False）")
+            logger.info("[RATE-LIMITER] Disabled (LIMIT_ENABLE=False)")
 
     @staticmethod
     def _init_storage(uri: str):
         try:
             return storage_from_string(uri)
         except Exception as exc:  # pylint: disable=broad-except
-            logger.error(f"[RATE-LIMITER] 初始化存储 '{uri}' 失败，回退至内存存储。错误: {exc}")
+            logger.error("[RATE-LIMITER] Failed to initialize storage '%s', falling back to memory: %s", uri, exc)
             return storage_from_string("memory://")
 
     def create_context(
@@ -140,7 +163,7 @@ class RateLimiter:
             return None
         limit_items = parse_limit_string(limit_string)
         if not limit_items:
-            logger.warning(f"[RATE-LIMITER] '{limit_string}' 未解析出有效规则，跳过限速。")
+            logger.warning("[RATE-LIMITER] No valid limit rules were parsed from '%s'", limit_string)
             return None
         return RateLimitContext(
             limiter=self,
@@ -170,10 +193,14 @@ rate_limiter = RateLimiter(settings.LIMITER_REDIS_URL)
 async def enforce_user_rate_limit(
     request: Request,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> User:
-    """
-    FastAPI 端每次调用时执行与旧版 dynamic_limit 相同的逻辑。
-    """
+    """Apply per-user rate limiting using the current FastAPI request context."""
+
+    request.state.quota_user = current_user
+    request.state.quota_db = db
+    request.state.quota_username = current_user.username
+    request.state.pending_quota_allocation = None
 
     if not rate_limiter.enabled:
         return current_user
@@ -188,13 +215,15 @@ async def enforce_user_rate_limit(
     if is_public_test_user:
         context = rate_limiter.create_context(
             limit_string=limit_rule,
-            key=f"{get_client_ip(request)}:{datetime.now().strftime('%Y-%m-%d')}",
+            key=f"{get_client_ip(request)}:{_utc_day_bucket()}",
             scope=SHARED_LIMIT_SCOPE,
             context_type="user",
             deduct_when=lambda status: True,
         )
     else:
-        daily_key = f"{current_user.username}:{datetime.now().strftime('%Y-%m-%d')}"
+        if not settings.LEGACY_CLIENT_COMPAT:
+            limit_rule = _strip_day_limits(limit_rule)
+        daily_key = f"{current_user.username}:{_utc_day_bucket()}"
         context = rate_limiter.create_context(
             limit_string=limit_rule,
             key=daily_key,
@@ -215,15 +244,45 @@ async def enforce_user_rate_limit(
 
 
 def set_user_context_cost(request: Request, cost: int) -> None:
-    """
-    调整当前请求的用户限速扣减权重，并立即按新权重复检。
-    """
+    """Update request-scoped quota cost and re-check the user rate-limit context."""
+    desired_cost = max(1, int(cost or 1))
+    if rate_limiter.enabled:
+        for context in getattr(request.state, "rate_limit_contexts", []):
+            if getattr(context, "context_type", "") != "user":
+                continue
+            context.set_cost(desired_cost)
+            context.check()
+
+    if settings.LEGACY_CLIENT_COMPAT:
+        return
+
+    db = getattr(request.state, "quota_db", None)
+    current_user = getattr(request.state, "quota_user", None)
+    if db is None or current_user is None:
+        return
+
+    request.state.pending_quota_allocation = prepare_quota_allocation(db, current_user, desired_cost)
+
+
+async def enforce_user_center_rate_limit(request: Request) -> None:
+    """Apply a dedicated per-IP limit for user-center endpoints."""
+
     if not rate_limiter.enabled:
         return
 
-    desired_cost = max(1, int(cost or 1))
-    for context in getattr(request.state, "rate_limit_contexts", []):
-        if getattr(context, "context_type", "") != "user":
-            continue
-        context.set_cost(desired_cost)
+    key = get_client_ip(request)
+    context = rate_limiter.create_context(
+        limit_string=USER_CENTER_LIMIT,
+        key=key,
+        scope=USER_CENTER_SCOPE,
+        context_type="user_center",
+        deduct_when=lambda status: True,
+    )
+
+    if context:
         context.check()
+        pending = getattr(request.state, "rate_limit_contexts", None)
+        if pending is None:
+            pending = []
+            request.state.rate_limit_contexts = pending
+        pending.append(context)

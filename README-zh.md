@@ -362,7 +362,7 @@ data={"targetLanguage":""}
 |------|------|--------|
 | `AFDIAN_USER_ID` | 爱发电用户 ID | `db43f694299511ef821252540025c377` |
 | `AFDIAN_TOKEN` | 爱发电 API Token | 空 |
-| `AFDIAN_ORDER_CREATE_BASE_URL` | 爱发电下单页地址 | `https://afdian.com/order/create` |
+| `AFDIAN_ORDER_CREATE_BASE_URL` | 爱发电付款页基础地址 | `https://ifdian.net/p/9c65d9cc617011ed81c352540025c377` |
 | `AFDIAN_QUERY_ORDER_URL` | 爱发电订单查询接口 | `https://afdian.com/api/open/query-order` |
 | `AFDIAN_CUSTOM_ID_KEY` | 自定义订单 ID 加密/签名密钥 | `change-me-to-32-byte-secret` |
 | `AFDIAN_CUSTOM_PRICE` | 自定义套餐基础价格 | `5.0` |
@@ -374,6 +374,52 @@ data={"targetLanguage":""}
 | `AFDIAN_BOOST_LIMIT_RULE` | Boost 用户显式额度规则，留空表示自动推导 | 空 |
 | `AFDIAN_QUERY_SCAN_PAGES` | 每次同步扫描的订单页数 | `3` |
 | `AFDIAN_CUSTOM_ID_TTL_SECONDS` | 自定义订单 ID 有效期，单位秒 | `604800` |
+| `AFDIAN_WEBHOOK_FORWARD_ENABLED` | 是否将爱发电 Webhook 透明转发给机器人插件 | `False` |
+| `AFDIAN_WEBHOOK_FORWARD_URL` | 机器人插件 Webhook 地址 | 空 |
+| `AFDIAN_WEBHOOK_FORWARD_TIMEOUT` | 转发超时时间，单位秒 | `10.0` |
+| `AFDIAN_WEBHOOK_FORWARD_AUTHORIZATION` | 转发时附带的 Authorization 请求头 | 空 |
+
+#### 爱发电 Webhook 与 Nginx 反代
+
+现在推荐的链路是：
+
+1. 爱发电 Webhook 只回调到服务端 `/api/user-center/afdian/webhook`
+2. 服务端收到后会立即返回 `{"ec":200,"em":""}` 给爱发电
+3. 随后服务端在后台异步执行本地激活，并把原始 Webhook JSON 透明转发给机器人插件
+
+对应配置示例：
+
+```env
+AFDIAN_WEBHOOK_FORWARD_ENABLED=True
+AFDIAN_WEBHOOK_FORWARD_URL=http://127.0.0.1:6500/
+AFDIAN_WEBHOOK_FORWARD_TIMEOUT=10
+AFDIAN_WEBHOOK_FORWARD_AUTHORIZATION=
+```
+
+Nginx 反代示例：
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name your-domain.example;
+
+    # VoiceLink 服务端
+    location = /api/user-center/afdian/webhook {
+        proxy_pass http://127.0.0.1:8980/api/user-center/afdian/webhook;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+部署时请对应设置：
+
+- 爱发电后台 Webhook URL：`https://your-domain.example/api/user-center/afdian/webhook`
+- 服务端转发目标 `AFDIAN_WEBHOOK_FORWARD_URL`：机器人插件的实际可达地址，例如 `http://127.0.0.1:6500/` 或内网地址
+
+如果机器人插件和服务端在同一台机器上，不需要再给机器人插件额外配置公网 Nginx 入口。
 
 #### Uvicorn 启动参数
 

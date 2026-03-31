@@ -5,745 +5,284 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>用户管理 - VoiceLink Server</title>
     <style>
-        :root {
-            --bg: #f6f8fc;
-            --card: #ffffff;
-            --line: #dde5f2;
-            --text: #182235;
-            --muted: #66758f;
-            --primary: #2563eb;
-            --primary-hover: #1d4ed8;
-            --danger: #dc2626;
-            --danger-hover: #b91c1c;
-            --tag-bg: #eff4ff;
-            --tag-text: #2d4eb2;
-            --ok-bg: #ecfdf3;
-            --ok-text: #166534;
-            --bad-bg: #fff1f2;
-            --bad-text: #b42318;
-        }
-        * { box-sizing: border-box; }
-        body {
-            margin: 0;
-            font-family: "Manrope", "Noto Sans SC", "Segoe UI", sans-serif;
-            color: var(--text);
-            background: var(--bg);
-        }
-        .topbar {
-            position: sticky;
-            top: 0;
-            z-index: 20;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 12px 20px;
-            background: rgba(255, 255, 255, 0.92);
-            backdrop-filter: blur(7px);
-            border-bottom: 1px solid var(--line);
-        }
-        .brand {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-weight: 800;
-        }
-        .brand-logo {
-            width: 32px;
-            height: 32px;
-            border-radius: 9px;
-            display: grid;
-            place-items: center;
-            color: #fff;
-            font-size: 13px;
-            background: linear-gradient(135deg, #2563eb, #1e3a8a);
-        }
-        .nav {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-        }
-        .nav a {
-            text-decoration: none;
-            color: #10203d;
-            border: 1px solid var(--line);
-            background: #fff;
-            border-radius: 9px;
-            padding: 7px 11px;
-            font-size: 13px;
-            font-weight: 700;
-        }
-        .nav a:hover { background: #eff6ff; border-color: #c9d8f9; }
-        .layout {
-            width: 100%;
-            max-width: none;
-            margin: 0;
-            padding: 18px;
-            display: grid;
-            grid-template-columns: 390px 1fr;
-            gap: 14px;
-            align-items: start;
-        }
-        .form-panel {
-            position: sticky;
-            top: 72px;
-            max-height: calc(100vh - 88px);
-            overflow: auto;
-        }
-        .list-panel {
-            min-width: 0;
-        }
-        @media (max-width: 1080px) {
-            .layout { grid-template-columns: 1fr; }
-            .form-panel {
-                position: static;
-                max-height: none;
-                overflow: visible;
-            }
-        }
-        .card {
-            background: var(--card);
-            border: 1px solid var(--line);
-            border-radius: 14px;
-            box-shadow: 0 4px 14px rgba(17, 24, 39, 0.05);
-        }
-        .card-head {
-            border-bottom: 1px solid #edf2fb;
-            padding: 14px 16px;
-        }
-        .card-head h2 {
-            margin: 0;
-            font-size: 17px;
-        }
-        .card-head p {
-            margin: 6px 0 0;
-            color: var(--muted);
-            font-size: 12px;
-        }
-        .card-body { padding: 14px 16px 16px; }
-        .form-grid {
-            display: grid;
-            gap: 11px;
-        }
-        .field { display: grid; gap: 6px; }
-        .field label {
-            font-size: 12px;
-            color: #334155;
-            font-weight: 700;
-        }
-        input[type="text"],
-        input[type="password"],
-        input[type="date"] {
-            width: 100%;
-            height: 38px;
-            border: 1px solid var(--line);
-            border-radius: 9px;
-            padding: 0 10px;
-            font-size: 13px;
-            color: var(--text);
-            background: #fff;
-            outline: none;
-        }
-        textarea {
-            width: 100%;
-            min-height: 88px;
-            border: 1px solid var(--line);
-            border-radius: 9px;
-            padding: 10px;
-            font-size: 12px;
-            color: var(--text);
-            background: #fff;
-            outline: none;
-            resize: vertical;
-            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-        }
-        textarea:focus {
-            border-color: #93c5fd;
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
-        }
-        input:focus {
-            border-color: #93c5fd;
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
-        }
-        .check-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 9px;
-        }
-        .check-item {
-            border: 1px solid var(--line);
-            border-radius: 9px;
-            padding: 8px 10px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            font-size: 13px;
-            color: #334155;
-            background: #fbfdff;
-        }
-        .check-item input[type="checkbox"] {
-            width: 15px;
-            height: 15px;
-        }
-        .btn-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 9px;
-            margin-top: 2px;
-        }
-        button {
-            height: 39px;
-            border: 0;
-            border-radius: 9px;
-            font-size: 13px;
-            font-weight: 700;
-            cursor: pointer;
-        }
-        .btn-primary {
-            background: linear-gradient(135deg, var(--primary), #1d4ed8);
-            color: #fff;
-        }
-        .btn-primary:hover { background: linear-gradient(135deg, var(--primary-hover), #1e40af); }
-        .btn-ghost {
-            border: 1px solid var(--line);
-            background: #fff;
-            color: #334155;
-        }
-        .btn-ghost:hover { background: #f8fbff; }
-        .flash-list {
-            margin: 0;
-            padding: 0;
-            list-style: none;
-            display: grid;
-            gap: 8px;
-            margin-bottom: 12px;
-        }
-        .flash-list li {
-            border: 1px solid #c9ddff;
-            background: #eef5ff;
-            color: #194592;
-            border-radius: 9px;
-            padding: 8px 10px;
-            font-size: 13px;
-        }
-        .filters {
-            display: grid;
-            grid-template-columns: 1fr 130px 130px;
-            gap: 10px;
-            margin-bottom: 12px;
-        }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(4, minmax(140px, 1fr));
-            gap: 10px;
-            margin-bottom: 12px;
-        }
-        .stats-item {
-            border: 1px solid #edf2fb;
-            border-radius: 10px;
-            padding: 10px;
-            background: #fcfdff;
-        }
-        .stats-item .label {
-            font-size: 12px;
-            color: var(--muted);
-            font-weight: 700;
-            margin-bottom: 6px;
-        }
-        .stats-item .value {
-            font-size: 24px;
-            line-height: 1.1;
-            font-weight: 800;
-        }
-        @media (max-width: 760px) {
-            .filters { grid-template-columns: 1fr; }
-            .stats-grid { grid-template-columns: 1fr 1fr; }
-        }
-        select {
-            width: 100%;
-            height: 38px;
-            border: 1px solid var(--line);
-            border-radius: 9px;
-            padding: 0 10px;
-            font-size: 13px;
-            color: var(--text);
-            background: #fff;
-            outline: none;
-        }
-        .table-wrap {
-            border: 1px solid #edf2fb;
-            border-radius: 12px;
-            overflow: auto;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 13px;
-        }
-        th, td {
-            padding: 9px 10px;
-            border-bottom: 1px solid #f1f5fb;
-            text-align: left;
-            white-space: nowrap;
-        }
-        th {
-            font-size: 12px;
-            color: var(--muted);
-            background: #f9fbff;
-            font-weight: 700;
-        }
-        .role-tag {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 999px;
-            background: var(--tag-bg);
-            color: var(--tag-text);
-            font-size: 12px;
-            font-weight: 700;
-        }
-        .status-tag {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 999px;
-            font-size: 12px;
-            font-weight: 700;
-        }
-        .status-active { background: var(--ok-bg); color: var(--ok-text); }
-        .status-inactive { background: var(--bad-bg); color: var(--bad-text); }
-        .actions {
-            display: flex;
-            gap: 7px;
-        }
-        .divider {
-            border: 0;
-            border-top: 1px solid #edf2fb;
-            margin: 14px 0;
-        }
-        .tool-head {
-            display: grid;
-            gap: 4px;
-            margin-bottom: 10px;
-        }
-        .tool-title {
-            font-size: 14px;
-            font-weight: 800;
-            margin: 0;
-        }
-        .tool-desc {
-            margin: 0;
-            font-size: 12px;
-            color: var(--muted);
-        }
-        .tool-result {
-            border: 1px solid #edf2fb;
-            background: #fcfdff;
-            border-radius: 12px;
-            padding: 10px;
-            display: grid;
-            gap: 8px;
-        }
-        .tool-result pre {
-            margin: 0;
-            white-space: pre-wrap;
-            word-break: break-word;
-            font-size: 12px;
-            line-height: 1.4;
-            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-        }
-        .tool-kv {
-            display: grid;
-            grid-template-columns: 140px 1fr;
-            gap: 6px 10px;
-            font-size: 12px;
-            line-height: 1.4;
-        }
-        .tool-kv .k {
-            color: var(--muted);
-            font-weight: 700;
-        }
-        .tool-kv .v {
-            word-break: break-all;
-        }
-        .btn-mini {
-            height: 30px;
-            border-radius: 8px;
-            padding: 0 10px;
-            font-size: 12px;
-        }
-        .btn-edit {
-            border: 1px solid #bfdbfe;
-            background: #eff6ff;
-            color: #1e40af;
-        }
-        .btn-delete {
-            background: var(--danger);
-            color: #fff;
-        }
-        .btn-delete:hover { background: var(--danger-hover); }
-        .meta-row {
-            margin-top: 12px;
-            display: flex;
-            justify-content: space-between;
-            gap: 8px;
-            flex-wrap: wrap;
-            color: var(--muted);
-            font-size: 12px;
-        }
-        .empty {
-            text-align: center;
-            color: var(--muted);
-            padding: 15px 8px;
-        }
+        :root{--bg:#f6f8fc;--card:#fff;--line:#dde5f2;--text:#182235;--muted:#66758f;--blue:#2563eb;--blue2:#1d4ed8;--danger:#dc2626;--okbg:#ecfdf3;--ok:#166534;--badbg:#fff1f2;--bad:#b42318;--pendbg:#fff7ed;--pend:#c2410c}
+        *{box-sizing:border-box} body{margin:0;font-family:"Manrope","Noto Sans SC","Segoe UI",sans-serif;color:var(--text);background:var(--bg)}
+        .topbar{position:sticky;top:0;z-index:20;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 20px;background:rgba(255,255,255,.92);backdrop-filter:blur(7px);border-bottom:1px solid var(--line)}
+        .brand{display:flex;align-items:center;gap:10px;font-weight:800}.brand-logo{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;color:#fff;font-size:13px;background:linear-gradient(135deg,#2563eb,#1e3a8a)}
+        .nav{display:flex;gap:10px;flex-wrap:wrap}.nav a,button,input,select{font:inherit}.nav a,.btn-ghost,.btn-edit,.btn-detail{text-decoration:none;color:#10203d;border:1px solid var(--line);background:#fff;border-radius:9px;padding:7px 11px;font-size:13px;font-weight:700}
+        .nav a:hover,.btn-ghost:hover,.btn-edit:hover,.btn-detail:hover{background:#eff6ff;border-color:#c9d8f9}
+        .layout{padding:18px;display:grid;grid-template-columns:390px 1fr;gap:14px;align-items:start}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 4px 14px rgba(17,24,39,.05)}
+        .form-panel{position:sticky;top:72px;max-height:calc(100vh - 88px);overflow:auto}.card-head{border-bottom:1px solid #edf2fb;padding:14px 16px}.card-head h2,.card-head h3,.section-title{margin:0}.card-head p,.section-sub{margin:6px 0 0;color:var(--muted);font-size:12px}.card-body{padding:14px 16px 16px}
+        .form-grid,.afdian-summary,.drawer-body,.drawer-section,.order-list,.json-block{display:grid;gap:10px}.field{display:grid;gap:6px}.field label,.mini-label{font-size:12px;color:#334155;font-weight:700}
+        input[type="text"],input[type="password"],input[type="date"],select{width:100%;height:38px;border:1px solid var(--line);border-radius:9px;padding:0 10px;background:#fff;outline:none}
+        input:focus,select:focus{border-color:#93c5fd;box-shadow:0 0 0 3px rgba(59,130,246,.15)} .check-row{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+        .check-item{border:1px solid var(--line);border-radius:9px;padding:8px 10px;display:flex;align-items:center;justify-content:space-between;background:#fbfdff;font-size:13px}
+        .btn-row,.actions,.drawer-head{display:flex;gap:9px;flex-wrap:wrap} button{height:39px;border:0;border-radius:9px;font-weight:700;cursor:pointer}.btn-primary{background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff}.btn-mini{height:30px;padding:0 10px;font-size:12px;border-radius:8px}.btn-delete{background:var(--danger);color:#fff}
+        .flash-list{margin:0 0 12px;padding:0;list-style:none;display:grid;gap:8px}.flash-list li{border:1px solid #c9ddff;background:#eef5ff;color:#194592;border-radius:9px;padding:8px 10px;font-size:13px}
+        .stats-item,.kv-card{border:1px solid #edf2fb;background:#fcfdff;border-radius:12px;padding:10px}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.kv-card{display:grid;gap:6px}.kv-card .mini-label{color:var(--muted)}.kv-card>div:last-child{white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+        .stats-grid{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-bottom:12px}.stats-item .mini-label{margin-bottom:6px}.stats-item .value{font-size:24px;line-height:1.1;font-weight:800}
+        .filters{display:grid;grid-template-columns:1fr 130px 130px;gap:10px;margin-bottom:12px}.table-wrap{border:1px solid #edf2fb;border-radius:12px;overflow:auto}
+        table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:9px 10px;border-bottom:1px solid #f1f5fb;text-align:left;white-space:nowrap;vertical-align:top} th{font-size:12px;color:var(--muted);background:#f9fbff;font-weight:700}
+        .tag{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.role-tag{background:#eff4ff;color:#2d4eb2}.status-active{background:var(--okbg);color:var(--ok)}.status-inactive{background:var(--badbg);color:var(--bad)}.status-pending{background:var(--pendbg);color:var(--pend)}
+        .meta-row,.order-head{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.meta-row,.muted{color:var(--muted);font-size:12px}.empty{text-align:center;color:var(--muted);padding:15px 8px}
+        .order-detail{border:1px solid #edf2fb;background:#fcfdff;border-radius:12px;overflow:hidden}.order-summary{list-style:none;cursor:pointer;padding:12px}.order-summary::-webkit-details-marker{display:none}.order-content{padding:0 12px 12px;display:grid;gap:12px}.order-head>div{min-width:0}.order-head strong,.order-head .muted{white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+        .drawer{position:fixed;inset:0;z-index:60;display:none}.drawer.open{display:block}.drawer-mask{position:absolute;inset:0;background:rgba(15,23,42,.42)}.drawer-panel{position:absolute;top:0;right:0;width:min(960px,100vw);height:100%;display:grid;grid-template-rows:auto 1fr;background:#fff;box-shadow:-16px 0 40px rgba(15,23,42,.18)}.drawer-head{padding:16px 18px;align-items:flex-start;justify-content:space-between;border-bottom:1px solid #edf2fb}.drawer-body{overflow:auto;padding:18px;background:#f8fbff}.drawer-section{border:1px solid #e6edf8;border-radius:14px;background:#fff;padding:14px}
+        .json-pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;padding:12px;border-radius:12px;background:#0f172a;color:#e2e8f0;max-height:260px;margin:0;font-size:12px;line-height:1.5;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;overflow:auto}
+        @media (max-width:1080px){.layout{grid-template-columns:1fr}.form-panel{position:static;max-height:none;overflow:visible}} @media (max-width:880px){.detail-grid{grid-template-columns:1fr}} @media (max-width:760px){.filters{grid-template-columns:1fr}.stats-grid{grid-template-columns:1fr 1fr}.check-row{grid-template-columns:1fr}}
     </style>
 </head>
 <body>
     <header class="topbar">
-        <div class="brand">
-            <div class="brand-logo">VL</div>
-            <span>后台管理</span>
-        </div>
+        <div class="brand"><div class="brand-logo">VL</div><span>后台管理</span></div>
         <nav class="nav">
             <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
+            <a href="{{ request.url_for('afdian_management_ui') }}">Afdian 管理</a>
             <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
             <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
         </nav>
     </header>
-
     <main class="layout">
         <section class="card form-panel">
-            <div class="card-head">
-                <h2>新增 / 更新用户</h2>
-                <p>点右侧“编辑”可快速回填表单，默认是新增模式。</p>
-            </div>
+            <div class="card-head"><h2>新增 / 更新用户</h2><p>点击右侧“编辑”可回填表单，默认是新增模式。</p></div>
             <div class="card-body">
-                {% if messages %}
-                <ul class="flash-list">
-                    {% for message in messages %}
-                    <li>{{ message }}</li>
-                    {% endfor %}
-                </ul>
-                {% endif %}
-
+                {% if messages %}<ul class="flash-list">{% for message in messages %}<li>{{ message }}</li>{% endfor %}</ul>{% endif %}
                 <form method="POST" id="userForm">
                     <div class="form-grid">
-                        <div class="field">
-                            <label for="new_username">用户名</label>
-                            <input type="text" id="new_username" name="new_username" required>
-                        </div>
-                        <div class="field">
-                            <label for="new_password">密码</label>
-                            <input type="password" id="new_password" name="new_password" placeholder="新增必填，更新可留空">
-                        </div>
-                        <div class="field">
-                            <label for="new_limit_rule">限流规则</label>
-                            <input type="text" id="new_limit_rule" name="new_limit_rule" placeholder="例如: 10000/day;1000/hour">
-                        </div>
-                        <div class="field">
-                            <label for="expiration_date">到期日期</label>
-                            <input type="date" id="expiration_date" name="expiration_date">
-                        </div>
-
+                        <div class="field"><label for="new_username">用户名</label><input type="text" id="new_username" name="new_username" required></div>
+                        <div class="field"><label for="new_password">密码</label><input type="password" id="new_password" name="new_password" placeholder="新增必填，更新可留空"></div>
+                        <div class="field"><label for="new_limit_rule">限流规则</label><input type="text" id="new_limit_rule" name="new_limit_rule" placeholder="例如: 10000/day;1000/hour"></div>
+                        <div class="field"><label for="expiration_date">到期日期</label><input type="date" id="expiration_date" name="expiration_date"></div>
                         <div class="check-row">
-                            <label class="check-item" for="new_is_admin">
-                                <span>管理员权限</span>
-                                <input type="checkbox" id="new_is_admin" name="new_is_admin">
-                            </label>
-                            <label class="check-item" for="is_active">
-                                <span>账号启用</span>
-                                <input type="checkbox" id="is_active" name="is_active" checked>
-                            </label>
+                            <label class="check-item" for="new_is_admin"><span>管理员权限</span><input type="checkbox" id="new_is_admin" name="new_is_admin"></label>
+                            <label class="check-item" for="is_active"><span>账号启用</span><input type="checkbox" id="is_active" name="is_active" checked></label>
                         </div>
-
-                        <label class="check-item" for="is_update">
-                            <span>更新模式（勾选后按用户名更新）</span>
-                            <input type="checkbox" id="is_update" name="is_update">
-                        </label>
-
-                        <div class="btn-row">
-                            <button class="btn-primary" type="submit">提交</button>
-                            <button class="btn-ghost" type="button" id="resetFormBtn">重置表单</button>
-                        </div>
+                        <label class="check-item" for="is_update"><span>更新模式（按用户名更新）</span><input type="checkbox" id="is_update" name="is_update"></label>
+                        <div class="btn-row"><button class="btn-primary" type="submit">提交</button><button class="btn-ghost" type="button" id="resetFormBtn">重置表单</button></div>
                     </div>
                 </form>
-
-                <hr class="divider">
-
-                <div class="tool-head">
-                    <h3 class="tool-title">Afdian Token Parser</h3>
-                    <p class="tool-desc">Paste token/custom_id here to decode fields (admin only).</p>
-                </div>
-
-                <div class="form-grid">
-                    <div class="field">
-                        <label for="afdian_token">Token</label>
-                        <textarea id="afdian_token" placeholder="Paste token here..."></textarea>
-                    </div>
-                    <div class="btn-row">
-                        <button class="btn-primary" type="button" id="afdianParseBtn">Parse</button>
-                        <button class="btn-ghost" type="button" id="afdianClearBtn">Clear</button>
-                    </div>
-                    <div class="tool-result" id="afdianResult" style="display:none;">
-                        <div class="tool-kv" id="afdianKv"></div>
-                        <pre id="afdianRaw"></pre>
-                    </div>
-                </div>
             </div>
         </section>
-
-        <section class="card list-panel">
-            <div class="card-head">
-                <h2>用户列表</h2>
-                <p>支持本地搜索与过滤，删除操作会立即生效。</p>
-            </div>
+        <section class="card">
+            <div class="card-head"><h2>用户列表</h2><p>点击“详情”可查看完整用户字段和爱发电订单。</p></div>
             <div class="card-body">
                 <div class="stats-grid">
-                    <div class="stats-item">
-                        <div class="label">总用户数</div>
-                        <div class="value">{{ user_stats.total_users }}</div>
-                    </div>
-                    <div class="stats-item">
-                        <div class="label">非长期总用户数</div>
-                        <div class="value">{{ user_stats.non_permanent_users }}</div>
-                    </div>
-                    <div class="stats-item">
-                        <div class="label">启用状态用户数</div>
-                        <div class="value">{{ user_stats.active_users }}</div>
-                    </div>
-                    <div class="stats-item">
-                        <div class="label">7天内到期(启用)</div>
-                        <div class="value">{{ user_stats.expiring_in_7_days }}</div>
-                    </div>
+                    <div class="stats-item"><div class="mini-label">总用户数</div><div class="value">{{ user_stats.total_users }}</div></div>
+                    <div class="stats-item"><div class="mini-label">非长期用户数</div><div class="value">{{ user_stats.non_permanent_users }}</div></div>
+                    <div class="stats-item"><div class="mini-label">启用用户数</div><div class="value">{{ user_stats.active_users }}</div></div>
+                    <div class="stats-item"><div class="mini-label">7 天内到期</div><div class="value">{{ user_stats.expiring_in_7_days }}</div></div>
                 </div>
-
                 <div class="filters">
-                    <input type="text" id="searchInput" placeholder="搜索用户名 / 限流规则 / 到期日">
-                    <select id="roleFilter">
-                        <option value="all">全部角色</option>
-                        <option value="admin">仅管理员</option>
-                        <option value="user">仅普通用户</option>
-                    </select>
-                    <select id="statusFilter">
-                        <option value="all">全部状态</option>
-                        <option value="active">仅启用</option>
-                        <option value="inactive">仅停用</option>
-                    </select>
+                    <input type="text" id="searchInput" placeholder="搜索用户名 / 限流规则 / 到期日 / 爱发电概要">
+                    <select id="roleFilter"><option value="all">全部角色</option><option value="admin">仅管理员</option><option value="user">仅普通用户</option></select>
+                    <select id="statusFilter"><option value="all">全部状态</option><option value="active">仅启用</option><option value="inactive">仅停用</option></select>
                 </div>
-
                 <div class="table-wrap">
                     <table>
-                        <thead>
-                            <tr>
-                                <th>用户名</th>
-                                <th>角色</th>
-                                <th>状态</th>
-                                <th>限流规则</th>
-                                <th>到期日</th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
+                        <thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>限流规则</th><th>到期日</th><th>爱发电概要</th><th>操作</th></tr></thead>
                         <tbody id="userTableBody">
                             {% for user in users %}
-                            <tr
-                                data-username="{{ user.username }}"
-                                data-is-admin="{{ '1' if user.is_admin else '0' }}"
-                                data-is-active="{{ '1' if user.is_active else '0' }}"
-                                data-limit-rule="{{ user.limit_rule or '' }}"
-                                data-expiration="{{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else '' }}"
-                            >
+                            <tr data-user-id="{{ user.id }}" data-username="{{ user.username }}" data-is-admin="{{ '1' if user.is_admin else '0' }}" data-is-active="{{ '1' if user.is_active else '0' }}" data-limit-rule="{{ user.limit_rule or '' }}" data-expiration="{{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else '' }}" data-afdian-summary="{{ user.afdian_summary.order_count }} {{ user.afdian_summary.activated_order_count }} {{ user.afdian_summary.pending_order_count }} {{ user.afdian_summary.closed_order_count }} {{ user.afdian_summary.activated_amount_total }}">
                                 <td><strong>{{ user.username }}</strong></td>
-                                <td>
-                                    {% if user.is_admin %}
-                                    <span class="role-tag">管理员</span>
-                                    {% else %}
-                                    <span class="role-tag">普通用户</span>
-                                    {% endif %}
-                                </td>
-                                <td>
-                                    {% if user.is_active %}
-                                    <span class="status-tag status-active">启用</span>
-                                    {% else %}
-                                    <span class="status-tag status-inactive">停用</span>
-                                    {% endif %}
-                                </td>
+                                <td>{% if user.is_admin %}<span class="tag role-tag">管理员</span>{% else %}<span class="tag role-tag">普通用户</span>{% endif %}</td>
+                                <td>{% if user.is_active %}<span class="tag status-active">启用</span>{% else %}<span class="tag status-inactive">停用</span>{% endif %}</td>
                                 <td>{{ user.limit_rule or '-' }}</td>
                                 <td>{{ user.expiration_date.strftime('%Y-%m-%d') if user.expiration_date else '长期有效' }}</td>
-                                <td>
-                                    <div class="actions">
-                                        <button type="button" class="btn-mini btn-edit js-edit-btn">编辑</button>
-                                        <form action="{{ request.url_for('delete_user_ui') }}" method="post" onsubmit="return confirm('确认删除用户 {{ user.username }} ?')">
-                                            <input type="hidden" name="id" value="{{ user.id }}">
-                                            <button type="submit" class="btn-mini btn-delete">删除</button>
-                                        </form>
-                                    </div>
-                                </td>
+                                <td><div class="afdian-summary"><strong>{{ user.afdian_summary.activated_order_count }} 已激活 / {{ user.afdian_summary.pending_order_count }} 未激活 / {{ user.afdian_summary.closed_order_count }} 已关闭</strong><span>共 {{ user.afdian_summary.order_count }} 笔，已支付 {{ '%.2f'|format(user.afdian_summary.activated_amount_total or 0) }} CNY</span></div></td>
+                                <td><div class="actions"><button type="button" class="btn-mini btn-detail js-detail-btn">详情</button><button type="button" class="btn-mini btn-edit js-edit-btn">编辑</button><form action="{{ request.url_for('delete_user_ui') }}" method="post" onsubmit="return confirm('确认删除用户 {{ user.username }} ?')"><input type="hidden" name="id" value="{{ user.id }}"><button type="submit" class="btn-mini btn-delete">删除</button></form></div></td>
                             </tr>
                             {% endfor %}
                         </tbody>
                     </table>
-                    {% if users|length == 0 %}
-                    <div class="empty">暂无用户数据</div>
-                    {% endif %}
+                    {% if users|length == 0 %}<div class="empty">暂无用户数据</div>{% endif %}
                 </div>
-
-                <div class="meta-row">
-                    <span id="visibleCount">显示 0 / 0</span>
-                    <span>提示：点击“编辑”会自动勾选“更新模式”。</span>
-                </div>
+                <div class="meta-row"><span id="visibleCount">显示 0 / 0</span><span>点击“详情”会异步拉取完整用户信息和爱发电订单。</span></div>
             </div>
         </section>
     </main>
-
+    <div class="drawer" id="detailDrawer" hidden>
+        <div class="drawer-mask js-close-drawer"></div>
+        <aside class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+            <div class="drawer-head"><div><h3 id="detailTitle">用户详情</h3><p class="section-sub" id="detailMeta">加载中...</p></div><button type="button" class="btn-ghost btn-mini js-close-drawer">关闭</button></div>
+            <div class="drawer-body" id="detailBody"><div class="empty">加载中...</div></div>
+        </aside>
+    </div>
     <script>
-        const searchInput = document.getElementById("searchInput");
-        const roleFilter = document.getElementById("roleFilter");
-        const statusFilter = document.getElementById("statusFilter");
-        const userTableBody = document.getElementById("userTableBody");
-        const visibleCount = document.getElementById("visibleCount");
-        const resetFormBtn = document.getElementById("resetFormBtn");
-        const afdianParseBtn = document.getElementById("afdianParseBtn");
-        const afdianClearBtn = document.getElementById("afdianClearBtn");
-        const afdianTokenInput = document.getElementById("afdian_token");
-        const afdianResult = document.getElementById("afdianResult");
-        const afdianKv = document.getElementById("afdianKv");
-        const afdianRaw = document.getElementById("afdianRaw");
+        const searchInput=document.getElementById("searchInput"),roleFilter=document.getElementById("roleFilter"),statusFilter=document.getElementById("statusFilter"),userTableBody=document.getElementById("userTableBody"),visibleCount=document.getElementById("visibleCount"),resetFormBtn=document.getElementById("resetFormBtn"),detailDrawer=document.getElementById("detailDrawer"),detailTitle=document.getElementById("detailTitle"),detailMeta=document.getElementById("detailMeta"),detailBody=document.getElementById("detailBody"),detailUrlTemplate="{{ request.url_for('manage_user_detail_ui', user_id=0) }}"; const formRefs={username:document.getElementById("new_username"),password:document.getElementById("new_password"),isAdmin:document.getElementById("new_is_admin"),limitRule:document.getElementById("new_limit_rule"),expirationDate:document.getElementById("expiration_date"),isActive:document.getElementById("is_active"),isUpdate:document.getElementById("is_update")}; let activeDetailRequestId=0;
+        function resetForm(){formRefs.username.value="";formRefs.password.value="";formRefs.isAdmin.checked=false;formRefs.limitRule.value="";formRefs.expirationDate.value="";formRefs.isActive.checked=true;formRefs.isUpdate.checked=false}
+        function fillFormFromRow(row){formRefs.username.value=row.dataset.username||"";formRefs.password.value="";formRefs.isAdmin.checked=row.dataset.isAdmin==="1";formRefs.limitRule.value=row.dataset.limitRule||"";formRefs.expirationDate.value=row.dataset.expiration||"";formRefs.isActive.checked=row.dataset.isActive==="1";formRefs.isUpdate.checked=true;window.scrollTo({top:0,behavior:"smooth"})}
+        function matchRole(row,role){const isAdmin=row.dataset.isAdmin==="1";if(role==="admin")return isAdmin;if(role==="user")return !isAdmin;return true}
+        function matchStatus(row,status){const isActive=row.dataset.isActive==="1";if(status==="active")return isActive;if(status==="inactive")return !isActive;return true}
+        function applyFilters(){const keyword=searchInput.value.trim().toLowerCase(),role=roleFilter.value,status=statusFilter.value,rows=Array.from(userTableBody.querySelectorAll("tr"));let shown=0;rows.forEach((row)=>{const text=`${row.dataset.username} ${row.dataset.limitRule} ${row.dataset.expiration} ${row.dataset.afdianSummary}`.toLowerCase();const visible=(!keyword||text.includes(keyword))&&matchRole(row,role)&&matchStatus(row,status);row.style.display=visible?"":"none";if(visible)shown+=1});visibleCount.textContent=`显示 ${shown} / ${rows.length}`}
+        function escapeHtml(value){return String(value).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
+        function simpleValue(value){if(value===null||value===undefined||value==="")return "-";if(typeof value==="boolean")return value?"是":"否";if(typeof value==="object")return `<code>${escapeHtml(JSON.stringify(value))}</code>`;return escapeHtml(String(value))}
+        function prettyJson(value){if(value===null||value===undefined||value==="")return "-";if(typeof value==="string")return value;try{return JSON.stringify(value,null,2)}catch{return String(value)}}
+        function renderGrid(fields){return Object.entries(fields).map(([key,value])=>`<div class="kv-card"><div class="mini-label">${escapeHtml(key)}</div><div>${simpleValue(value)}</div></div>`).join("")}
+        function renderJsonBlock(title,value){return `<div class="json-block"><div class="mini-label">${escapeHtml(title)}</div><pre class="json-pre">${escapeHtml(prettyJson(value))}</pre></div>`}
+        function statusClass(status){if(status==="activated")return "status-active";if(status==="pending")return "status-pending";if(status==="unpaid")return "status-inactive";return "status-inactive"}
+        function activationSourceText(source,label){if(label&&source&&label!==source)return `${label} (${source})`;return label||source||"-"}
+        function renderOrder(order){const fields={"订单ID":order.id,"状态":order.status_label||order.status,"动作":order.action,"金额":order.amount,"爱发电订单号":order.order_no,"商户订单号":order.out_trade_no,"用户名":order.username,"激活方式":activationSourceText(order.activation_source,order.activation_source_label),"备注":order.remark,"激活失败原因":order.activation_error,"失败记录时间":order.activation_error_at,"创建时间":order.created_at,"更新时间":order.updated_at,"激活时间":order.activated_at,"custom_id":order.custom_id};const parsed=order.parsed_custom_id||(order.custom_id_parse_error?{error:order.custom_id_parse_error}:null);const statusText=order.status_label||order.status||"unknown";const openAttr=order.default_collapsed?"":" open";return `<details class="order-detail"${openAttr}><summary class="order-summary"><div class="order-head"><div><strong>${escapeHtml(order.action||"unknown")} / ${escapeHtml(order.out_trade_no||order.order_no||"未关联单号")}</strong><div class="muted">本地订单记录 ID: ${escapeHtml(String(order.id||"-"))} · ${escapeHtml(order.created_at||"-")}</div></div><span class="tag ${statusClass(order.status)}">${escapeHtml(statusText)}</span></div></summary><div class="order-content"><div class="detail-grid">${renderGrid(fields)}</div><div class="detail-grid">${renderJsonBlock("parsed custom_id",parsed)}${renderJsonBlock("raw payload",order.raw_payload||order.raw_payload_text)}</div></div></details>`}
+        function openDrawer(){detailDrawer.hidden=false;detailDrawer.classList.add("open");document.body.style.overflow="hidden"} function closeDrawer(){detailDrawer.classList.remove("open");detailDrawer.hidden=true;document.body.style.overflow=""}
+        function setDrawerLoading(username){detailTitle.textContent=username?`${username} 的详情`:"用户详情";detailMeta.textContent="加载中...";detailBody.innerHTML='<div class="empty">正在拉取用户详细信息和爱发电订单...</div>'}
+        function detailUrl(userId){return detailUrlTemplate.replace("/0/detail",`/${userId}/detail`)}
+        function renderDetail(payload){const user=payload.user||{},summary=payload.afdian_summary||{},orders=Array.isArray(payload.orders)?payload.orders:[];detailTitle.textContent=`${user.username||"用户"} 的详情`;detailMeta.textContent=`共 ${orders.length} 笔爱发电订单，完整字段已展开。`;const userFields={"用户ID":user.id,"用户名":user.username,"密码哈希":user.password_hash,"管理员":user.is_admin,"已启用":user.is_active,"限流规则":user.limit_rule,"到期时间":user.expiration_date,"Boost 到期时间":user.boost_expiration_date,"Boost 限流规则":user.boost_limit_rule};const summaryFields={"有爱发电订单":summary.has_orders,"订单总数":summary.order_count,"已激活订单":summary.activated_order_count,"未激活订单(24h内)":summary.pending_order_count,"已关闭订单(超24h)":summary.closed_order_count,"已支付总额(CNY)":summary.activated_amount_total,"最新订单时间":summary.latest_order_at};const ordersHtml=orders.length?`<div class="order-list">${orders.map((order)=>renderOrder(order)).join("")}</div>`:'<div class="empty">该用户暂时没有爱发电订单记录。</div>';detailBody.innerHTML=`<section class="drawer-section"><div><h3 class="section-title">用户完整字段</h3><p class="section-sub">展示当前数据库里该用户的完整主要字段。</p></div><div class="detail-grid">${renderGrid(userFields)}</div></section><section class="drawer-section"><div><h3 class="section-title">爱发电概要</h3><p class="section-sub">包含本地订单统计和最近可解析的 custom_id 信息。</p></div><div class="detail-grid">${renderGrid(summaryFields)}</div>${renderJsonBlock("latest parsed custom_id",summary.latest_parsed_custom_id)}</section><section class="drawer-section"><div><h3 class="section-title">爱发电订单</h3><p class="section-sub">按创建时间倒序显示。已关闭订单默认折叠，未激活和已激活订单默认展开。</p></div>${ordersHtml}</section>`}
+        async function loadDetail(row){const userId=row.dataset.userId,username=row.dataset.username||"用户",requestId=++activeDetailRequestId;openDrawer();setDrawerLoading(username);try{const resp=await fetch(detailUrl(userId));const data=await resp.json();if(requestId!==activeDetailRequestId)return;if(!resp.ok)throw new Error(data.detail||"加载失败");renderDetail(data)}catch(err){if(requestId!==activeDetailRequestId)return;detailMeta.textContent="加载失败";detailBody.innerHTML=`<div class="empty">${escapeHtml(err.message||String(err))}</div>`}}
+        document.querySelectorAll(".js-edit-btn").forEach((btn)=>btn.addEventListener("click",()=>{const row=btn.closest("tr");if(row)fillFormFromRow(row)})); document.querySelectorAll(".js-detail-btn").forEach((btn)=>btn.addEventListener("click",()=>{const row=btn.closest("tr");if(row)loadDetail(row)})); document.querySelectorAll(".js-close-drawer").forEach((node)=>node.addEventListener("click",closeDrawer)); document.addEventListener("keydown",(event)=>{if(event.key==="Escape"&&!detailDrawer.hidden)closeDrawer}); searchInput.addEventListener("input",applyFilters); roleFilter.addEventListener("change",applyFilters); statusFilter.addEventListener("change",applyFilters); resetFormBtn.addEventListener("click",resetForm); applyFilters();
+    </script>
+    <script>
+        const activateOrderUrl = "{{ request.url_for('activate_afdian_order_ui') }}";
 
-        const formRefs = {
-            username: document.getElementById("new_username"),
-            password: document.getElementById("new_password"),
-            isAdmin: document.getElementById("new_is_admin"),
-            limitRule: document.getElementById("new_limit_rule"),
-            expirationDate: document.getElementById("expiration_date"),
-            isActive: document.getElementById("is_active"),
-            isUpdate: document.getElementById("is_update")
-        };
-
-        function resetForm() {
-            formRefs.username.value = "";
-            formRefs.password.value = "";
-            formRefs.isAdmin.checked = false;
-            formRefs.limitRule.value = "";
-            formRefs.expirationDate.value = "";
-            formRefs.isActive.checked = true;
-            formRefs.isUpdate.checked = false;
+        function setDrawerLoading(username) {
+            detailTitle.textContent = username ? `${username} 的详情` : "用户详情";
+            detailMeta.textContent = "加载中...";
+            detailBody.innerHTML = '<div class="empty">正在拉取用户详细信息和爱发电订单...</div>';
         }
 
-        function fillFormFromRow(row) {
-            formRefs.username.value = row.dataset.username || "";
-            formRefs.password.value = "";
-            formRefs.isAdmin.checked = row.dataset.isAdmin === "1";
-            formRefs.limitRule.value = row.dataset.limitRule || "";
-            formRefs.expirationDate.value = row.dataset.expiration || "";
-            formRefs.isActive.checked = row.dataset.isActive === "1";
-            formRefs.isUpdate.checked = true;
-            window.scrollTo({ top: 0, behavior: "smooth" });
+        function renderActivateResult(payload) {
+            const fields = {
+                "结果": payload.message || "激活成功",
+                "是否重复提交": payload.idempotent,
+                "查询值": payload.lookup_value,
+                "商户订单号": payload.out_trade_no || payload.resolved_out_trade_no,
+                "爱发电订单号": payload.order_no,
+                "动作": payload.action,
+                "金额": payload.amount,
+                "月份": payload.months,
+                "套餐月价": payload.plan_price,
+                "限流规则": payload.limit_rule,
+                "激活方式": activationSourceText(payload.activation_source, payload.activation_source_label),
+                "到期时间(UTC)": payload.new_expiration_utc,
+                "Boost 到期(UTC)": payload.boost_expiration_utc,
+            };
+            return `<div class="detail-grid">${renderGrid(fields)}</div>`;
         }
 
-        function matchRole(row, role) {
-            const isAdmin = row.dataset.isAdmin === "1";
-            if (role === "admin") return isAdmin;
-            if (role === "user") return !isAdmin;
-            return true;
-        }
+        async function activateExistingOrder() {
+            const input = document.getElementById("manualActivateInput");
+            const button = document.getElementById("manualActivateBtn");
+            const result = document.getElementById("manualActivateResult");
+            const orderKeyword = (input?.value || "").trim();
 
-        function matchStatus(row, status) {
-            const isActive = row.dataset.isActive === "1";
-            if (status === "active") return isActive;
-            if (status === "inactive") return !isActive;
-            return true;
-        }
-
-        function applyFilters() {
-            const keyword = searchInput.value.trim().toLowerCase();
-            const role = roleFilter.value;
-            const status = statusFilter.value;
-            const rows = Array.from(userTableBody.querySelectorAll("tr"));
-
-            let shown = 0;
-            rows.forEach((row) => {
-                const text = `${row.dataset.username} ${row.dataset.limitRule} ${row.dataset.expiration}`.toLowerCase();
-                const okKeyword = !keyword || text.includes(keyword);
-                const okRole = matchRole(row, role);
-                const okStatus = matchStatus(row, status);
-                const visible = okKeyword && okRole && okStatus;
-                row.style.display = visible ? "" : "none";
-                if (visible) shown += 1;
-            });
-            visibleCount.textContent = `显示 ${shown} / ${rows.length}`;
-        }
-
-        function renderKv(target, fields) {
-            target.innerHTML = "";
-            Object.keys(fields).forEach((key) => {
-                const value = fields[key];
-                const rowKey = document.createElement("div");
-                rowKey.className = "k";
-                rowKey.textContent = key;
-                const rowVal = document.createElement("div");
-                rowVal.className = "v";
-                rowVal.textContent = value === null || value === undefined ? "-" : String(value);
-                target.appendChild(rowKey);
-                target.appendChild(rowVal);
-            });
-        }
-
-        async function parseAfdianToken() {
-            const token = (afdianTokenInput.value || "").trim();
-            if (!token) {
-                afdianResult.style.display = "none";
+            if (!orderKeyword) {
+                result.innerHTML = '<div class="empty">请先输入订单号、商户订单号、custom_id 或备注。</div>';
                 return;
             }
 
-            afdianParseBtn.disabled = true;
-            afdianParseBtn.textContent = "Parsing...";
+            const formData = new FormData();
+            formData.append("order_keyword", orderKeyword);
+
+            button.disabled = true;
+            button.textContent = "激活中...";
+            result.innerHTML = '<div class="empty">正在尝试激活该订单...</div>';
+
             try {
-                const formData = new FormData();
-                formData.append("token", token);
-                const resp = await fetch("{{ request.url_for('parse_afdian_token_ui') }}", {
+                const resp = await fetch(activateOrderUrl, {
                     method: "POST",
                     body: formData,
                 });
                 const data = await resp.json();
                 if (!resp.ok) {
-                    throw new Error(data.detail || "parse failed");
+                    throw new Error(data.detail || "激活失败");
                 }
-
-                const fields = data.fields || {};
-                fields.expired = data.expired;
-                fields.token_length = data.token_length;
-                renderKv(afdianKv, fields);
-                afdianRaw.textContent = JSON.stringify(data.payload || data, null, 2);
-                afdianResult.style.display = "grid";
+                result.innerHTML = renderActivateResult(data);
             } catch (err) {
-                renderKv(afdianKv, { error: err.message || String(err) });
-                afdianRaw.textContent = "";
-                afdianResult.style.display = "grid";
+                result.innerHTML = `<div class="empty">${escapeHtml(err.message || String(err))}</div>`;
             } finally {
-                afdianParseBtn.disabled = false;
-                afdianParseBtn.textContent = "Parse";
+                button.disabled = false;
+                button.textContent = "立即激活";
             }
         }
 
-        function clearAfdianToken() {
-            afdianTokenInput.value = "";
-            afdianResult.style.display = "none";
-            afdianKv.innerHTML = "";
-            afdianRaw.textContent = "";
+        function bindManualActivate() {
+            const button = document.getElementById("manualActivateBtn");
+            const input = document.getElementById("manualActivateInput");
+            if (!button || !input) return;
+
+            button.addEventListener("click", activateExistingOrder);
+            input.addEventListener("keydown", (event) => {
+                if (event.key === "Enter") {
+                    event.preventDefault();
+                    activateExistingOrder();
+                }
+            });
         }
 
-        document.querySelectorAll(".js-edit-btn").forEach((btn) => {
-            btn.addEventListener("click", () => {
-                const row = btn.closest("tr");
-                if (row) fillFormFromRow(row);
-            });
-        });
+        function renderDetail(payload) {
+            const user = payload.user || {};
+            const summary = payload.afdian_summary || {};
+            const orders = Array.isArray(payload.orders) ? payload.orders : [];
 
-        searchInput.addEventListener("input", applyFilters);
-        roleFilter.addEventListener("change", applyFilters);
-        statusFilter.addEventListener("change", applyFilters);
-        resetFormBtn.addEventListener("click", resetForm);
-        afdianParseBtn.addEventListener("click", parseAfdianToken);
-        afdianClearBtn.addEventListener("click", clearAfdianToken);
+            detailTitle.textContent = `${user.username || "用户"} 的详情`;
+            detailMeta.textContent = `共 ${orders.length} 笔爱发电订单，完整字段已展开。`;
 
-        applyFilters();
+            const userFields = {
+                "用户ID": user.id,
+                "用户名": user.username,
+                "密码哈希": user.password_hash,
+                "管理员": user.is_admin,
+                "已启用": user.is_active,
+                "限流规则": user.limit_rule,
+                "到期时间": user.expiration_date,
+                "Boost 到期时间": user.boost_expiration_date,
+                "Boost 限流规则": user.boost_limit_rule,
+            };
+
+            const summaryFields = {
+                "有爱发电订单": summary.has_orders,
+                "订单总数": summary.order_count,
+                "已激活订单": summary.activated_order_count,
+                "未激活订单(24h内)": summary.pending_order_count,
+                "已关闭订单(超24h)": summary.closed_order_count,
+                "已支付总额(CNY)": summary.activated_amount_total,
+                "最新订单时间": summary.latest_order_at,
+            };
+
+            const ordersHtml = orders.length
+                ? `<div class="order-list">${orders.map((order) => renderOrder(order)).join("")}</div>`
+                : '<div class="empty">该用户暂时没有爱发电订单记录。</div>';
+
+            detailBody.innerHTML = `
+                <section class="drawer-section">
+                    <div>
+                        <h3 class="section-title">用户完整字段</h3>
+                        <p class="section-sub">展示当前数据库里该用户的完整主要字段。</p>
+                    </div>
+                    <div class="detail-grid">${renderGrid(userFields)}</div>
+                </section>
+                <section class="drawer-section">
+                    <div>
+                        <h3 class="section-title">爱发电概要</h3>
+                        <p class="section-sub">包含本地订单统计和最近可解析的 custom_id 信息。</p>
+                    </div>
+                    <div class="detail-grid">${renderGrid(summaryFields)}</div>
+                    ${renderJsonBlock("latest parsed custom_id", summary.latest_parsed_custom_id)}
+                </section>
+                <section class="drawer-section">
+                    <div>
+                        <h3 class="section-title">已有订单号激活</h3>
+                        <p class="section-sub">支持商户订单号、已同步的爱发电订单号、custom_id 或备注，用于手动补激活。</p>
+                    </div>
+                    <div class="detail-grid">
+                        <div class="field" style="grid-column:1/-1;">
+                            <label for="manualActivateInput">订单关键字</label>
+                            <input type="text" id="manualActivateInput" placeholder="输入订单号 / 商户订单号 / custom_id / 备注">
+                        </div>
+                    </div>
+                    <div class="actions">
+                        <button type="button" class="btn-primary" id="manualActivateBtn">立即激活</button>
+                    </div>
+                    <div id="manualActivateResult"><div class="empty">输入已有订单号后，可在这里查看激活结果。</div></div>
+                </section>
+                <section class="drawer-section">
+                    <div>
+                        <h3 class="section-title">爱发电订单</h3>
+                        <p class="section-sub">按创建时间倒序显示。已关闭订单默认折叠，未激活和已激活订单默认展开。</p>
+                    </div>
+                    ${ordersHtml}
+                </section>
+            `;
+
+            bindManualActivate();
+        }
     </script>
 </body>
 </html>

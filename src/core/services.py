@@ -6,6 +6,7 @@ import html
 import traceback
 import struct
 import wave
+import re
 
 from io import BytesIO
 from openai import OpenAI, AsyncOpenAI
@@ -15,6 +16,7 @@ from core.config import settings, WHISPER_URL, WHISPER_TRT_URL, SENSEVOICE_URL
 from core.gemma_translate_service import gemma_translate, is_gemma_translation_supported
 from core.logging_config import logger
 from core.text_compressor import compress_repeated_chars
+from core.update_service import get_translation_capabilities
 
 # 延迟导入translators，避免初始化时的网络问题
 translators = None
@@ -87,6 +89,182 @@ def _is_same_translation_lang(source_lang: str, target_lang: str) -> bool:
 
 def _is_auto_translation_lang(lang: str) -> bool:
     return (lang or "").strip().lower() == "auto"
+
+
+def normalize_translation_language_code(lang: str) -> str:
+    return _canonical_lang_code(lang)
+
+
+def _iter_capability_targets(raw_targets):
+    if isinstance(raw_targets, dict):
+        return raw_targets.keys()
+    if isinstance(raw_targets, (list, tuple, set)):
+        return raw_targets
+    if isinstance(raw_targets, str):
+        return [raw_targets]
+    return []
+
+
+def get_runtime_translation_language_sets():
+    source_languages = set()
+    target_languages = set()
+
+    try:
+        capabilities = get_translation_capabilities()
+        engines = capabilities.get("engines", []) if isinstance(capabilities, dict) else []
+
+        for engine in engines:
+            language_map = engine.get("languages", {}) if isinstance(engine, dict) else {}
+            if not isinstance(language_map, dict):
+                continue
+
+            for raw_source, raw_targets in language_map.items():
+                source = _canonical_lang_code(str(raw_source))
+                if source and not _is_auto_translation_lang(source):
+                    source_languages.add(source)
+
+                for raw_target in _iter_capability_targets(raw_targets):
+                    target = _canonical_lang_code(str(raw_target))
+                    if target and not _is_auto_translation_lang(target):
+                        target_languages.add(target)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("[TRANSLATE] Failed to load runtime translation capabilities: %s", exc)
+
+    if not source_languages:
+        source_languages.update(supportedLanguagesList)
+    if not target_languages:
+        target_languages.update(supportedLanguagesList)
+
+    return {
+        "sources": sorted(source_languages),
+        "targets": sorted(target_languages),
+    }
+
+
+def get_runtime_translation_source_languages():
+    return get_runtime_translation_language_sets()["sources"]
+
+
+def get_runtime_translation_target_languages():
+    return get_runtime_translation_language_sets()["targets"]
+
+
+def is_runtime_translation_source_supported(lang: str) -> bool:
+    normalized = _canonical_lang_code(lang)
+    return normalized in set(get_runtime_translation_source_languages())
+
+
+def is_runtime_translation_target_supported(lang: str) -> bool:
+    normalized = _canonical_lang_code(lang)
+    return normalized in set(get_runtime_translation_target_languages())
+
+
+SCRIPT_LANGUAGE_RANGES = {
+    "ko": [(0xAC00, 0xD7AF), (0x1100, 0x11FF), (0x3130, 0x318F)],
+    "ja": [(0x3040, 0x309F), (0x30A0, 0x30FF), (0x31F0, 0x31FF)],
+    "ru": [(0x0400, 0x04FF), (0x0500, 0x052F)],
+    "ar": [(0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF)],
+    "hi": [(0x0900, 0x097F)],
+    "th": [(0x0E00, 0x0E7F)],
+    "he": [(0x0590, 0x05FF)],
+    "el": [(0x0370, 0x03FF)],
+}
+
+LATIN_LANGUAGE_HINTS = {
+    "en": {"the", "and", "you", "this", "that", "are", "with", "have", "what", "please", "hello"},
+    "de": {"der", "die", "das", "und", "ist", "nicht", "ich", "mit", "ein", "eine", "bitte", "hallo"},
+    "fr": {"le", "la", "les", "de", "des", "est", "pas", "que", "pour", "une", "bonjour", "merci"},
+    "es": {"el", "la", "los", "las", "de", "que", "para", "por", "una", "gracias", "hola", "estoy"},
+    "pt": {"de", "que", "para", "por", "uma", "obrigado", "ola", "voce", "estou", "nao"},
+    "it": {"che", "per", "una", "grazie", "ciao", "sono", "non", "con", "del", "della"},
+    "nl": {"de", "het", "een", "en", "voor", "niet", "hallo", "dank", "ik", "jij"},
+}
+
+TRADITIONAL_CHINESE_HINTS = set("體對會說這個們來時後開關讓歡國語麼嗎學習點電腦網頁輸入龍貓貝萬與")
+
+
+def _count_chars_in_ranges(text: str, ranges: list[tuple[int, int]]) -> int:
+    count = 0
+    for ch in text:
+        code = ord(ch)
+        for start, end in ranges:
+            if start <= code <= end:
+                count += 1
+                break
+    return count
+
+
+def _contains_cjk(text: str) -> bool:
+    return any(
+        0x4E00 <= ord(ch) <= 0x9FFF
+        or 0x3400 <= ord(ch) <= 0x4DBF
+        for ch in text
+    )
+
+
+def _detect_script_language(text: str) -> str | None:
+    scores = {
+        lang: _count_chars_in_ranges(text, ranges)
+        for lang, ranges in SCRIPT_LANGUAGE_RANGES.items()
+    }
+
+    best_lang = None
+    best_score = 0
+    for lang, score in scores.items():
+        if score > best_score:
+            best_lang = lang
+            best_score = score
+
+    if best_lang and best_score > 0:
+        return best_lang
+
+    if _contains_cjk(text):
+        traditional_hits = sum(1 for ch in text if ch in TRADITIONAL_CHINESE_HINTS)
+        return "zt" if traditional_hits > 0 else "zh"
+
+    return None
+
+
+def _detect_latin_language(text: str) -> str | None:
+    tokens = re.findall(r"[a-zA-ZÀ-ÿ']+", text.lower())
+    if not tokens:
+        return None
+
+    scores: dict[str, int] = {}
+    for lang, hints in LATIN_LANGUAGE_HINTS.items():
+        score = sum(1 for token in tokens if token in hints)
+        if score > 0:
+            scores[lang] = score
+
+    if not scores:
+        return "en"
+
+    return max(scores.items(), key=lambda item: item[1])[0]
+
+
+def detect_translation_source_language(text: str, allowed_languages: list[str] | None = None) -> str:
+    allowed = {
+        _canonical_lang_code(lang)
+        for lang in (allowed_languages or get_runtime_translation_source_languages())
+        if lang and not _is_auto_translation_lang(lang)
+    }
+
+    detected = _detect_script_language(text) or _detect_latin_language(text) or "en"
+    canonical = _canonical_lang_code(detected)
+
+    if canonical in allowed:
+        return canonical
+
+    if canonical == "zt" and "zh" in allowed:
+        return "zh"
+
+    if "en" in allowed:
+        return "en"
+
+    if "zh" in allowed:
+        return "zh"
+
+    return next(iter(allowed), "en")
 
 
 # --- 初始化函数 ---

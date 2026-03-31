@@ -10,13 +10,16 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), unique=True, nullable=False, index=True)
-    password = Column(String(80), nullable=False)
+    password = Column(String(255), nullable=False)
     is_admin = Column(Boolean, default=False)
     limit_rule = Column(String(100), nullable=True)
     expiration_date = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
     boost_expiration_date = Column(DateTime, nullable=True)
     boost_limit_rule = Column(String(100), nullable=True)
+    addon_resource_balance = Column(Integer, nullable=False, default=0)
+    addon_resource_total = Column(Integer, nullable=False, default=0)
+    addon_expiration_date = Column(DateTime, nullable=True)
 
 
 class RequestLog(Base):
@@ -31,6 +34,7 @@ class RequestLog(Base):
     status = Column(String(20), nullable=False, index=True)
     resource_cost = Column(Integer, nullable=False, default=0, index=True)
     resource_deducted = Column(Boolean, nullable=False, default=False, index=True)
+    quota_source = Column(String(20), nullable=False, default="none", index=True)
 
 
 class PaymentOrder(Base):
@@ -46,6 +50,9 @@ class PaymentOrder(Base):
     amount = Column(Float, nullable=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
     activated_at = Column(DateTime, nullable=True)
+    activation_source = Column(String(64), nullable=True, index=True)
+    activation_error = Column(Text, nullable=True)
+    activation_error_at = Column(DateTime, nullable=True)
     raw_payload = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.now, nullable=False)
     updated_at = Column(DateTime, default=datetime.now, nullable=False)

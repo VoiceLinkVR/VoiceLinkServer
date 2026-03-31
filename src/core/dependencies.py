@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Generator, Optional
 
-from fastapi import Depends, HTTPException, status, Request
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
@@ -11,19 +11,20 @@ from core.config import settings
 from db.base import SessionLocal
 from db.models import User
 
-# 使用Werkzeug进行密码哈希（与原有server.py保持一致）
+
 def verify_password(password: str, hashed_password: str) -> bool:
-    """使用Werkzeug验证密码"""
+    """Verify a password using Werkzeug."""
     return check_password_hash(hashed_password, password)
 
+
 def hash_password(password: str) -> str:
-    """使用Werkzeug生成密码哈希"""
+    """Hash a password using Werkzeug."""
     return generate_password_hash(password)
 
-# OAuth2 Scheme
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login", auto_error=False)
 
-# Database session dependency
+
 def get_db() -> Generator:
     try:
         db = SessionLocal()
@@ -31,7 +32,7 @@ def get_db() -> Generator:
     finally:
         db.close()
 
-# JWT Token creation
+
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRES_MINUTES)
@@ -64,7 +65,7 @@ def get_effective_user_limit_rule(user: User) -> str:
         return boost_rule
     return (user.limit_rule or "").strip() or default_rule
 
-# Get current user dependency
+
 async def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     if token is None:
         raise HTTPException(
@@ -144,16 +145,16 @@ async def get_current_user_for_status(
         raise credentials_exception
     return user
 
-# Get current admin user dependency
+
 async def get_current_admin_user(current_user: User = Depends(get_current_user)) -> User:
     if not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="The user doesn't have enough privileges"
+            detail="The user doesn't have enough privileges",
         )
     return current_user
 
-# (For UI) Get admin user from session
+
 def get_admin_user_from_session(request: Request, db: Session = Depends(get_db)) -> Optional[User]:
     user_id = request.session.get("user_id")
     if user_id is None:

@@ -1,17 +1,18 @@
+import json
 from datetime import datetime, timedelta, time
 from typing import Optional, Dict, Any, List
 
-from fastapi import APIRouter, Request, Depends, Form
+from fastapi import APIRouter, Request, Depends, Form, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import text, func, case, desc
+from sqlalchemy import text, func, case, desc, or_
 from sqlalchemy.orm import Session
 
 from core.afdian_service import afdian_service
 from core.dependencies import get_db, hash_password, verify_password, get_admin_user_from_session
 from core.logging_config import logger
-from db.models import User, RequestLog
+from db.models import User, RequestLog, PaymentOrder
 
 router = APIRouter(
     tags=["UI Management"],
@@ -37,6 +38,16 @@ AFDIAN_ACTION_LABELS = {
     "upgrade": "upgrade",
 }
 
+AFDIAN_ACTIVATION_SOURCE_LABELS = {
+    "manual_activate": "手动激活",
+    "admin_manual_activate": "后台手动激活",
+    "legacy_manual_activate": "旧版手动激活",
+    "webhook_direct": "Webhook 直连激活",
+    "webhook_query_confirmed": "Webhook 二次查询激活",
+}
+
+PAYMENT_PENDING_EXPIRE_HOURS = 24
+
 
 def _format_local_timestamp(timestamp_value: Any) -> Optional[str]:
     try:
@@ -55,6 +66,13 @@ def _format_money(value: Any) -> Optional[str]:
         return f"CNY {float(value):.2f}"
     except (TypeError, ValueError):
         return None
+
+
+def _get_activation_source_label(source: Optional[str]) -> Optional[str]:
+    normalized = str(source or "").strip().lower()
+    if not normalized:
+        return None
+    return AFDIAN_ACTIVATION_SOURCE_LABELS.get(normalized, source)
 
 
 def _build_afdian_token_result(token: str) -> Dict[str, Any]:
@@ -84,6 +102,316 @@ def _build_afdian_token_result(token: str) -> Dict[str, Any]:
         },
         "payload": parsed,
     }
+
+
+def _format_datetime(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_payment_status(status: Optional[str]) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "pending":
+        return "pending"
+    if normalized == "activated":
+        return "activated"
+    if normalized == "unpaid":
+        return "unpaid"
+    return normalized or "unknown"
+
+
+def _close_expired_pending_orders(db: Session) -> int:
+    expire_before = datetime.utcnow() - timedelta(hours=PAYMENT_PENDING_EXPIRE_HOURS)
+    expired_orders = (
+        db.query(PaymentOrder)
+        .filter(
+            PaymentOrder.status == "pending",
+            PaymentOrder.created_at.isnot(None),
+            PaymentOrder.created_at <= expire_before,
+        )
+        .all()
+    )
+
+    if not expired_orders:
+        return 0
+
+    now_utc = datetime.utcnow()
+    for order in expired_orders:
+        order.status = "unpaid"
+        order.updated_at = now_utc
+
+    db.commit()
+    logger.info("[ADMIN] Auto-closed unpaid afdian orders: %s", len(expired_orders))
+    return len(expired_orders)
+
+
+def _parse_json_text(raw_text: Optional[str]) -> Any:
+    if not raw_text:
+        return None
+    try:
+        return json.loads(raw_text)
+    except (TypeError, ValueError):
+        return {"_raw": raw_text}
+
+
+def _build_user_afdian_summary_map(db: Session) -> Dict[str, Dict[str, Any]]:
+    rows = (
+        db.query(
+            PaymentOrder.username.label("username"),
+            func.count(PaymentOrder.id).label("order_count"),
+            func.sum(case((PaymentOrder.status == "activated", 1), else_=0)).label("activated_order_count"),
+            func.sum(case((PaymentOrder.status == "pending", 1), else_=0)).label("pending_order_count"),
+            func.sum(case((PaymentOrder.status == "unpaid", 1), else_=0)).label("unpaid_order_count"),
+            func.coalesce(
+                func.sum(case((PaymentOrder.status == "activated", PaymentOrder.amount), else_=0.0)),
+                0.0,
+            ).label("activated_amount_total"),
+            func.max(PaymentOrder.created_at).label("latest_order_at"),
+        )
+        .filter(PaymentOrder.username.isnot(None))
+        .group_by(PaymentOrder.username)
+        .all()
+    )
+
+    summary_map: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        username = str(row.username or "").strip()
+        if not username:
+            continue
+        summary_map[username] = {
+            "order_count": int(row.order_count or 0),
+            "activated_order_count": int(row.activated_order_count or 0),
+            "pending_order_count": int(row.pending_order_count or 0),
+            "unpaid_order_count": int(row.unpaid_order_count or 0),
+            "closed_order_count": int(row.unpaid_order_count or 0),
+            "activated_amount_total": round(float(row.activated_amount_total or 0.0), 2),
+            "latest_order_at": _format_datetime(row.latest_order_at),
+        }
+
+    return summary_map
+
+
+def _build_afdian_order_payload(order: PaymentOrder) -> Dict[str, Any]:
+    parsed_custom_id = None
+    custom_id_parse_error = None
+    status = _normalize_payment_status(order.status)
+    if order.custom_id:
+        try:
+            parsed_custom_id = afdian_service.parse_custom_id(order.custom_id)
+        except ValueError as exc:
+            custom_id_parse_error = str(exc)
+
+    return {
+        "id": order.id,
+        "order_no": order.order_no,
+        "out_trade_no": order.out_trade_no,
+        "custom_id": order.custom_id,
+        "remark": order.remark,
+        "username": order.username,
+        "action": order.action,
+        "amount": round(float(order.amount), 2) if order.amount is not None else None,
+        "status": status,
+        "status_label": {
+            "activated": "已激活",
+            "pending": "未激活",
+            "unpaid": "已关闭",
+        }.get(status, status),
+        "default_collapsed": status == "unpaid",
+        "activated_at": _format_datetime(order.activated_at),
+        "activation_source": getattr(order, "activation_source", None),
+        "activation_source_label": _get_activation_source_label(getattr(order, "activation_source", None)),
+        "activation_error": order.activation_error,
+        "activation_error_at": _format_datetime(getattr(order, "activation_error_at", None)),
+        "created_at": _format_datetime(order.created_at),
+        "updated_at": _format_datetime(order.updated_at),
+        "parsed_custom_id": parsed_custom_id,
+        "custom_id_parse_error": custom_id_parse_error,
+        "raw_payload": _parse_json_text(order.raw_payload),
+        "raw_payload_text": order.raw_payload,
+    }
+
+
+def _build_user_detail_payload(db: Session, user: User) -> Dict[str, Any]:
+    orders = (
+        db.query(PaymentOrder)
+        .filter(PaymentOrder.username == user.username)
+        .order_by(desc(PaymentOrder.created_at), desc(PaymentOrder.id))
+        .all()
+    )
+    afdian_summary_map = _build_user_afdian_summary_map(db)
+    afdian_summary = afdian_summary_map.get(
+        user.username,
+        {
+            "order_count": 0,
+            "activated_order_count": 0,
+            "pending_order_count": 0,
+            "unpaid_order_count": 0,
+            "closed_order_count": 0,
+            "activated_amount_total": 0.0,
+            "latest_order_at": None,
+        },
+    )
+
+    latest_parsed_custom_id = None
+    for order in orders:
+        if not order.custom_id:
+            continue
+        try:
+            latest_parsed_custom_id = afdian_service.parse_custom_id(order.custom_id)
+            break
+        except ValueError:
+            continue
+
+    return {
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "password_hash": user.password,
+            "is_admin": user.is_admin,
+            "is_active": user.is_active,
+            "limit_rule": user.limit_rule,
+            "expiration_date": _format_datetime(user.expiration_date),
+            "boost_expiration_date": _format_datetime(user.boost_expiration_date),
+            "boost_limit_rule": user.boost_limit_rule,
+        },
+        "afdian_summary": {
+            **afdian_summary,
+            "has_orders": bool(orders),
+            "latest_parsed_custom_id": latest_parsed_custom_id,
+        },
+        "orders": [_build_afdian_order_payload(order) for order in orders],
+    }
+
+
+def _build_remote_afdian_order_payload(order: Dict[str, Any]) -> Dict[str, Any]:
+    custom_id = afdian_service.get_custom_id(order) or None
+    parsed_custom_id = None
+    custom_id_parse_error = None
+    if custom_id:
+        try:
+            parsed_custom_id = afdian_service.parse_custom_id(custom_id)
+        except ValueError as exc:
+            custom_id_parse_error = str(exc)
+
+    status_code = afdian_service.get_order_status(order)
+    return {
+        "order_no": afdian_service.get_order_no(order) or None,
+        "out_trade_no": afdian_service.get_out_trade_no(order) or None,
+        "custom_id": custom_id,
+        "remark": order.get("remark"),
+        "status": status_code,
+        "status_label": {
+            2: "已支付",
+            1: "待支付",
+            0: "未知",
+        }.get(status_code, str(status_code) if status_code is not None else None),
+        "amount": _format_money(order.get("show_amount") or order.get("total_amount") or order.get("amount")),
+        "create_time_local": _format_local_timestamp(order.get("create_time")),
+        "parsed_custom_id": parsed_custom_id,
+        "custom_id_parse_error": custom_id_parse_error,
+        "raw_payload": order,
+    }
+
+
+def _build_afdian_order_list_payload(db: Session) -> Dict[str, Any]:
+    orders = (
+        db.query(PaymentOrder)
+        .order_by(desc(PaymentOrder.created_at), desc(PaymentOrder.id))
+        .all()
+    )
+    parsed_orders = [_build_afdian_order_payload(order) for order in orders]
+    return {
+        "summary": {
+            "total_orders": len(parsed_orders),
+            "activated_orders": sum(1 for order in parsed_orders if order["status"] == "activated"),
+            "pending_orders": sum(1 for order in parsed_orders if order["status"] == "pending"),
+            "closed_orders": sum(1 for order in parsed_orders if order["status"] == "unpaid"),
+            "activated_amount_total": round(
+                sum(float(order["amount"] or 0) for order in parsed_orders if order["status"] == "activated"),
+                2,
+            ),
+        },
+        "orders": parsed_orders,
+    }
+
+
+def _find_local_order_by_keyword(db: Session, query_value: str) -> Optional[PaymentOrder]:
+    lookup_value = (query_value or "").strip()
+    if not lookup_value:
+        return None
+
+    return (
+        db.query(PaymentOrder)
+        .filter(
+            or_(
+                PaymentOrder.out_trade_no == lookup_value,
+                PaymentOrder.order_no == lookup_value,
+                PaymentOrder.custom_id == lookup_value,
+                PaymentOrder.remark == lookup_value,
+            )
+        )
+        .order_by(desc(PaymentOrder.id))
+        .first()
+    )
+
+
+async def _lookup_afdian_order_payload(db: Session, query_value: str) -> Dict[str, Any]:
+    lookup_value = (query_value or "").strip()
+    local_order = _find_local_order_by_keyword(db, lookup_value)
+
+    resolved_out_trade_no = lookup_value
+    if local_order and local_order.out_trade_no:
+        resolved_out_trade_no = local_order.out_trade_no
+
+    remote_payload = None
+    remote_order = None
+    remote_error = None
+    if resolved_out_trade_no:
+        try:
+            remote_payload = await afdian_service.query_order(out_trade_no=resolved_out_trade_no)
+            remote_orders = afdian_service.extract_orders(remote_payload)
+            if remote_orders:
+                remote_order = next(
+                    (
+                        item
+                        for item in remote_orders
+                        if afdian_service.get_out_trade_no(item) == resolved_out_trade_no
+                    ),
+                    remote_orders[0],
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            remote_error = str(exc)
+
+    return {
+        "query_value": lookup_value,
+        "resolved_out_trade_no": resolved_out_trade_no or None,
+        "local_found": local_order is not None,
+        "remote_found": remote_order is not None,
+        "remote_error": remote_error,
+        "local_order": _build_afdian_order_payload(local_order) if local_order else None,
+        "remote_order": _build_remote_afdian_order_payload(remote_order) if remote_order else None,
+        "remote_payload": remote_payload,
+    }
+
+
+def _resolve_activate_lookup(db: Session, query_value: str) -> tuple[Optional[str], Optional[str]]:
+    lookup_value = (query_value or "").strip()
+    local_order = _find_local_order_by_keyword(db, lookup_value)
+    if local_order is None:
+        return lookup_value or None, lookup_value or None
+
+    local_out_trade_no = (local_order.out_trade_no or "").strip() or None
+    local_custom_id = (local_order.custom_id or "").strip() or None
+    local_remark = (local_order.remark or "").strip() or None
+
+    if lookup_value == local_out_trade_no:
+        return local_out_trade_no, local_custom_id or local_remark or lookup_value
+
+    if lookup_value == local_custom_id or lookup_value == local_remark:
+        return local_out_trade_no, lookup_value
+
+    return local_out_trade_no, local_custom_id or local_remark or lookup_value
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -131,7 +459,26 @@ async def manage_users_ui(request: Request, db: Session = Depends(get_db)):
     if not admin_user:
         return RedirectResponse(url=request.url_for("login_ui_get"))
 
+    _close_expired_pending_orders(db)
     users = db.query(User).all()
+    afdian_summary_map = _build_user_afdian_summary_map(db)
+    for user in users:
+        setattr(
+            user,
+            "afdian_summary",
+            afdian_summary_map.get(
+                user.username,
+                {
+                    "order_count": 0,
+                    "activated_order_count": 0,
+                    "pending_order_count": 0,
+                    "unpaid_order_count": 0,
+                    "closed_order_count": 0,
+                    "activated_amount_total": 0.0,
+                    "latest_order_at": None,
+                },
+            ),
+        )
     now = datetime.now()
     soon = now + timedelta(days=7)
     user_stats = {
@@ -157,6 +504,48 @@ async def manage_users_ui(request: Request, db: Session = Depends(get_db)):
     )
 
 
+@router.get("/afdian", response_class=HTMLResponse)
+async def afdian_management_ui(request: Request, db: Session = Depends(get_db)):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return RedirectResponse(url=request.url_for("login_ui_get"))
+
+    _close_expired_pending_orders(db)
+    payload = _build_afdian_order_list_payload(db)
+    return templates.TemplateResponse(
+        "afdian_management.html",
+        {"request": request, "orders": payload["orders"], "summary": payload["summary"]},
+    )
+
+
+@router.get("/afdian/orders/{order_id}", response_class=JSONResponse)
+async def afdian_order_detail_ui(request: Request, order_id: int, db: Session = Depends(get_db)):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+
+    order = db.query(PaymentOrder).filter(PaymentOrder.id == order_id).first()
+    if not order:
+        return JSONResponse(status_code=404, content={"detail": "Order not found"})
+
+    return JSONResponse(content=jsonable_encoder(_build_afdian_order_payload(order)))
+
+
+@router.get("/manage_users/{user_id}/detail", response_class=JSONResponse)
+async def manage_user_detail_ui(request: Request, user_id: int, db: Session = Depends(get_db)):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+
+    _close_expired_pending_orders(db)
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        return JSONResponse(status_code=404, content={"detail": "User not found"})
+
+    payload = _build_user_detail_payload(db, user)
+    return JSONResponse(content=jsonable_encoder(payload))
+
+
 @router.post("/manage_users/parse_afdian_token", response_class=JSONResponse)
 async def parse_afdian_token_ui(
     request: Request,
@@ -176,6 +565,62 @@ async def parse_afdian_token_ui(
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    return JSONResponse(content=jsonable_encoder(payload))
+
+
+@router.post("/manage_users/query_afdian_order", response_class=JSONResponse)
+async def query_afdian_order_ui(
+    request: Request,
+    db: Session = Depends(get_db),
+    order_keyword: str = Form(...),
+):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+
+    lookup_value = (order_keyword or "").strip()
+    if not lookup_value:
+        return JSONResponse(status_code=400, content={"detail": "order_keyword is required"})
+
+    payload = await _lookup_afdian_order_payload(db, lookup_value)
+    return JSONResponse(content=jsonable_encoder(payload))
+
+
+@router.post("/manage_users/activate_afdian_order", response_class=JSONResponse)
+async def activate_afdian_order_ui(
+    request: Request,
+    db: Session = Depends(get_db),
+    order_keyword: str = Form(...),
+):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+
+    lookup_value = (order_keyword or "").strip()
+    if not lookup_value:
+        return JSONResponse(status_code=400, content={"detail": "order_keyword is required"})
+
+    from routers.user_center import activate_afdian_order_by_lookup
+
+    out_trade_no, remark_or_custom_id = _resolve_activate_lookup(db, lookup_value)
+
+    try:
+        result = await activate_afdian_order_by_lookup(
+            db=db,
+            out_trade_no=out_trade_no,
+            remark_or_custom_id=remark_or_custom_id,
+            source="admin_manual_activate",
+        )
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    payload = {
+        "lookup_value": lookup_value,
+        "resolved_out_trade_no": out_trade_no,
+        "resolved_custom_id": remark_or_custom_id,
+        **result,
+    }
+    payload["activation_source_label"] = _get_activation_source_label(payload.get("activation_source"))
     return JSONResponse(content=jsonable_encoder(payload))
 
 

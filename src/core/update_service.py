@@ -202,6 +202,7 @@ def get_translation_capabilities() -> Dict[str, Any]:
 
 def _load_translators_capabilities() -> List[Dict[str, Any]]:
     try:
+        os.environ.setdefault("translators_default_region", "CN")
         import translators as ts
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Failed to import translators library: %s", exc)

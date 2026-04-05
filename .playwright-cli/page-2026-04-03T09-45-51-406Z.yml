@@ -1,0 +1,61 @@
+- generic [ref=e3]:
+  - banner [ref=e31]:
+    - generic [ref=e32]:
+      - paragraph [ref=e33]: VoiceLinkVR Admin
+      - heading "Website operations console" [level=1] [ref=e34]
+    - generic [ref=e35]:
+      - generic [ref=e36]:
+        - strong [ref=e37]: Administrator
+        - generic [ref=e38]: preview-admin@local.test
+      - button "Sign Out" [ref=e39] [cursor=pointer]
+  - generic [ref=e40]: First admin created and signed in.
+  - navigation [ref=e41]:
+    - button "Dashboard" [ref=e42] [cursor=pointer]
+    - button "Users" [ref=e43] [cursor=pointer]
+    - button "Orders" [active] [ref=e44] [cursor=pointer]
+    - button "Stats" [ref=e45] [cursor=pointer]
+  - main [ref=e46]:
+    - generic [ref=e329]:
+      - generic [ref=e330]:
+        - article [ref=e331]:
+          - generic [ref=e332]: Total Orders
+          - strong [ref=e333]: "1"
+        - article [ref=e334]:
+          - generic [ref=e335]: Activated
+          - strong [ref=e336]: "0"
+        - article [ref=e337]:
+          - generic [ref=e338]: Pending
+          - strong [ref=e339]: "1"
+        - article [ref=e340]:
+          - generic [ref=e341]: Activated Amount
+          - strong [ref=e342]: CNY 0
+      - generic [ref=e343]:
+        - heading "Order lookup and activation" [level=2] [ref=e345]
+        - generic [ref=e346]:
+          - textbox "out_trade_no / order_no / custom_id / remark" [ref=e347]
+          - button "Lookup" [ref=e348] [cursor=pointer]
+          - button "Activate" [ref=e349] [cursor=pointer]
+          - button "Parse Token" [ref=e350] [cursor=pointer]
+      - generic [ref=e351]:
+        - generic [ref=e352]:
+          - heading "Order list" [level=2] [ref=e353]
+          - button "Refresh" [ref=e354] [cursor=pointer]
+        - table [ref=e355]:
+          - rowgroup [ref=e356]:
+            - row "Order User Status Action Amount Updated" [ref=e357]:
+              - columnheader "Order" [ref=e358]
+              - columnheader "User" [ref=e359]
+              - columnheader "Status" [ref=e360]
+              - columnheader "Action" [ref=e361]
+              - columnheader "Amount" [ref=e362]
+              - columnheader "Updated" [ref=e363]
+          - rowgroup [ref=e364]:
+            - row "#1 gAAAAABpz28Uu9PKtekc78nsH8ggxj2Pu3S6wLtzCZH1s65nXSUSPXj2mjtCb7LTyaKXEzB88gKdngiWeuzWXiWe9nB3MtGxRFEkIfi-39HqYJwpCXmHBVYYCqkdo_OLmx9R2_4U04UX0w1_Jq3fEg6XaFjcZ-rsY2G7dvrl-0uvGufnqEMwquwPD_ikRybxv5kD9n-hu9TuYQmye27Fpqw8aTkqzRv3nO0tarU-zQz7hsSvTEDdsZTezOqDGhBUyM8iqqFa6LgdFm67LI8LkWTc65B_u1WUBvhN9qbKujOBXx36ePGN9p8hBBpXiIAJMqpskEhwYtWW5G6LiwGOoPCqoA_7GqTc6KgocrY6lqUiKMSGDTy4G7KqN4k2jlY0NgFj4DNBzkOEre-66GFKKwhtNYoL_gOtZA== 1 Pending upgrade 5 2026-04-03 15:41" [ref=e365]:
+              - cell "#1 gAAAAABpz28Uu9PKtekc78nsH8ggxj2Pu3S6wLtzCZH1s65nXSUSPXj2mjtCb7LTyaKXEzB88gKdngiWeuzWXiWe9nB3MtGxRFEkIfi-39HqYJwpCXmHBVYYCqkdo_OLmx9R2_4U04UX0w1_Jq3fEg6XaFjcZ-rsY2G7dvrl-0uvGufnqEMwquwPD_ikRybxv5kD9n-hu9TuYQmye27Fpqw8aTkqzRv3nO0tarU-zQz7hsSvTEDdsZTezOqDGhBUyM8iqqFa6LgdFm67LI8LkWTc65B_u1WUBvhN9qbKujOBXx36ePGN9p8hBBpXiIAJMqpskEhwYtWW5G6LiwGOoPCqoA_7GqTc6KgocrY6lqUiKMSGDTy4G7KqN4k2jlY0NgFj4DNBzkOEre-66GFKKwhtNYoL_gOtZA==" [ref=e366]:
+                - strong [ref=e367]: "#1"
+                - generic [ref=e368]: gAAAAABpz28Uu9PKtekc78nsH8ggxj2Pu3S6wLtzCZH1s65nXSUSPXj2mjtCb7LTyaKXEzB88gKdngiWeuzWXiWe9nB3MtGxRFEkIfi-39HqYJwpCXmHBVYYCqkdo_OLmx9R2_4U04UX0w1_Jq3fEg6XaFjcZ-rsY2G7dvrl-0uvGufnqEMwquwPD_ikRybxv5kD9n-hu9TuYQmye27Fpqw8aTkqzRv3nO0tarU-zQz7hsSvTEDdsZTezOqDGhBUyM8iqqFa6LgdFm67LI8LkWTc65B_u1WUBvhN9qbKujOBXx36ePGN9p8hBBpXiIAJMqpskEhwYtWW5G6LiwGOoPCqoA_7GqTc6KgocrY6lqUiKMSGDTy4G7KqN4k2jlY0NgFj4DNBzkOEre-66GFKKwhtNYoL_gOtZA==
+              - cell "1" [ref=e369]
+              - cell "Pending" [ref=e370]
+              - cell "upgrade" [ref=e371]
+              - cell "5" [ref=e372]
+              - cell "2026-04-03 15:41" [ref=e373]

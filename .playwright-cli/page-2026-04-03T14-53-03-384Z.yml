@@ -1,0 +1,139 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e6]:
+      - paragraph [ref=e7]: VoiceLinkVR
+      - heading "ユーザーポータル" [level=1] [ref=e8]
+    - generic [ref=e9]:
+      - generic [ref=e10]: オンライン
+      - strong [ref=e11]: Portal Smoke
+      - paragraph [ref=e12]: portal_smoke_20260403_1443@example.com
+    - generic [ref=e13]:
+      - generic [ref=e14]: 言語
+      - combobox "言語" [ref=e15] [cursor=pointer]:
+        - option "中文"
+        - option "English"
+        - option "日本語" [selected]
+    - navigation [ref=e16]:
+      - link "OV 概要" [ref=e17] [cursor=pointer]:
+        - /url: /app/overview
+        - generic [ref=e18]: OV
+        - generic [ref=e19]: 概要
+      - link "BI 支払い" [ref=e20] [cursor=pointer]:
+        - /url: /app/sponsor
+        - generic [ref=e21]: BI
+        - generic [ref=e22]: 支払い
+      - link "OR 注文" [ref=e23] [cursor=pointer]:
+        - /url: /app/orders
+        - generic [ref=e24]: OR
+        - generic [ref=e25]: 注文
+      - link "US 使用量" [active] [ref=e26] [cursor=pointer]:
+        - /url: /app/usage
+        - generic [ref=e27]: US
+        - generic [ref=e28]: 使用量
+    - generic [ref=e29]:
+      - generic [ref=e30]:
+        - paragraph [ref=e31]: 1,500 / 1,500
+        - generic [ref=e32]: 枠が少ない場合はここから直接支払いへ進めます。 現在のプランをバックエンドから読み取り、そのまま支払いリンクを作成します。
+        - link "支払いページへ" [ref=e33] [cursor=pointer]:
+          - /url: /app/sponsor
+      - button "ログアウト" [ref=e34] [cursor=pointer]
+  - main [ref=e35]:
+    - generic [ref=e36]:
+      - generic [ref=e38]:
+        - paragraph [ref=e39]: 統一アカウントセンター
+        - heading "API 使用量" [level=2] [ref=e139]
+      - generic [ref=e41]:
+        - generic [ref=e42]: "現在のプラン: 元 5.00 / か月"
+        - generic [ref=e43]: P
+    - generic [ref=e140]:
+      - generic [ref=e142]:
+        - paragraph [ref=e143]: API 使用量
+        - heading "呼び出し数、枠消費、日別明細を確認" [level=2] [ref=e144]
+        - paragraph [ref=e145]: "このページは実際の `/api/account/usage` 応答を読み取り、リクエスト統計、枠消費、追加パック消費、日別明細を表示します。"
+      - generic [ref=e146]:
+        - generic [ref=e147]:
+          - generic [ref=e148]:
+            - generic [ref=e149]: 開始日
+            - textbox "開始日" [ref=e150]: 2026-03-28
+          - generic [ref=e151]:
+            - generic [ref=e152]: 終了日
+            - textbox "終了日" [ref=e153]: 2026-04-03
+        - button "照会" [ref=e155] [cursor=pointer]
+      - generic [ref=e156]:
+        - article [ref=e157]:
+          - generic [ref=e158]: 成功リクエスト
+          - strong [ref=e159]: "0"
+          - text: "総リクエスト: 0"
+        - article [ref=e160]:
+          - generic [ref=e161]: 期間内の枠消費
+          - strong [ref=e162]: "0"
+          - text: "本日の残り枠: 1,500"
+        - article [ref=e163]:
+          - generic [ref=e164]: 追加パック消費
+          - strong [ref=e165]: "0"
+          - text: "追加パック残高: 0"
+        - article [ref=e166]:
+          - generic [ref=e167]: 期限
+          - strong [ref=e168]: "-"
+          - text: 2026-03-28 ~ 2026-04-03
+      - generic [ref=e169]:
+        - heading "日別明細" [level=3] [ref=e171]
+        - table [ref=e173]:
+          - rowgroup [ref=e174]:
+            - row "日付 成功 失敗 制限 枠消費 残り" [ref=e175]:
+              - columnheader "日付" [ref=e176]
+              - columnheader "成功" [ref=e177]
+              - columnheader "失敗" [ref=e178]
+              - columnheader "制限" [ref=e179]
+              - columnheader "枠消費" [ref=e180]
+              - columnheader "残り" [ref=e181]
+          - rowgroup [ref=e182]:
+            - row "2026-03-28 0 0 0 0 1,500" [ref=e183]:
+              - cell "2026-03-28" [ref=e184]
+              - cell "0" [ref=e185]
+              - cell "0" [ref=e186]
+              - cell "0" [ref=e187]
+              - cell "0" [ref=e188]
+              - cell "1,500" [ref=e189]
+            - row "2026-03-29 0 0 0 0 1,500" [ref=e190]:
+              - cell "2026-03-29" [ref=e191]
+              - cell "0" [ref=e192]
+              - cell "0" [ref=e193]
+              - cell "0" [ref=e194]
+              - cell "0" [ref=e195]
+              - cell "1,500" [ref=e196]
+            - row "2026-03-30 0 0 0 0 1,500" [ref=e197]:
+              - cell "2026-03-30" [ref=e198]
+              - cell "0" [ref=e199]
+              - cell "0" [ref=e200]
+              - cell "0" [ref=e201]
+              - cell "0" [ref=e202]
+              - cell "1,500" [ref=e203]
+            - row "2026-03-31 0 0 0 0 1,500" [ref=e204]:
+              - cell "2026-03-31" [ref=e205]
+              - cell "0" [ref=e206]
+              - cell "0" [ref=e207]
+              - cell "0" [ref=e208]
+              - cell "0" [ref=e209]
+              - cell "1,500" [ref=e210]
+            - row "2026-04-01 0 0 0 0 1,500" [ref=e211]:
+              - cell "2026-04-01" [ref=e212]
+              - cell "0" [ref=e213]
+              - cell "0" [ref=e214]
+              - cell "0" [ref=e215]
+              - cell "0" [ref=e216]
+              - cell "1,500" [ref=e217]
+            - row "2026-04-02 0 0 0 0 1,500" [ref=e218]:
+              - cell "2026-04-02" [ref=e219]
+              - cell "0" [ref=e220]
+              - cell "0" [ref=e221]
+              - cell "0" [ref=e222]
+              - cell "0" [ref=e223]
+              - cell "1,500" [ref=e224]
+            - row "2026-04-03 0 0 0 0 1,500" [ref=e225]:
+              - cell "2026-04-03" [ref=e226]
+              - cell "0" [ref=e227]
+              - cell "0" [ref=e228]
+              - cell "0" [ref=e229]
+              - cell "0" [ref=e230]
+              - cell "1,500" [ref=e231]

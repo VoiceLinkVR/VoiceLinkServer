@@ -1,0 +1,80 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e6]:
+      - paragraph [ref=e7]: VoiceLinkVR
+      - heading "ユーザーポータル" [level=1] [ref=e8]
+    - generic [ref=e9]:
+      - generic [ref=e10]: オンライン
+      - strong [ref=e11]: Portal Smoke
+      - paragraph [ref=e12]: portal_smoke_20260403_1443@example.com
+    - generic [ref=e13]:
+      - generic [ref=e14]: 言語
+      - combobox "言語" [ref=e15] [cursor=pointer]:
+        - option "中文"
+        - option "English"
+        - option "日本語" [selected]
+    - navigation [ref=e16]:
+      - link "OV 概要" [ref=e17] [cursor=pointer]:
+        - /url: /app/overview
+        - generic [ref=e18]: OV
+        - generic [ref=e19]: 概要
+      - link "BI 支払い" [ref=e20] [cursor=pointer]:
+        - /url: /app/sponsor
+        - generic [ref=e21]: BI
+        - generic [ref=e22]: 支払い
+      - link "OR 注文" [active] [ref=e23] [cursor=pointer]:
+        - /url: /app/orders
+        - generic [ref=e24]: OR
+        - generic [ref=e25]: 注文
+      - link "US 使用量" [ref=e26] [cursor=pointer]:
+        - /url: /app/usage
+        - generic [ref=e27]: US
+        - generic [ref=e28]: 使用量
+    - generic [ref=e29]:
+      - generic [ref=e30]:
+        - paragraph [ref=e31]: 1,500 / 1,500
+        - generic [ref=e32]: 枠が少ない場合はここから直接支払いへ進めます。 現在のプランをバックエンドから読み取り、そのまま支払いリンクを作成します。
+        - link "支払いページへ" [ref=e33] [cursor=pointer]:
+          - /url: /app/sponsor
+      - button "ログアウト" [ref=e34] [cursor=pointer]
+  - main [ref=e35]:
+    - generic [ref=e36]:
+      - generic [ref=e38]:
+        - paragraph [ref=e39]: 統一アカウントセンター
+        - heading "注文履歴" [level=2] [ref=e232]
+      - generic [ref=e41]:
+        - generic [ref=e42]: "現在のプラン: 元 5.00 / か月"
+        - generic [ref=e43]: P
+    - generic [ref=e233]:
+      - generic [ref=e234]:
+        - generic [ref=e235]:
+          - paragraph [ref=e236]: 支払い履歴
+          - heading "支払い注文を確認し、未払いのものを続行する" [level=2] [ref=e237]
+          - paragraph [ref=e238]: 注文データはバックエンドの支払いテーブルから取得されます。未払いの行には支払いリンクが残ります。
+        - link "支払いページへ" [ref=e239] [cursor=pointer]:
+          - /url: /app/sponsor
+      - generic [ref=e240]:
+        - generic [ref=e242]:
+          - heading "注文一覧" [level=3] [ref=e243]
+          - paragraph [ref=e244]: 1 件
+        - table [ref=e246]:
+          - rowgroup [ref=e247]:
+            - row "注文 ID 操作 金額 チャネル 作成日時 状態 新しいタブで開く" [ref=e248]:
+              - columnheader "注文 ID" [ref=e249]
+              - columnheader "操作" [ref=e250]
+              - columnheader "金額" [ref=e251]
+              - columnheader "チャネル" [ref=e252]
+              - columnheader "作成日時" [ref=e253]
+              - columnheader "状態" [ref=e254]
+              - columnheader "新しいタブで開く" [ref=e255]
+          - rowgroup [ref=e256]:
+            - row "2 更新 元 5.00 Afdian 2026/04/03 22:52 処理中 支払いを続ける" [ref=e257]:
+              - cell "2" [ref=e258]
+              - cell "更新" [ref=e259]
+              - cell "元 5.00" [ref=e260]
+              - cell "Afdian" [ref=e261]
+              - cell "2026/04/03 22:52" [ref=e262]
+              - cell "処理中" [ref=e263]:
+                - generic [ref=e264]: 処理中
+              - cell "支払いを続ける" [ref=e265]:
+                - button "支払いを続ける" [ref=e266] [cursor=pointer]

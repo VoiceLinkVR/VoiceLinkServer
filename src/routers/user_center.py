@@ -12,6 +12,16 @@ from sqlalchemy.orm import Session
 
 from core.afdian_service import afdian_service
 from core.config import settings
+from core.plan_catalog import (
+    build_limit_rule,
+    build_limit_rule_for_price,
+    find_paid_tier_by_price,
+    get_first_paid_tier,
+    get_free_plan,
+    get_next_paid_tier,
+    get_paid_tiers,
+    resolve_plan_from_rule,
+)
 from core.rate_limiter import enforce_user_center_rate_limit
 from core.dependencies import (
     get_db,
@@ -22,7 +32,14 @@ from core.dependencies import (
 )
 from core.logging_config import logger
 from db.base import SessionLocal
-from db.models import PaymentOrder, User
+from db.models import (
+    PaymentOrder,
+    User,
+    normalize_payment_lookup_value,
+    payment_lookup_digest,
+    set_payment_order_custom_id,
+    set_payment_order_remark,
+)
 
 router = APIRouter()
 
@@ -64,8 +81,7 @@ class PaymentGuideRequest(BaseModel):
 
 
 def _get_price_step() -> float:
-    # Spec: fixed 5 CNY step.
-    return 5.0
+    return round(float(get_first_paid_tier()["monthly_price"]), 2)
 
 
 def _get_resource_increment_per_step() -> int:
@@ -87,7 +103,7 @@ def _get_addon_resource_increment() -> int:
 def _normalize_addon_amount(raw_price: Optional[float]) -> float:
     price = _safe_parse_amount(raw_price)
     if price is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="加油包金额无效")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="资源包金额无效")
 
     step = _get_addon_price_step()
     units = float(Decimal(str(price / step)).to_integral_value(rounding=ROUND_FLOOR))
@@ -95,7 +111,7 @@ def _normalize_addon_amount(raw_price: Optional[float]) -> float:
     if normalized + PRICE_EPSILON < step:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"加油包金额最低为 {step:.2f}",
+            detail=f"资源包金额最低为 {step:.2f}",
         )
     return normalized
 
@@ -318,7 +334,10 @@ def _has_active_subscription(user: Optional[User]) -> bool:
     if user is None or not user.is_active:
         return False
     is_expired, _ = is_user_expired(user)
-    return not is_expired
+    if is_expired:
+        return False
+    current_price, _ = _get_user_price_and_limit_rule(user)
+    return current_price > PRICE_EPSILON
 
 
 def _clear_expired_addon_balance(user: Optional[User]) -> None:
@@ -397,21 +416,18 @@ def _normalize_action(raw_action: Optional[str]) -> str:
 
 def _get_user_price_and_limit_rule(user: Optional[User]) -> tuple[float, str]:
     if user is None:
-        rule = (settings.AFDIAN_DEFAULT_LIMIT_RULE or "").strip()
-        return _infer_plan_price_from_rule(rule), rule
+        first_paid_tier = get_first_paid_tier()
+        rule = build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, first_paid_tier["id"], first_paid_tier["daily_quota"])
+        return round(float(first_paid_tier["monthly_price"]), 2), rule
 
     effective_rule = get_effective_user_limit_rule(user)
-    price = _infer_plan_price_from_rule(effective_rule)
+    plan = resolve_plan_from_rule(effective_rule, getattr(user, "expiration_date", None))
+    price = round(float(plan["monthly_price"]), 2)
     return price, effective_rule
 
 
 def _is_downgrade_allowed(user: Optional[User], is_expired: bool, current_price: float) -> bool:
-    # Spec: allow downgrade when account expired.
-    if user is None:
-        return False
-    if not is_expired:
-        return False
-    return current_price > _get_price_step() + PRICE_EPSILON
+    return False
 
 
 def _is_first_purchase_like(user: Optional[User], is_expired: bool) -> bool:
@@ -424,20 +440,31 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
     addon_step = round(_get_addon_price_step(), 2)
     addon_resource_step = _get_addon_resource_increment()
     current_price, effective_rule = _get_user_price_and_limit_rule(user)
+    free_plan = get_free_plan()
+    current_plan = resolve_plan_from_rule(
+        effective_rule,
+        getattr(user, "expiration_date", None) if user is not None else None,
+    )
+    next_plan = get_next_paid_tier(current_price)
 
     is_registered = user is not None
-
-    if not is_registered:
-        current_price = float(price_step)
 
     is_expired = False
     if user is not None:
         is_expired, _ = is_user_expired(user)
 
     first_purchase_like = _is_first_purchase_like(user, is_expired)
-    allowed_actions = ["renew"] if first_purchase_like else ["renew", "upgrade"]
-    if is_registered and _is_downgrade_allowed(user, is_expired, current_price):
-        allowed_actions.append("downgrade")
+    is_free_plan = current_price <= PRICE_EPSILON
+    allowed_actions = []
+    if not is_registered:
+        allowed_actions = ["renew"]
+    elif is_free_plan:
+        if next_plan is not None:
+            allowed_actions = ["upgrade"]
+    else:
+        allowed_actions = ["renew"]
+        if next_plan is not None:
+            allowed_actions.append("upgrade")
     addon_allowed = _is_new_quota_purchase_enabled() and _has_active_subscription(user)
     if addon_allowed:
         allowed_actions.append("addon")
@@ -453,49 +480,50 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
     }
     guide_token = _build_payment_guide_token(username, guide_payload)
 
+    renew_target_price = round(float(current_price), 2)
+    renew_target_quota = int(current_plan["daily_quota"])
+    if not is_registered:
+        first_paid_tier = get_first_paid_tier()
+        renew_target_price = round(float(first_paid_tier["monthly_price"]), 2)
+        renew_target_quota = int(first_paid_tier["daily_quota"])
+
     renew_option = {
-        "allowed": True,
+        "allowed": (not is_registered) or (not is_free_plan),
+        "readonly": True,
+        "default_monthly_price": renew_target_price,
+        "min_monthly_price": renew_target_price,
+        "max_monthly_price": renew_target_price,
+        "step": price_step,
+        "target_resource_quota_preview": renew_target_quota,
+    }
+
+    upgrade_option = {
+        "allowed": bool((not is_registered and get_first_paid_tier()) or next_plan is not None or (is_registered and is_free_plan and get_first_paid_tier())),
+        "readonly": True,
+        "default_monthly_price": round(float((next_plan or get_first_paid_tier())["monthly_price"]), 2)
+        if (next_plan or get_first_paid_tier())
+        else None,
+        "min_monthly_price": round(float((next_plan or get_first_paid_tier())["monthly_price"]), 2)
+        if (next_plan or get_first_paid_tier())
+        else None,
+        "max_monthly_price": round(float((next_plan or get_first_paid_tier())["monthly_price"]), 2)
+        if (next_plan or get_first_paid_tier())
+        else None,
+        "step": price_step,
+        "target_resource_quota_preview": int((next_plan or get_first_paid_tier())["daily_quota"])
+        if (next_plan or get_first_paid_tier())
+        else None,
+    }
+
+    downgrade_allowed = False
+    downgrade_option = {
+        "allowed": downgrade_allowed,
         "readonly": True,
         "default_monthly_price": round(float(current_price), 2),
         "min_monthly_price": round(float(current_price), 2),
         "max_monthly_price": round(float(current_price), 2),
         "step": price_step,
-        "target_resource_quota_preview": _calculate_daily_limit_from_price(current_price),
-    }
-
-    if first_purchase_like:
-        # Unregistered or expired accounts can choose any first-purchase plan.
-        renew_option = {
-            "allowed": True,
-            "readonly": False,
-            "default_monthly_price": round(float(current_price if is_registered else price_step), 2),
-            "min_monthly_price": float(price_step),
-            "max_monthly_price": None,
-            "step": price_step,
-            "target_resource_quota_preview": _calculate_daily_limit_from_price(
-                float(current_price if is_registered else price_step)
-            ),
-        }
-
-    upgrade_option = {
-        "allowed": bool(is_registered and not first_purchase_like),
-        "readonly": False,
-        "default_monthly_price": round(float(max(current_price + price_step, price_step)), 2),
-        "min_monthly_price": round(float(max(current_price + price_step, price_step)), 2),
-        "max_monthly_price": None,
-        "step": price_step,
-        "target_resource_quota_preview": _calculate_daily_limit_from_price(float(max(current_price + price_step, price_step))),
-    }
-
-    downgrade_allowed = bool(is_registered) and _is_downgrade_allowed(user, is_expired, current_price)
-    downgrade_option = {
-        "allowed": downgrade_allowed,
-        "readonly": False,
-        "default_monthly_price": round(float(max(price_step, current_price - price_step)), 2),
-        "min_monthly_price": float(price_step),
-        "max_monthly_price": round(float(max(price_step, current_price - price_step)), 2),
-        "step": price_step,
-        "target_resource_quota_preview": _calculate_daily_limit_from_price(float(max(price_step, current_price - price_step))),
+        "target_resource_quota_preview": int(current_plan["daily_quota"]),
     }
 
     addon_option = {
@@ -511,19 +539,19 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
     }
 
     display_monthly_price = round(float(current_price), 2)
-    display_plan_name = (
-        f"￥{display_monthly_price:.2f}/月" if is_registered else "首次开通（自选档位）"
-    )
+    display_plan_name = "Free" if is_free_plan else f"￥{display_monthly_price:.2f}/月"
+    if not is_registered:
+        display_plan_name = "首次开通（默认免费档，付费升级）"
     display_resource_summary = (
-        f"{_calculate_daily_limit_from_price(current_price)}/day"
+        f"{int(current_plan['daily_quota'])}/day"
         if is_registered
-        else f"起步 {_calculate_daily_limit_from_price(float(price_step))}/day"
+        else f"免费档 {int(free_plan['daily_quota'])}/day"
     )
 
     anchor_reason = (
         "unregistered"
         if not is_registered
-        else ("expired_downgrade_allowed" if downgrade_allowed else "current")
+        else ("free" if is_free_plan else "current")
     )
 
     return {
@@ -536,7 +564,7 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
         "resource_increment_per_step": resource_step,
         "display_plan_name": display_plan_name,
         "display_monthly_price": display_monthly_price,
-        "display_resource_quota": _calculate_daily_limit_from_price(current_price),
+        "display_resource_quota": int(current_plan["daily_quota"]),
         "display_resource_summary": display_resource_summary,
         "anchor_reason": anchor_reason,
         "allowed_actions": allowed_actions,
@@ -565,28 +593,20 @@ def _normalize_plan_price(raw_price: Optional[float]) -> float:
     if price is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="套餐价格无效")
 
-    step = _get_price_step()
-    if price + PRICE_EPSILON < step:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"套餐月价最低为 {step:.2f}",
-        )
-
-    units = float(Decimal(str(price / step)).to_integral_value(rounding=ROUND_FLOOR))
-    normalized = round(units * step, 2)
-    if normalized + PRICE_EPSILON < step:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"套餐月价最低为 {step:.2f}",
-        )
+    normalized = round(float(price), 2)
+    if find_paid_tier_by_price(normalized) is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="套餐价格未配置")
     return normalized
 
 
 def _calculate_daily_limit_from_price(plan_price: float) -> int:
-    step = _get_price_step()
-    increment = _get_resource_increment_per_step()
-    units = int((Decimal(str(plan_price)) / Decimal(str(step))).to_integral_value(rounding=ROUND_FLOOR))
-    return max(1, units) * increment
+    normalized = round(float(plan_price or 0), 2)
+    if normalized <= 0:
+        return int(get_free_plan()["daily_quota"])
+    tier = find_paid_tier_by_price(normalized)
+    if tier is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="套餐价格未配置")
+    return int(tier["daily_quota"])
 
 
 def _calculate_price_from_daily_limit(daily_limit: Optional[int]) -> Optional[float]:
@@ -599,11 +619,8 @@ def _calculate_price_from_daily_limit(daily_limit: Optional[int]) -> Optional[fl
 
 
 def _infer_plan_price_from_rule(limit_rule: Optional[str]) -> float:
-    daily_limit = _extract_daily_limit(limit_rule)
-    inferred = _calculate_price_from_daily_limit(daily_limit)
-    if inferred is not None:
-        return inferred
-    return round(_get_price_step(), 2)
+    plan = resolve_plan_from_rule(limit_rule)
+    return round(float(plan["monthly_price"]), 2)
 
 
 def _replace_daily_limit_rule(base_rule: Optional[str], daily_limit: int) -> str:
@@ -628,16 +645,17 @@ def _replace_daily_limit_rule(base_rule: Optional[str], daily_limit: int) -> str
 
 
 def _build_limit_rule_for_plan(base_rule: Optional[str], plan_price: float) -> str:
-    return _replace_daily_limit_rule(base_rule, _calculate_daily_limit_from_price(plan_price))
+    return build_limit_rule_for_price(base_rule, plan_price)
 
 
 def _build_new_afdian_user(username: str, password: str) -> User:
+    free_plan = get_free_plan()
     return User(
         username=username,
         password=hash_password(password),
         is_admin=False,
         is_active=True,
-        limit_rule=settings.AFDIAN_DEFAULT_LIMIT_RULE,
+        limit_rule=build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"]),
     )
 
 
@@ -655,11 +673,16 @@ def _find_local_order(
         order = db.query(PaymentOrder).filter(PaymentOrder.order_no == order_no).first()
         if order:
             return order
-    if custom_id:
-        order = db.query(PaymentOrder).filter(PaymentOrder.custom_id == custom_id).first()
-        if order:
+    lookup_value = normalize_payment_lookup_value(custom_id)
+    lookup_digest = payment_lookup_digest(lookup_value)
+    if lookup_digest:
+        order = db.query(PaymentOrder).filter(PaymentOrder.custom_id_digest == lookup_digest).first()
+        if order and normalize_payment_lookup_value(order.custom_id) == lookup_value:
             return order
-        return db.query(PaymentOrder).filter(PaymentOrder.remark == custom_id).first()
+
+        order = db.query(PaymentOrder).filter(PaymentOrder.remark_digest == lookup_digest).first()
+        if order and normalize_payment_lookup_value(order.remark) == lookup_value:
+            return order
     return None
 
 
@@ -674,12 +697,12 @@ def _ensure_order_record(
         record = PaymentOrder(
             order_no=order_no or None,
             out_trade_no=out_trade_no or None,
-            custom_id=custom_id or None,
-            remark=custom_id or None,
             status="pending",
             created_at=_utc_now_naive(),
             updated_at=_utc_now_naive(),
         )
+        set_payment_order_custom_id(record, custom_id)
+        set_payment_order_remark(record, custom_id)
         db.add(record)
     return record
 
@@ -758,12 +781,12 @@ def _sync_local_order_from_remote(
     if out_trade_no:
         local_order.out_trade_no = out_trade_no
     if custom_id:
-        local_order.custom_id = custom_id
+        set_payment_order_custom_id(local_order, custom_id)
     remark = str(remote_order.get("remark") or "").strip()
     if remark:
-        local_order.remark = remark
+        set_payment_order_remark(local_order, remark)
     elif custom_id:
-        local_order.remark = custom_id
+        set_payment_order_remark(local_order, custom_id)
     if remote_amount is not None:
         local_order.amount = remote_amount
     if local_order.status != "activated":
@@ -831,7 +854,7 @@ async def activate_remote_afdian_order(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail) from exc
 
     if afdian_service.is_custom_id_expired(custom_payload):
-        detail = "custom_id 已过期，请重新生成发电链接"
+        detail = "custom_id 已过期，请重新生成支付链接"
         _record_order_activation_failure(
             db,
             local_order,
@@ -911,7 +934,7 @@ async def activate_remote_afdian_order(
         if plan_price_raw is None and amount is not None:
             plan_price_raw = round(amount / max(1, months), 2)
         if plan_price_raw is None:
-            base_rule = user.limit_rule if user is not None else settings.AFDIAN_DEFAULT_LIMIT_RULE
+            base_rule = user.limit_rule if user is not None else settings.FREE_PLAN_LIMIT_RULE
             plan_price_raw = _infer_plan_price_from_rule(base_rule)
         try:
             plan_price = _normalize_plan_price(float(plan_price_raw))
@@ -980,7 +1003,7 @@ async def activate_remote_afdian_order(
         extend_days = int(settings.AFDIAN_RENEW_DAYS) * months
         user.expiration_date = _extend_date(user.expiration_date, extend_days)
         user.limit_rule = _build_limit_rule_for_plan(
-            user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE,
+            user.limit_rule or settings.FREE_PLAN_LIMIT_RULE,
             final_plan_price,
         )
         user.boost_expiration_date = None
@@ -1031,7 +1054,7 @@ async def activate_remote_afdian_order(
 
         user.expiration_date = now_utc + timedelta(days=total_days_int)
         user.limit_rule = _build_limit_rule_for_plan(
-            user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE,
+            user.limit_rule or settings.FREE_PLAN_LIMIT_RULE,
             plan_price,
         )
         user.boost_expiration_date = None
@@ -1065,7 +1088,7 @@ async def activate_remote_afdian_order(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
         user.limit_rule = _build_limit_rule_for_plan(
-            user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE,
+            user.limit_rule or settings.FREE_PLAN_LIMIT_RULE,
             plan_price,
         )
         user.boost_expiration_date = None
@@ -1075,7 +1098,7 @@ async def activate_remote_afdian_order(
 
     if action == "addon":
         if not _is_new_quota_purchase_enabled():
-            detail = "加油包仅在新资源模式下可激活"
+            detail = "资源包仅在新资源模式下可激活"
             _record_order_activation_failure(
                 db,
                 local_order,
@@ -1087,7 +1110,7 @@ async def activate_remote_afdian_order(
             )
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
         if is_new_user or not _has_active_subscription(user):
-            detail = "加油包需要有效订阅才能激活"
+            detail = "资源包需要有效订阅才能激活"
             _record_order_activation_failure(
                 db,
                 local_order,
@@ -1099,7 +1122,7 @@ async def activate_remote_afdian_order(
             )
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
         if addon_resource_amount <= 0:
-            detail = "加油包资源额度解析失败"
+            detail = "资源包额度解析失败"
             _record_order_activation_failure(
                 db,
                 local_order,
@@ -1118,8 +1141,8 @@ async def activate_remote_afdian_order(
 
     local_order.order_no = order_no
     local_order.out_trade_no = out_trade_no
-    local_order.custom_id = custom_id
-    local_order.remark = custom_id
+    set_payment_order_custom_id(local_order, custom_id)
+    set_payment_order_remark(local_order, custom_id)
     local_order.username = username
     local_order.action = action
     local_order.amount = amount
@@ -1217,7 +1240,7 @@ async def create_payment_link(
     username = payload.username.strip()
     password = payload.password
     if _is_test_user(username):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="测试账户不允许直接发电，请填写正式账号")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="测试账户不允许直接创建支付链接，请填写正式账号")
 
     user = db.query(User).filter(User.username == username).first()
     if user and not verify_password(password, user.password):
@@ -1247,9 +1270,9 @@ async def create_payment_link(
 
     if action == "addon":
         if not _is_new_quota_purchase_enabled():
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="加油包仅在新资源模式下可购买")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="资源包仅在新资源模式下可购买")
         if not _has_active_subscription(user):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="加油包需要在有效订阅期间购买")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="资源包需要在有效订阅期间购买")
 
         if payload.custom_price is not None:
             plan_price = _normalize_addon_amount(payload.custom_price)
@@ -1310,7 +1333,7 @@ async def create_payment_link(
     donation_url = afdian_service.build_donation_url(custom_id, donation_amount)
 
     pending = _ensure_order_record(db, order_no=None, out_trade_no=None, custom_id=custom_id)
-    pending.remark = custom_id
+    set_payment_order_remark(pending, custom_id)
     pending.username = username
     pending.action = action
     pending.amount = donation_amount
@@ -1371,7 +1394,7 @@ async def activate_order(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     if afdian_service.is_custom_id_expired(custom_payload):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="custom_id 已过期，请重新生成发电链接")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="custom_id 已过期，请重新生成支付链接")
 
     username = str(custom_payload.get("username") or "").strip()
     password = str(custom_payload.get("password") or "")
@@ -1409,7 +1432,7 @@ async def activate_order(
         if plan_price_raw is None and amount is not None:
             plan_price_raw = round(amount / max(1, months), 2)
         if plan_price_raw is None:
-            base_rule = user.limit_rule if user is not None else settings.AFDIAN_DEFAULT_LIMIT_RULE
+            base_rule = user.limit_rule if user is not None else settings.FREE_PLAN_LIMIT_RULE
             plan_price_raw = _infer_plan_price_from_rule(base_rule)
         plan_price = _normalize_plan_price(float(plan_price_raw))
 
@@ -1440,7 +1463,7 @@ async def activate_order(
         final_plan_price = plan_price if first_purchase_like else current_price
         extend_days = int(settings.AFDIAN_RENEW_DAYS) * months
         user.expiration_date = _extend_date(user.expiration_date, extend_days)
-        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE, final_plan_price)
+        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.FREE_PLAN_LIMIT_RULE, final_plan_price)
         user.boost_expiration_date = None
         user.boost_limit_rule = None
         user.is_active = True
@@ -1473,7 +1496,7 @@ async def activate_order(
         converted_remaining_days = float(total_days_int)
 
         user.expiration_date = now_utc + timedelta(days=total_days_int)
-        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE, plan_price)
+        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.FREE_PLAN_LIMIT_RULE, plan_price)
         user.boost_expiration_date = None
         user.boost_limit_rule = None
         user.is_active = True
@@ -1489,7 +1512,7 @@ async def activate_order(
         if is_new_user:
             user = _build_new_afdian_user(username, password)
             db.add(user)
-        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.AFDIAN_DEFAULT_LIMIT_RULE, plan_price)
+        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.FREE_PLAN_LIMIT_RULE, plan_price)
         user.boost_expiration_date = None
         user.boost_limit_rule = None
         user.is_active = True
@@ -1497,11 +1520,11 @@ async def activate_order(
 
     if action == "addon":
         if not _is_new_quota_purchase_enabled():
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="加油包仅在新资源模式下可激活")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="资源包仅在新资源模式下可激活")
         if is_new_user or not _has_active_subscription(user):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="加油包需要有效订阅才能激活")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="资源包需要有效订阅才能激活")
         if addon_resource_amount <= 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="加油包资源额度解析失败")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="资源包额度解析失败")
 
         user.addon_resource_balance = int(user.addon_resource_balance or 0) + addon_resource_amount
         user.addon_resource_total = int(user.addon_resource_total or 0) + addon_resource_amount
@@ -1510,8 +1533,8 @@ async def activate_order(
 
     local_order.order_no = order_no
     local_order.out_trade_no = out_trade_no
-    local_order.custom_id = custom_id
-    local_order.remark = custom_id
+    set_payment_order_custom_id(local_order, custom_id)
+    set_payment_order_remark(local_order, custom_id)
     local_order.username = username
     local_order.action = action
     local_order.amount = amount

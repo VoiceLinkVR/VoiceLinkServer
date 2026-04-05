@@ -1,0 +1,4 @@
+- generic [ref=e4]:
+  - paragraph [ref=e5]: VoiceLinkVR Admin
+  - heading "Preparing the management console" [level=1] [ref=e6]
+  - paragraph [ref=e7]: Loading session state, users, billing orders, and runtime stats.

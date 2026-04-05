@@ -1,0 +1,62 @@
+- generic [ref=e3]:
+  - navigation [ref=e4]:
+    - generic [ref=e7]:
+      - paragraph [ref=e8]: VoiceLinkVR
+      - strong [ref=e9]: Portal
+    - generic [ref=e10]:
+      - generic [ref=e11]:
+        - generic [ref=e12]: Language
+        - combobox "Language" [ref=e64] [cursor=pointer]:
+          - option "中文"
+          - option "English" [selected]
+          - option "日本語"
+      - link "Sign in" [ref=e65] [cursor=pointer]:
+        - /url: /auth
+      - link "Open portal" [ref=e66] [cursor=pointer]:
+        - /url: /auth
+  - main [ref=e16]:
+    - generic [ref=e17]:
+      - generic [ref=e18]: Unified account and quota center
+      - heading "Check account, quota, payment, and API usage directly on the website the new portal direction" [level=1] [ref=e67]
+      - paragraph [ref=e20]: This is no longer a mock page. The portal now reads real backend account data, billing guides, and usage statistics while matching the new client payment flow.
+      - generic [ref=e21]:
+        - link "Open portal" [ref=e68] [cursor=pointer]:
+          - /url: /auth
+        - link "Sign in" [ref=e69] [cursor=pointer]:
+          - /url: /auth
+        - link "GitHub" [ref=e24] [cursor=pointer]:
+          - /url: https://github.com/VoiceLinkVR/VRCLS
+      - generic [ref=e25]:
+        - generic [ref=e70]:
+          - strong [ref=e71]: Email login
+          - generic [ref=e72]: website account entry
+        - generic [ref=e73]:
+          - strong [ref=e74]: Dynamic tiers
+          - generic [ref=e75]: payment guided by backend rules
+        - generic [ref=e76]:
+          - strong [ref=e77]: API Usage
+          - generic [ref=e78]: daily details on a dedicated page
+    - generic [ref=e41]:
+      - generic [ref=e42]:
+        - text: GET /auth/me
+        - strong [ref=e43]: Resolve current website session
+      - generic [ref=e44]:
+        - text: GET /api/account/profile
+        - strong [ref=e45]: Load account, plan, and quota
+      - generic [ref=e46]:
+        - text: POST /api/billing/order-intents
+        - strong [ref=e47]: Create payment link from the signed-in identity
+  - generic [ref=e50]:
+    - generic [ref=e51]:
+      - paragraph [ref=e52]: Portal
+      - heading "The website is now a real user portal instead of a placeholder for the old flow." [level=2] [ref=e79]
+    - generic [ref=e54]:
+      - article [ref=e80]:
+        - heading "One identity" [level=3] [ref=e81]
+        - paragraph [ref=e82]: The website and client work around the same backend user identity.
+      - article [ref=e83]:
+        - heading "Guide-driven amounts" [level=3] [ref=e84]
+        - paragraph [ref=e85]: Amounts, quota increments, and upgrade boundaries come from the backend guide.
+      - article [ref=e86]:
+        - heading "Clear usage visibility" [level=3] [ref=e87]
+        - paragraph [ref=e88]: API calls, quota usage, expiration, and daily breakdown are now separated into a dedicated page.

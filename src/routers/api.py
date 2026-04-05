@@ -17,6 +17,7 @@ from core.dependencies import (
     get_current_user_for_status,
     is_user_expired,
     get_effective_user_limit_rule,
+    utcnow_naive,
 )
 from core.quota_service import (
     QUOTA_SOURCE_ADDON,
@@ -185,7 +186,9 @@ async def login(db: Session = Depends(get_db), user_credentials: UserLogin = Bod
         )
 
     logger.info(f"[LOGIN] 用户登录成功: {user_credentials.username}")
-    access_token = create_access_token(data={"sub": user.username})
+    user.last_login_at = utcnow_naive()
+    db.commit()
+    access_token = create_access_token(data={"sub": user.username, "uid": user.id, "type": "access"})
     return {"message": "Login successful", "access_token": access_token}
 
 @router.get("/latestVersionInfo")

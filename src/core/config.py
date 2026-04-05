@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "aaargwgwqewe"
     SESSION_SECRET_KEY: str = "feefadfagagagwadsee"
     JWT_ACCESS_TOKEN_EXPIRES_MINUTES: int = 10080  # 7 days
+    REFRESH_TOKEN_EXPIRES_DAYS: int = 30
+    PORTAL_SESSION_EXPIRES_DAYS: int = 30
+    PORTAL_SESSION_KEY: str = "portal_session_id"
+    PORTAL_SESSION_USER_KEY: str = "portal_user_id"
     JWT_ALGORITHM: str = "HS256"
     WHISPER_MODEL: str = "Systran/faster-whisper-large-v3"
     SQL_PATH: str = f"sqlite:///{project_root}/data/db/users.db"
@@ -67,10 +71,12 @@ class Settings(BaseSettings):
     AFDIAN_BOOST_DAYS: int = 30
     AFDIAN_BOOST_PRICE_STEP: float = 5.0
     AFDIAN_BOOST_DAILY_INCREMENT: int = 1500
+    FREE_PLAN_LIMIT_RULE: str = "800/day;8/minute"
     AFDIAN_DEFAULT_LIMIT_RULE: str = "1500/day"
     AFDIAN_BOOST_LIMIT_RULE: str = ""
     AFDIAN_ADDON_PRICE_STEP: float = 5.0
     AFDIAN_ADDON_RESOURCE_INCREMENT: int = 5000
+    PLAN_CATALOG_PATH: str = f"{project_root}/data/plan_catalog.json"
     AFDIAN_QUERY_SCAN_PAGES: int = 3
     AFDIAN_CUSTOM_ID_TTL_SECONDS: int = 604800
     AFDIAN_WEBHOOK_FORWARD_ENABLED: bool = False

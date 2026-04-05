@@ -1,0 +1,140 @@
+- generic [ref=e3]:
+  - banner [ref=e31]:
+    - generic [ref=e32]:
+      - paragraph [ref=e33]: VoiceLinkVR Admin
+      - heading "Website operations console" [level=1] [ref=e34]
+    - generic [ref=e35]:
+      - generic [ref=e36]:
+        - strong [ref=e37]: Administrator
+        - generic [ref=e38]: preview-admin@local.test
+      - button "Sign Out" [ref=e39] [cursor=pointer]
+  - generic [ref=e40]: First admin created and signed in.
+  - navigation [ref=e41]:
+    - button "Dashboard" [ref=e42] [cursor=pointer]
+    - button "Users" [active] [ref=e43] [cursor=pointer]
+    - button "Orders" [ref=e44] [cursor=pointer]
+    - button "Stats" [ref=e45] [cursor=pointer]
+  - main [ref=e46]:
+    - generic [ref=e208]:
+      - generic [ref=e209]:
+        - article [ref=e210]:
+          - generic [ref=e211]: Total Users
+          - strong [ref=e212]: "3"
+        - article [ref=e213]:
+          - generic [ref=e214]: Admin Users
+          - strong [ref=e215]: "1"
+        - article [ref=e216]:
+          - generic [ref=e217]: Expiring in 7 Days
+          - strong [ref=e218]: "0"
+        - article [ref=e219]:
+          - generic [ref=e220]: Non Permanent
+          - strong [ref=e221]: "0"
+      - generic [ref=e222]:
+        - generic [ref=e223]:
+          - generic [ref=e224]:
+            - heading "Create user" [level=2] [ref=e225]
+            - button "Reset" [ref=e226] [cursor=pointer]
+          - generic [ref=e227]:
+            - generic [ref=e228]:
+              - generic [ref=e229]: Username
+              - textbox "Username" [ref=e230]
+            - generic [ref=e231]:
+              - generic [ref=e232]: Display Name
+              - textbox "Display Name" [ref=e233]
+            - generic [ref=e234]:
+              - generic [ref=e235]: Email
+              - textbox "Email" [ref=e236]
+            - generic [ref=e237]:
+              - generic [ref=e238]: Password
+              - textbox "Password" [ref=e239]
+            - generic [ref=e240]:
+              - generic [ref=e241]: Limit Rule
+              - textbox "Limit Rule" [ref=e242]:
+                - /placeholder: 800/day;8/minute
+            - generic [ref=e243]:
+              - generic [ref=e244]: Expiration
+              - textbox "Expiration" [ref=e245]
+            - generic [ref=e246]:
+              - checkbox "Admin" [ref=e247]
+              - text: Admin
+            - generic [ref=e248]:
+              - checkbox "Active" [checked] [ref=e249]
+              - text: Active
+          - button "Create User" [ref=e250] [cursor=pointer]
+        - generic [ref=e251]:
+          - generic [ref=e252]:
+            - heading "Edit selected user" [level=2] [ref=e253]
+            - button "Clear" [disabled] [ref=e254]
+          - generic [ref=e255]:
+            - generic [ref=e256]:
+              - generic [ref=e257]: Username
+              - textbox "Username" [disabled] [ref=e258]
+            - generic [ref=e259]:
+              - generic [ref=e260]: Display Name
+              - textbox "Display Name" [disabled] [ref=e261]
+            - generic [ref=e262]:
+              - generic [ref=e263]: Email
+              - textbox "Email" [disabled] [ref=e264]
+            - generic [ref=e265]:
+              - generic [ref=e266]: New Password
+              - textbox "New Password" [disabled] [ref=e267]
+            - generic [ref=e268]:
+              - generic [ref=e269]: Limit Rule
+              - textbox "Limit Rule" [disabled] [ref=e270]
+            - generic [ref=e271]:
+              - generic [ref=e272]: Expiration
+              - textbox "Expiration" [disabled] [ref=e273]
+            - generic [ref=e274]:
+              - checkbox "Admin" [disabled] [ref=e275]
+              - text: Admin
+            - generic [ref=e276]:
+              - checkbox "Active" [checked] [disabled] [ref=e277]
+              - text: Active
+          - button "Update User" [disabled] [ref=e278]
+      - generic [ref=e279]:
+        - generic [ref=e280]:
+          - heading "User directory" [level=2] [ref=e281]
+          - button "Refresh" [ref=e282] [cursor=pointer]
+        - table [ref=e283]:
+          - rowgroup [ref=e284]:
+            - row "User Role Status Limit Orders Actions" [ref=e285]:
+              - columnheader "User" [ref=e286]
+              - columnheader "Role" [ref=e287]
+              - columnheader "Status" [ref=e288]
+              - columnheader "Limit" [ref=e289]
+              - columnheader "Orders" [ref=e290]
+              - columnheader "Actions" [ref=e291]
+          - rowgroup [ref=e292]:
+            - row "Administrator admin Admin Active - 0 Open Delete" [ref=e293]:
+              - cell "Administrator admin" [ref=e294]:
+                - strong [ref=e295]: Administrator
+                - generic [ref=e296]: admin
+              - cell "Admin" [ref=e297]
+              - cell "Active" [ref=e298]
+              - cell "-" [ref=e299]
+              - cell "0" [ref=e300]
+              - cell "Open Delete" [ref=e301]:
+                - button "Open" [ref=e302] [cursor=pointer]
+                - button "Delete" [disabled] [ref=e303]
+            - row "boyqiu001 boyqiu001 Member Active - 0 Open Delete" [ref=e304]:
+              - cell "boyqiu001 boyqiu001" [ref=e305]:
+                - strong [ref=e306]: boyqiu001
+                - generic [ref=e307]: boyqiu001
+              - cell "Member" [ref=e308]
+              - cell "Active" [ref=e309]
+              - cell "-" [ref=e310]
+              - cell "0" [ref=e311]
+              - cell "Open Delete" [ref=e312]:
+                - button "Open" [ref=e313] [cursor=pointer]
+                - button "Delete" [ref=e314] [cursor=pointer]
+            - row "1 1 Member Active - 1 Open Delete" [ref=e315]:
+              - cell "1 1" [ref=e316]:
+                - strong [ref=e317]: "1"
+                - generic [ref=e318]: "1"
+              - cell "Member" [ref=e319]
+              - cell "Active" [ref=e320]
+              - cell "-" [ref=e321]
+              - cell "1" [ref=e322]
+              - cell "Open Delete" [ref=e323]:
+                - button "Open" [ref=e324] [cursor=pointer]
+                - button "Delete" [ref=e325] [cursor=pointer]

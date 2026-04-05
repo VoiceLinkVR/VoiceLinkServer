@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from core.afdian_service import afdian_service
 from core.dependencies import get_db, hash_password, verify_password, get_admin_user_from_session
 from core.logging_config import logger
-from db.models import User, RequestLog, PaymentOrder
+from db.models import PaymentOrder, RequestLog, User, normalize_payment_lookup_value, payment_lookup_digest
 
 router = APIRouter(
     tags=["UI Management"],
@@ -341,19 +341,33 @@ def _find_local_order_by_keyword(db: Session, query_value: str) -> Optional[Paym
     if not lookup_value:
         return None
 
-    return (
+    lookup_digest = payment_lookup_digest(lookup_value)
+    if not lookup_digest:
+        return None
+
+    order = (
         db.query(PaymentOrder)
         .filter(
             or_(
                 PaymentOrder.out_trade_no == lookup_value,
                 PaymentOrder.order_no == lookup_value,
-                PaymentOrder.custom_id == lookup_value,
-                PaymentOrder.remark == lookup_value,
+                PaymentOrder.custom_id_digest == lookup_digest,
+                PaymentOrder.remark_digest == lookup_digest,
             )
         )
         .order_by(desc(PaymentOrder.id))
         .first()
     )
+    if order is None:
+        return None
+
+    if order.out_trade_no == lookup_value or order.order_no == lookup_value:
+        return order
+    if normalize_payment_lookup_value(order.custom_id) == lookup_value:
+        return order
+    if normalize_payment_lookup_value(order.remark) == lookup_value:
+        return order
+    return None
 
 
 async def _lookup_afdian_order_payload(db: Session, query_value: str) -> Dict[str, Any]:
@@ -417,7 +431,7 @@ def _resolve_activate_lookup(db: Session, query_value: str) -> tuple[Optional[st
 @router.get("/login", response_class=HTMLResponse)
 async def login_ui_get(request: Request):
     messages = request.session.pop("flash_messages", [])
-    return templates.TemplateResponse("login.html", {"request": request, "messages": messages})
+    return templates.TemplateResponse(request, "login.html", {"request": request, "messages": messages})
 
 
 @router.post("/login", response_class=RedirectResponse)
@@ -499,6 +513,7 @@ async def manage_users_ui(request: Request, db: Session = Depends(get_db)):
     }
     messages = request.session.pop("flash_messages", [])
     return templates.TemplateResponse(
+        request,
         "manage_users.html",
         {"request": request, "users": users, "messages": messages, "user_stats": user_stats}
     )
@@ -513,6 +528,7 @@ async def afdian_management_ui(request: Request, db: Session = Depends(get_db)):
     _close_expired_pending_orders(db)
     payload = _build_afdian_order_list_payload(db)
     return templates.TemplateResponse(
+        request,
         "afdian_management.html",
         {"request": request, "orders": payload["orders"], "summary": payload["summary"]},
     )
@@ -984,7 +1000,7 @@ async def stats_ui(request: Request, hour: Optional[str] = None, db: Session = D
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
         return RedirectResponse(url=request.url_for("login_ui_get"))
-    return templates.TemplateResponse("stats.html", {"request": request, "selected_hour": hour})
+    return templates.TemplateResponse(request, "stats.html", {"request": request, "selected_hour": hour})
 
 
 @router.get("/stats/data", response_class=JSONResponse)

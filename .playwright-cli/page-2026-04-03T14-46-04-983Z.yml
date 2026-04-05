@@ -1,0 +1,141 @@
+- generic [ref=e153]:
+  - complementary [ref=e154]:
+    - generic [ref=e156]:
+      - paragraph [ref=e157]: VoiceLinkVR
+      - heading "ユーザーポータル" [level=1] [ref=e158]
+    - generic [ref=e159]:
+      - generic [ref=e160]: オンライン
+      - strong [ref=e161]: Portal Smoke
+      - paragraph [ref=e162]: portal_smoke_20260403_1443@example.com
+    - generic [ref=e163]:
+      - generic [ref=e164]: 言語
+      - combobox "言語" [ref=e165] [cursor=pointer]:
+        - option "中文"
+        - option "English"
+        - option "日本語" [selected]
+    - navigation [ref=e166]:
+      - link "OV 概要" [ref=e167] [cursor=pointer]:
+        - /url: /app/overview
+        - generic [ref=e168]: OV
+        - generic [ref=e169]: 概要
+      - link "BI 支払い" [active] [ref=e170] [cursor=pointer]:
+        - /url: /app/sponsor
+        - generic [ref=e171]: BI
+        - generic [ref=e172]: 支払い
+      - link "OR 注文" [ref=e173] [cursor=pointer]:
+        - /url: /app/orders
+        - generic [ref=e174]: OR
+        - generic [ref=e175]: 注文
+      - link "US 使用量" [ref=e176] [cursor=pointer]:
+        - /url: /app/usage
+        - generic [ref=e177]: US
+        - generic [ref=e178]: 使用量
+    - generic [ref=e179]:
+      - generic [ref=e180]:
+        - paragraph [ref=e181]: 1,500 / 1,500
+        - generic [ref=e182]: 枠が少ない場合はここから直接支払いへ進めます。 現在のプランをバックエンドから読み取り、そのまま支払いリンクを作成します。
+        - link "支払いページへ" [ref=e183] [cursor=pointer]:
+          - /url: /app/sponsor
+      - button "ログアウト" [ref=e184] [cursor=pointer]
+  - main [ref=e185]:
+    - generic [ref=e186]:
+      - generic [ref=e188]:
+        - paragraph [ref=e189]: 統一アカウントセンター
+        - heading "枠の取得 / アップグレード" [level=2] [ref=e251]
+      - generic [ref=e191]:
+        - generic [ref=e192]: "現在のプラン: 元 5.00 / か月"
+        - generic [ref=e193]: P
+    - generic [ref=e252]:
+      - generic [ref=e253]:
+        - generic [ref=e254]:
+          - paragraph [ref=e255]: 枠の取得 / アップグレード
+          - heading "このアカウントで有効な操作を読み取り、そのまま支払いへ進む" [level=2] [ref=e256]
+          - paragraph [ref=e257]: まずバックエンドから現在のプラン、利用可能な操作、金額ステップを取得し、その後に直接支払いリンクを作成します。QR フローはありません。
+        - generic [ref=e258]:
+          - strong [ref=e259]: 1,500
+          - text: 本日の残り枠
+      - generic [ref=e260]:
+        - article [ref=e261]:
+          - heading "現在のアカウントガイド" [level=3] [ref=e262]
+          - generic [ref=e263]:
+            - generic [ref=e264]:
+              - generic [ref=e265]: 現在のプラン
+              - strong [ref=e266]: 元 5.00 / か月
+            - generic [ref=e267]:
+              - generic [ref=e268]: 現在の枠
+              - strong [ref=e269]: 1500/day
+            - generic [ref=e270]:
+              - generic [ref=e271]: 枠ルール
+              - strong [ref=e272]: 5 元ごとに 1,500 枠が対応します。最終的な境界はバックエンド guide に従います。
+        - article [ref=e273]:
+          - heading "支払い時の注意" [level=3] [ref=e274]
+          - paragraph [ref=e275]: リンク生成後はそのまま支払い、金額を変更しないでください。
+          - paragraph [ref=e276]: 支払いページへ移動した後は金額を変更せず、そのまま支払ってください。
+      - generic [ref=e277]:
+        - heading "今回の操作を選択" [level=3] [ref=e279]
+        - generic [ref=e280]:
+          - button "更新 現在または選択した月額で更新します。" [ref=e281] [cursor=pointer]:
+            - strong [ref=e282]: 更新
+            - text: 現在または選択した月額で更新します。
+          - button "アップグレード 高頻度利用向けに月額プランを上げます。" [ref=e283] [cursor=pointer]:
+            - strong [ref=e284]: アップグレード
+            - text: 高頻度利用向けに月額プランを上げます。
+          - button "ダウングレード バックエンドが許可した場合のみ利用可能です。" [disabled] [ref=e285]:
+            - strong [ref=e286]: ダウングレード
+            - text: バックエンドが許可した場合のみ利用可能です。
+          - button "追加パック 有効な購読に一回限りの追加枠を付与します。" [disabled] [ref=e287]:
+            - strong [ref=e288]: 追加パック
+            - text: 有効な購読に一回限りの追加枠を付与します。
+      - generic [ref=e289]:
+        - article [ref=e290]:
+          - heading "金額と期間を選択" [level=3] [ref=e292]
+          - generic [ref=e293]:
+            - generic [ref=e294]: 期間
+            - generic [ref=e295]:
+              - button "1 か月" [ref=e296] [cursor=pointer]
+              - button "2 か月" [ref=e297] [cursor=pointer]
+              - button "3 か月" [ref=e298] [cursor=pointer]
+              - button "4 か月" [ref=e299] [cursor=pointer]
+              - button "5 か月" [ref=e300] [cursor=pointer]
+              - button "6 か月" [ref=e301] [cursor=pointer]
+              - button "7 か月" [ref=e302] [cursor=pointer]
+              - button "8 か月" [ref=e303] [cursor=pointer]
+              - button "9 か月" [ref=e304] [cursor=pointer]
+              - button "10 か月" [ref=e305] [cursor=pointer]
+              - button "11 か月" [ref=e306] [cursor=pointer]
+              - button "12 か月" [ref=e307] [cursor=pointer]
+          - generic [ref=e308]:
+            - generic [ref=e309]: 金額
+            - generic [ref=e310]:
+              - button "-" [disabled] [ref=e311]
+              - generic [ref=e312]:
+                - generic [ref=e313]: 金額（元 / 月）
+                - strong [ref=e314]: 元 5.00
+              - button "+" [disabled] [ref=e315]
+          - paragraph [ref=e316]: この操作後の見込み枠：1,500/day
+          - button "Afdian で支払う ➚" [ref=e318] [cursor=pointer]
+        - article [ref=e319]:
+          - heading "支払いプレビュー" [level=3] [ref=e321]
+          - generic [ref=e322]:
+            - generic [ref=e323]:
+              - generic [ref=e324]: 現在のプラン
+              - strong [ref=e325]: 元 5.00 / か月
+              - text: ￥5.00/月
+            - generic [ref=e326]:
+              - generic [ref=e327]: 現在の枠
+              - strong [ref=e328]: 1500/day
+              - text: 本日の残り枠
+            - generic [ref=e329]:
+              - generic [ref=e330]: 支払い予定総額
+              - strong [ref=e331]: 元 5.00
+              - text: 1 か月
+            - generic [ref=e332]:
+              - generic [ref=e333]: 支払い後の見込み枠
+              - strong [ref=e334]: 1,500/day
+              - text: この操作後の見込み枠：1,500/day
+      - generic [ref=e335]:
+        - generic [ref=e336]:
+          - heading "未払い注文" [level=3] [ref=e337]
+          - link "支払い履歴を見る" [ref=e338] [cursor=pointer]:
+            - /url: /app/orders
+        - generic [ref=e339]: 未払い注文はありません。

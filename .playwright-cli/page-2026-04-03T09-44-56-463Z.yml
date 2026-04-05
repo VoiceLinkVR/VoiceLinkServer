@@ -1,0 +1,117 @@
+- generic [ref=e3]:
+  - banner [ref=e31]:
+    - generic [ref=e32]:
+      - paragraph [ref=e33]: VoiceLinkVR Admin
+      - heading "Website operations console" [level=1] [ref=e34]
+    - generic [ref=e35]:
+      - generic [ref=e36]:
+        - strong [ref=e37]: Administrator
+        - generic [ref=e38]: preview-admin@local.test
+      - button "Sign Out" [ref=e39] [cursor=pointer]
+  - generic [ref=e40]: First admin created and signed in.
+  - navigation [ref=e41]:
+    - button "Dashboard" [ref=e42] [cursor=pointer]
+    - button "Users" [ref=e43] [cursor=pointer]
+    - button "Orders" [ref=e44] [cursor=pointer]
+    - button "Stats" [active] [ref=e45] [cursor=pointer]
+  - main [ref=e46]:
+    - generic [ref=e112]:
+      - generic [ref=e113]:
+        - generic [ref=e114]:
+          - heading "Hourly request stats" [level=2] [ref=e115]
+          - generic [ref=e116]:
+            - combobox [ref=e117]:
+              - option "Latest window"
+              - option "2026-04-03 17:00" [selected]
+              - option "2026-04-03 16:00"
+              - option "2026-04-03 15:00"
+              - option "2026-04-03 12:00"
+              - option "2026-04-03 11:00"
+            - button "Reload" [ref=e118] [cursor=pointer]
+        - generic [ref=e119]:
+          - article [ref=e120]:
+            - generic [ref=e121]: Requests
+            - strong [ref=e122]: "4"
+          - article [ref=e123]:
+            - generic [ref=e124]: Success Rate
+            - strong [ref=e125]: 100%
+          - article [ref=e126]:
+            - generic [ref=e127]: Rate Limited
+            - strong [ref=e128]: "0"
+          - article [ref=e129]:
+            - generic [ref=e130]: Resource Cost
+            - strong [ref=e131]: "0"
+      - generic [ref=e132]:
+        - generic [ref=e133]:
+          - heading "Daily trend" [level=2] [ref=e135]
+          - table [ref=e136]:
+            - rowgroup [ref=e137]:
+              - row "Day Success Fail Rate Limited Total" [ref=e138]:
+                - columnheader "Day" [ref=e139]
+                - columnheader "Success" [ref=e140]
+                - columnheader "Fail" [ref=e141]
+                - columnheader "Rate Limited" [ref=e142]
+                - columnheader "Total" [ref=e143]
+            - rowgroup [ref=e144]:
+              - row "2026-03-28 0 0 0 0" [ref=e145]:
+                - cell "2026-03-28" [ref=e146]
+                - cell "0" [ref=e147]
+                - cell "0" [ref=e148]
+                - cell "0" [ref=e149]
+                - cell "0" [ref=e150]
+              - row "2026-03-29 0 0 0 0" [ref=e151]:
+                - cell "2026-03-29" [ref=e152]
+                - cell "0" [ref=e153]
+                - cell "0" [ref=e154]
+                - cell "0" [ref=e155]
+                - cell "0" [ref=e156]
+              - row "2026-03-30 0 0 0 0" [ref=e157]:
+                - cell "2026-03-30" [ref=e158]
+                - cell "0" [ref=e159]
+                - cell "0" [ref=e160]
+                - cell "0" [ref=e161]
+                - cell "0" [ref=e162]
+              - row "2026-03-31 0 0 0 0" [ref=e163]:
+                - cell "2026-03-31" [ref=e164]
+                - cell "0" [ref=e165]
+                - cell "0" [ref=e166]
+                - cell "0" [ref=e167]
+                - cell "0" [ref=e168]
+              - row "2026-04-01 0 0 0 0" [ref=e169]:
+                - cell "2026-04-01" [ref=e170]
+                - cell "0" [ref=e171]
+                - cell "0" [ref=e172]
+                - cell "0" [ref=e173]
+                - cell "0" [ref=e174]
+              - row "2026-04-02 0 0 0 0" [ref=e175]:
+                - cell "2026-04-02" [ref=e176]
+                - cell "0" [ref=e177]
+                - cell "0" [ref=e178]
+                - cell "0" [ref=e179]
+                - cell "0" [ref=e180]
+              - row "2026-04-03 40 7 0 58" [ref=e181]:
+                - cell "2026-04-03" [ref=e182]
+                - cell "40" [ref=e183]
+                - cell "7" [ref=e184]
+                - cell "0" [ref=e185]
+                - cell "58" [ref=e186]
+        - generic [ref=e187]:
+          - heading "Top endpoints" [level=2] [ref=e189]
+          - table [ref=e190]:
+            - rowgroup [ref=e191]:
+              - row "Endpoint Success Fail Total" [ref=e192]:
+                - columnheader "Endpoint" [ref=e193]
+                - columnheader "Success" [ref=e194]
+                - columnheader "Fail" [ref=e195]
+                - columnheader "Total" [ref=e196]
+            - rowgroup [ref=e197]:
+              - row "/adminapi/auth/state 3 0 3" [ref=e198]:
+                - cell "/adminapi/auth/state" [ref=e199]
+                - cell "3" [ref=e200]
+                - cell "0" [ref=e201]
+                - cell "3" [ref=e202]
+              - row "/adminapi/auth/bootstrap 1 0 1" [ref=e203]:
+                - cell "/adminapi/auth/bootstrap" [ref=e204]
+                - cell "1" [ref=e205]
+                - cell "0" [ref=e206]
+                - cell "1" [ref=e207]

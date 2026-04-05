@@ -1,0 +1,82 @@
+- generic [ref=e3]:
+  - banner [ref=e31]:
+    - generic [ref=e32]:
+      - paragraph [ref=e33]: VoiceLinkVR Admin
+      - heading "Website operations console" [level=1] [ref=e34]
+    - generic [ref=e35]:
+      - generic [ref=e36]:
+        - strong [ref=e37]: Administrator
+        - generic [ref=e38]: preview-admin@local.test
+      - button "Sign Out" [ref=e39] [cursor=pointer]
+  - generic [ref=e40]: First admin created and signed in.
+  - navigation [ref=e41]:
+    - button "Dashboard" [ref=e42] [cursor=pointer]
+    - button "Users" [ref=e43] [cursor=pointer]
+    - button "Orders" [ref=e44] [cursor=pointer]
+    - button "Stats" [ref=e45] [cursor=pointer]
+  - main [ref=e46]:
+    - generic [ref=e47]:
+      - generic [ref=e48]:
+        - article [ref=e49]:
+          - generic [ref=e50]: Total Users
+          - strong [ref=e51]: "3"
+        - article [ref=e52]:
+          - generic [ref=e53]: Active Users
+          - strong [ref=e54]: "3"
+        - article [ref=e55]:
+          - generic [ref=e56]: Total Orders
+          - strong [ref=e57]: "1"
+        - article [ref=e58]:
+          - generic [ref=e59]: Activated Amount
+          - strong [ref=e60]: CNY 0
+      - generic [ref=e61]:
+        - generic [ref=e62]:
+          - generic [ref=e63]:
+            - heading "Latest users" [level=2] [ref=e64]
+            - button "Refresh" [ref=e65] [cursor=pointer]
+          - table [ref=e66]:
+            - rowgroup [ref=e67]:
+              - row "User Role Status Last Login" [ref=e68]:
+                - columnheader "User" [ref=e69]
+                - columnheader "Role" [ref=e70]
+                - columnheader "Status" [ref=e71]
+                - columnheader "Last Login" [ref=e72]
+            - rowgroup [ref=e73]:
+              - row "Administrator admin Admin Active 2026-04-03 17:44" [ref=e74]:
+                - cell "Administrator admin" [ref=e75]:
+                  - strong [ref=e76]: Administrator
+                  - generic [ref=e77]: admin
+                - cell "Admin" [ref=e78]
+                - cell "Active" [ref=e79]
+                - cell "2026-04-03 17:44" [ref=e80]
+              - row "boyqiu001 boyqiu001 Member Active -" [ref=e81]:
+                - cell "boyqiu001 boyqiu001" [ref=e82]:
+                  - strong [ref=e83]: boyqiu001
+                  - generic [ref=e84]: boyqiu001
+                - cell "Member" [ref=e85]
+                - cell "Active" [ref=e86]
+                - cell "-" [ref=e87]
+              - row "1 1 Member Active 2026-04-03 15:40" [ref=e88]:
+                - cell "1 1" [ref=e89]:
+                  - strong [ref=e90]: "1"
+                  - generic [ref=e91]: "1"
+                - cell "Member" [ref=e92]
+                - cell "Active" [ref=e93]
+                - cell "2026-04-03 15:40" [ref=e94]
+        - generic [ref=e95]:
+          - generic [ref=e96]:
+            - heading "Latest orders" [level=2] [ref=e97]
+            - button "Refresh" [ref=e98] [cursor=pointer]
+          - table [ref=e99]:
+            - rowgroup [ref=e100]:
+              - row "Order User Status Amount" [ref=e101]:
+                - columnheader "Order" [ref=e102]
+                - columnheader "User" [ref=e103]
+                - columnheader "Status" [ref=e104]
+                - columnheader "Amount" [ref=e105]
+            - rowgroup [ref=e106]:
+              - row "#1 1 Pending 5" [ref=e107]:
+                - cell "#1" [ref=e108]
+                - cell "1" [ref=e109]
+                - cell "Pending" [ref=e110]
+                - cell "5" [ref=e111]

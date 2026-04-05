@@ -1,25 +1,25 @@
 import time
 import uuid
-from contextlib import asynccontextmanager
+from ipaddress import ip_address
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from jose import jwt
+from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import inspect, text
 from starlette.middleware.sessions import SessionMiddleware
 
 from core.config import settings
-from core.dependencies import get_db, oauth2_scheme
+from core.dependencies import get_db, oauth2_scheme, resolve_authenticated_user
 from core.logging_config import logger, reset_request_id, set_request_id
 from core.quota_service import commit_quota_allocation, is_new_quota_mode_enabled
 from core.rate_limiter import RateLimitExceeded, get_client_ip, rate_limiter
 from core.services import init_supported_languages, load_filter_config, update_filter_config
 from db.base import Base, SessionLocal, engine
-from db.models import PaymentOrder, RequestLog, User
-from routers import api, manage_api, ui, user_center
+from db.models import PaymentOrder, RequestLog, User, payment_lookup_digest
+from routers import admin_api, api, auth, manage_api, portal_api, ui, user_center
 
 
 def _ensure_password_column_capacity(db, inspector) -> None:
@@ -41,6 +41,96 @@ def _ensure_password_column_capacity(db, inspector) -> None:
         logger.warning("Unsupported dialect for password resize: %s", dialect_name)
 
 
+def _add_column_if_missing(db, columns: list[str], column_name: str, ddl: str, log_message: str) -> None:
+    if column_name in columns:
+        return
+    db.execute(text(ddl))
+    columns.append(column_name)
+    logger.info(log_message)
+
+
+def _sync_payment_order_lookup_digests(db) -> None:
+    updated_count = 0
+    for order in db.query(PaymentOrder).all():
+        expected_custom_id_digest = payment_lookup_digest(getattr(order, "custom_id", None))
+        expected_remark_digest = payment_lookup_digest(getattr(order, "remark", None))
+        changed = False
+
+        if getattr(order, "custom_id_digest", None) != expected_custom_id_digest:
+            order.custom_id_digest = expected_custom_id_digest
+            changed = True
+        if getattr(order, "remark_digest", None) != expected_remark_digest:
+            order.remark_digest = expected_remark_digest
+            changed = True
+
+        if changed:
+            updated_count += 1
+
+    if updated_count:
+        logger.info("Synchronized payment_order lookup digests for %s rows", updated_count)
+
+
+@contextmanager
+def _startup_db_init_lock(timeout_seconds: int = 180):
+    if engine.dialect.name != "mysql":
+        yield
+        return
+
+    lock_name = "voicelinkvr_server_schema_init"
+    connection = engine.connect()
+    try:
+        acquired = connection.execute(
+            text("SELECT GET_LOCK(:lock_name, :timeout_seconds)"),
+            {"lock_name": lock_name, "timeout_seconds": timeout_seconds},
+        ).scalar()
+        if int(acquired or 0) != 1:
+            raise RuntimeError(f"Failed to acquire startup DB lock: {lock_name}")
+        logger.info("Acquired MySQL startup DB lock: %s", lock_name)
+        yield
+    finally:
+        try:
+            connection.execute(text("SELECT RELEASE_LOCK(:lock_name)"), {"lock_name": lock_name})
+            logger.info("Released MySQL startup DB lock: %s", lock_name)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to release MySQL startup DB lock %s: %s", lock_name, exc)
+        connection.close()
+
+
+def _try_acquire_scheduler_lock():
+    if engine.dialect.name != "mysql":
+        return True, None
+
+    lock_name = "voicelinkvr_server_scheduler"
+    connection = engine.connect()
+    try:
+        acquired = connection.execute(
+            text("SELECT GET_LOCK(:lock_name, 0)"),
+            {"lock_name": lock_name},
+        ).scalar()
+        if int(acquired or 0) != 1:
+            connection.close()
+            return False, None
+        logger.info("Acquired MySQL scheduler lock: %s", lock_name)
+        return True, connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def _release_scheduler_lock(connection) -> None:
+    if connection is None:
+        return
+
+    lock_name = "voicelinkvr_server_scheduler"
+    try:
+        connection.execute(text("SELECT RELEASE_LOCK(:lock_name)"), {"lock_name": lock_name})
+        logger.info("Released MySQL scheduler lock: %s", lock_name)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to release MySQL scheduler lock %s: %s", lock_name, exc)
+    finally:
+        connection.close()
+
+
 def check_and_update_db():
     db = SessionLocal()
     try:
@@ -48,12 +138,27 @@ def check_and_update_db():
         if "user" in inspector.get_table_names():
             user_columns = [col["name"] for col in inspector.get_columns("user")]
             _ensure_password_column_capacity(db, inspector)
+            if "email" not in user_columns:
+                db.execute(text("ALTER TABLE user ADD COLUMN email VARCHAR(255)"))
+                logger.info("Added email to user table")
+            if "email_verified" not in user_columns:
+                db.execute(text("ALTER TABLE user ADD COLUMN email_verified BOOLEAN DEFAULT 0"))
+                logger.info("Added email_verified to user table")
+            if "display_name" not in user_columns:
+                db.execute(text("ALTER TABLE user ADD COLUMN display_name VARCHAR(100)"))
+                logger.info("Added display_name to user table")
             if "expiration_date" not in user_columns:
                 db.execute(text("ALTER TABLE user ADD COLUMN expiration_date DATETIME"))
                 logger.info("Added expiration_date to user table")
             if "is_active" not in user_columns:
                 db.execute(text("ALTER TABLE user ADD COLUMN is_active BOOLEAN DEFAULT 1"))
                 logger.info("Added is_active to user table")
+            if "created_at" not in user_columns:
+                db.execute(text("ALTER TABLE user ADD COLUMN created_at DATETIME"))
+                logger.info("Added created_at to user table")
+            if "last_login_at" not in user_columns:
+                db.execute(text("ALTER TABLE user ADD COLUMN last_login_at DATETIME"))
+                logger.info("Added last_login_at to user table")
             if "boost_expiration_date" not in user_columns:
                 db.execute(text("ALTER TABLE user ADD COLUMN boost_expiration_date DATETIME"))
                 logger.info("Added boost_expiration_date to user table")
@@ -69,6 +174,15 @@ def check_and_update_db():
             if "addon_expiration_date" not in user_columns:
                 db.execute(text("ALTER TABLE user ADD COLUMN addon_expiration_date DATETIME"))
                 logger.info("Added addon_expiration_date to user table")
+
+            user_indexes = {idx.get("name") for idx in inspector.get_indexes("user")}
+            for index_name, create_sql in [
+                ("idx_user_email", "CREATE INDEX idx_user_email ON user (email)"),
+                ("idx_user_email_verified", "CREATE INDEX idx_user_email_verified ON user (email_verified)"),
+            ]:
+                if index_name not in user_indexes:
+                    db.execute(text(create_sql))
+                    logger.info("Added index: %s", index_name)
 
         if "request_log" in inspector.get_table_names():
             log_columns = [col["name"] for col in inspector.get_columns("request_log")]
@@ -103,17 +217,53 @@ def check_and_update_db():
 
         if "payment_order" in inspector.get_table_names():
             payment_columns = [col["name"] for col in inspector.get_columns("payment_order")]
-            if "activation_source" not in payment_columns:
-                db.execute(text("ALTER TABLE payment_order ADD COLUMN activation_source VARCHAR(64)"))
-                logger.info("Added activation_source to payment_order table")
-            if "activation_error" not in payment_columns:
-                db.execute(text("ALTER TABLE payment_order ADD COLUMN activation_error TEXT"))
-                logger.info("Added activation_error to payment_order table")
-            if "activation_error_at" not in payment_columns:
-                db.execute(text("ALTER TABLE payment_order ADD COLUMN activation_error_at DATETIME"))
-                logger.info("Added activation_error_at to payment_order table")
+            _add_column_if_missing(
+                db,
+                payment_columns,
+                "custom_id_digest",
+                "ALTER TABLE payment_order ADD COLUMN custom_id_digest VARCHAR(64)",
+                "Added custom_id_digest to payment_order table",
+            )
+            _add_column_if_missing(
+                db,
+                payment_columns,
+                "remark_digest",
+                "ALTER TABLE payment_order ADD COLUMN remark_digest VARCHAR(64)",
+                "Added remark_digest to payment_order table",
+            )
+            _add_column_if_missing(
+                db,
+                payment_columns,
+                "activation_source",
+                "ALTER TABLE payment_order ADD COLUMN activation_source VARCHAR(64)",
+                "Added activation_source to payment_order table",
+            )
+            _add_column_if_missing(
+                db,
+                payment_columns,
+                "activation_error",
+                "ALTER TABLE payment_order ADD COLUMN activation_error TEXT",
+                "Added activation_error to payment_order table",
+            )
+            _add_column_if_missing(
+                db,
+                payment_columns,
+                "activation_error_at",
+                "ALTER TABLE payment_order ADD COLUMN activation_error_at DATETIME",
+                "Added activation_error_at to payment_order table",
+            )
+
+            _sync_payment_order_lookup_digests(db)
             payment_indexes = {idx.get("name") for idx in inspector.get_indexes("payment_order")}
             for index_name, create_sql in [
+                (
+                    "idx_payment_order_custom_id_digest",
+                    "CREATE UNIQUE INDEX idx_payment_order_custom_id_digest ON payment_order (custom_id_digest)",
+                ),
+                (
+                    "idx_payment_order_remark_digest",
+                    "CREATE INDEX idx_payment_order_remark_digest ON payment_order (remark_digest)",
+                ),
                 ("idx_payment_order_status", "CREATE INDEX idx_payment_order_status ON payment_order (status)"),
                 ("idx_payment_order_username", "CREATE INDEX idx_payment_order_username ON payment_order (username)"),
                 (
@@ -122,6 +272,17 @@ def check_and_update_db():
                 ),
             ]:
                 if index_name not in payment_indexes:
+                    db.execute(text(create_sql))
+                    logger.info("Added index: %s", index_name)
+
+        if "account_token" in inspector.get_table_names():
+            account_token_indexes = {idx.get("name") for idx in inspector.get_indexes("account_token")}
+            for index_name, create_sql in [
+                ("idx_account_token_username_purpose", "CREATE INDEX idx_account_token_username_purpose ON account_token (username, purpose)"),
+                ("idx_account_token_email_purpose", "CREATE INDEX idx_account_token_email_purpose ON account_token (email, purpose)"),
+                ("idx_account_token_purpose_expires_at", "CREATE INDEX idx_account_token_purpose_expires_at ON account_token (purpose, expires_at)"),
+            ]:
+                if index_name not in account_token_indexes:
                     db.execute(text(create_sql))
                     logger.info("Added index: %s", index_name)
 
@@ -149,24 +310,84 @@ def check_user_expiration():
 scheduler = AsyncIOScheduler(timezone=pytz.utc)
 
 
+def _is_lan_client_ip(client_ip: str) -> bool:
+    normalized = str(client_ip or "").strip()
+    if not normalized or normalized == "unknown":
+        return False
+    try:
+        candidate = ip_address(normalized)
+    except ValueError:
+        return normalized in {"localhost"}
+    return candidate.is_private or candidate.is_loopback
+
+
+def _resolve_admin_access_ip(request: Request) -> str:
+    peer_ip = request.client.host if request.client else ""
+    if _is_lan_client_ip(peer_ip):
+        forwarded_ip = request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for", "")
+        forwarded_ip = forwarded_ip.split(",")[0].strip()
+        if forwarded_ip:
+            return forwarded_ip
+    return peer_ip or "unknown"
+
+
+def _is_admin_surface_path(path: str) -> bool:
+    return (
+        path == "/ui"
+        or path.startswith("/ui/")
+        or path == "/manageapi"
+        or path.startswith("/manageapi/")
+        or path == "/adminapi"
+        or path.startswith("/adminapi/")
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application startup")
-    Base.metadata.create_all(bind=engine)
-    check_and_update_db()
+    scheduler_lock_connection = None
+    with _startup_db_init_lock():
+        Base.metadata.create_all(bind=engine)
+        check_and_update_db()
     load_filter_config()
     init_supported_languages()
-    scheduler.add_job(check_user_expiration, "cron", hour=0, minute=0, second=0)
-    scheduler.add_job(update_filter_config, "cron", day_of_week=0, hour=3, minute=0, second=0)
-    scheduler.start()
-    logger.info("Background scheduler started")
+    run_scheduler, scheduler_lock_connection = _try_acquire_scheduler_lock()
+    if run_scheduler:
+        scheduler.add_job(check_user_expiration, "cron", hour=0, minute=0, second=0)
+        scheduler.add_job(update_filter_config, "cron", day_of_week=0, hour=3, minute=0, second=0)
+        scheduler.start()
+        logger.info("Background scheduler started")
+    else:
+        logger.info("Skipped scheduler startup in this worker")
     yield
     logger.info("Application shutdown")
-    scheduler.shutdown()
+    if scheduler.running:
+        scheduler.shutdown()
+    _release_scheduler_lock(scheduler_lock_connection)
 
 
 app = FastAPI(title="VoiceLinkVR Server", lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET_KEY)
+
+
+@app.middleware("http")
+async def lan_only_admin_middleware(request: Request, call_next):
+    if _is_admin_surface_path(request.url.path):
+        client_ip = _resolve_admin_access_ip(request)
+        if not _is_lan_client_ip(client_ip):
+            logger.warning("[ADMIN-ACCESS] Denied non-LAN request. ip=%s path=%s", client_ip, request.url.path)
+            if (
+                request.url.path == "/manageapi"
+                or request.url.path.startswith("/manageapi/")
+                or request.url.path == "/adminapi"
+                or request.url.path.startswith("/adminapi/")
+            ):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Management API is only available from LAN clients."},
+                )
+            return PlainTextResponse("Management UI is only available from LAN clients.", status_code=403)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -201,13 +422,16 @@ async def request_logging_middleware(request: Request, call_next):
 
     try:
         token = await oauth2_scheme(request)
-        if token and db:
-            payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-            username = payload.get("sub")
-            if username:
-                user = db.query(User).filter(User.username == username).first()
-                if user:
-                    current_user = user.username
+        if db:
+            authenticated_user = resolve_authenticated_user(
+                request,
+                db,
+                token=token,
+                allow_inactive=True,
+                allow_expired=True,
+            )
+            if authenticated_user is not None:
+                current_user = authenticated_user.username
         logger.info(
             "[API-START] user=%s ip=%s endpoint=%s method=%s",
             current_user,
@@ -346,9 +570,12 @@ async def request_logging_middleware(request: Request, call_next):
 
 
 app.include_router(ui.router, prefix="/ui", tags=["UI"])
+app.include_router(auth.router, tags=["Auth"])
 app.include_router(api.router, prefix="/api", tags=["API"])
+app.include_router(portal_api.router, prefix="/api", tags=["Portal API"])
 app.include_router(user_center.router, prefix="/api/user-center", tags=["User Center"])
 app.include_router(manage_api.router, prefix="/manageapi", tags=["Management API"])
+app.include_router(admin_api.router, prefix="/adminapi", tags=["Admin API"])
 
 
 @app.get("/", include_in_schema=False)

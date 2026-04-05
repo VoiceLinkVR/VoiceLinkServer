@@ -1,0 +1,43 @@
+- generic [ref=e117]:
+  - generic [ref=e118]:
+    - generic [ref=e119]:
+      - generic [ref=e120]:
+        - paragraph [ref=e121]: VoiceLinkVR ポータル
+        - heading "メールログインが Web の正式な入口です。" [level=1] [ref=e122]
+      - generic [ref=e123]:
+        - generic [ref=e124]: 言語
+        - combobox "言語" [ref=e125] [cursor=pointer]:
+          - option "中文"
+          - option "English"
+          - option "日本語" [selected]
+    - paragraph [ref=e126]: ログイン後は、枠、支払い履歴、使用量明細、支払いガイドを Web 上で直接確認できます。
+    - generic [ref=e127]:
+      - generic [ref=e128]:
+        - strong [ref=e129]: セッションベースの Web ログイン
+        - text: ページ更新、ルート制御、支払い遷移は実際のバックエンドセッションに基づきます。
+      - generic [ref=e130]:
+        - strong [ref=e131]: 直接支払いリンク
+        - text: 新しい決済フローでは QR のダミー表示をやめ、リンク遷移のみを使います。
+  - generic [ref=e132]:
+    - generic [ref=e133]:
+      - paragraph [ref=e134]: ユーザーポータル
+      - heading "新しい VoiceLinkVR アカウントを作成" [level=2] [ref=e148]
+    - generic [ref=e136]:
+      - button "ログイン" [ref=e137] [cursor=pointer]
+      - button "登録" [active] [ref=e138] [cursor=pointer]
+    - generic [ref=e139]:
+      - generic [ref=e149]:
+        - generic [ref=e150]: 表示名
+        - textbox "表示名" [ref=e151]:
+          - /placeholder: 例：VR Explorer
+      - generic [ref=e140]:
+        - generic [ref=e141]: メール
+        - textbox "メール" [ref=e142]:
+          - /placeholder: vrcls@example.com
+      - generic [ref=e143]:
+        - generic [ref=e144]: パスワード
+        - textbox "パスワード" [ref=e145]:
+          - /placeholder: 6 文字以上
+      - button "アカウント作成" [ref=e152] [cursor=pointer]
+    - link "ホームに戻る" [ref=e147] [cursor=pointer]:
+      - /url: /

@@ -1,0 +1,62 @@
+- generic [ref=e3]:
+  - navigation [ref=e4]:
+    - generic [ref=e7]:
+      - paragraph [ref=e8]: VoiceLinkVR
+      - strong [ref=e9]: ユーザーポータル
+    - generic [ref=e10]:
+      - generic [ref=e11]:
+        - generic [ref=e12]: 言語
+        - combobox "言語" [ref=e89] [cursor=pointer]:
+          - option "中文"
+          - option "English"
+          - option "日本語" [selected]
+      - link "ログイン" [ref=e90] [cursor=pointer]:
+        - /url: /auth
+      - link "ポータルを開く" [ref=e91] [cursor=pointer]:
+        - /url: /auth
+  - main [ref=e16]:
+    - generic [ref=e17]:
+      - generic [ref=e18]: 統一アカウントと枠センター
+      - heading "Web から直接アカウント、枠、支払い、API 使用量を確認 新しいポータル方針" [level=1] [ref=e92]
+      - paragraph [ref=e20]: このページはもうモックではありません。実際のバックエンド情報、支払いガイド、使用量統計を読み込み、新しいクライアント決済フローと揃えています。
+      - generic [ref=e21]:
+        - link "ポータルを開く" [ref=e93] [cursor=pointer]:
+          - /url: /auth
+        - link "ログインへ" [ref=e94] [cursor=pointer]:
+          - /url: /auth
+        - link "GitHub" [ref=e24] [cursor=pointer]:
+          - /url: https://github.com/VoiceLinkVR/VRCLS
+      - generic [ref=e25]:
+        - generic [ref=e95]:
+          - strong [ref=e96]: メールログイン
+          - generic [ref=e97]: Web アカウント入口
+        - generic [ref=e98]:
+          - strong [ref=e99]: 動的ティア
+          - generic [ref=e100]: 支払い金額はバックエンド案内に従う
+        - generic [ref=e101]:
+          - strong [ref=e102]: API 使用量
+          - generic [ref=e103]: 専用ページで日別明細
+    - generic [ref=e41]:
+      - generic [ref=e42]:
+        - text: GET /auth/me
+        - strong [ref=e43]: 現在の Web セッションを解決
+      - generic [ref=e44]:
+        - text: GET /api/account/profile
+        - strong [ref=e45]: アカウント、プラン、枠を取得
+      - generic [ref=e46]:
+        - text: POST /api/billing/order-intents
+        - strong [ref=e47]: ログイン中の本人で支払いリンクを生成
+  - generic [ref=e50]:
+    - generic [ref=e51]:
+      - paragraph [ref=e52]: ユーザーポータル
+      - heading "Web サイトは旧フローの仮ページではなく、正式なユーザー入口になりました。" [level=2] [ref=e104]
+    - generic [ref=e54]:
+      - article [ref=e105]:
+        - heading "同一 ID" [level=3] [ref=e106]
+        - paragraph [ref=e107]: Web とクライアントは同じバックエンドユーザー ID を使います。
+      - article [ref=e108]:
+        - heading "ガイド駆動の金額" [level=3] [ref=e109]
+        - paragraph [ref=e110]: 金額、枠増分、アップグレード境界はバックエンドの guide に従います。
+      - article [ref=e111]:
+        - heading "明確な使用量表示" [level=3] [ref=e112]
+        - paragraph [ref=e113]: API 呼び出し、枠消費、期限、日別明細を専用ページで確認できます。

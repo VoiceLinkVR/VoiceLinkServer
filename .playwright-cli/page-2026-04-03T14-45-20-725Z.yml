@@ -1,0 +1,102 @@
+- generic [ref=e153]:
+  - complementary [ref=e154]:
+    - generic [ref=e156]:
+      - paragraph [ref=e157]: VoiceLinkVR
+      - heading "ユーザーポータル" [level=1] [ref=e158]
+    - generic [ref=e159]:
+      - generic [ref=e160]: オンライン
+      - strong [ref=e161]: Portal Smoke
+      - paragraph [ref=e162]: portal_smoke_20260403_1443@example.com
+    - generic [ref=e163]:
+      - generic [ref=e164]: 言語
+      - combobox "言語" [ref=e165] [cursor=pointer]:
+        - option "中文"
+        - option "English"
+        - option "日本語" [selected]
+    - navigation [ref=e166]:
+      - link "OV 概要" [ref=e167] [cursor=pointer]:
+        - /url: /app/overview
+        - generic [ref=e168]: OV
+        - generic [ref=e169]: 概要
+      - link "BI 支払い" [ref=e170] [cursor=pointer]:
+        - /url: /app/sponsor
+        - generic [ref=e171]: BI
+        - generic [ref=e172]: 支払い
+      - link "OR 注文" [ref=e173] [cursor=pointer]:
+        - /url: /app/orders
+        - generic [ref=e174]: OR
+        - generic [ref=e175]: 注文
+      - link "US 使用量" [ref=e176] [cursor=pointer]:
+        - /url: /app/usage
+        - generic [ref=e177]: US
+        - generic [ref=e178]: 使用量
+    - generic [ref=e179]:
+      - generic [ref=e180]:
+        - paragraph [ref=e181]: 1,500 / 1,500
+        - generic [ref=e182]: 枠が少ない場合はここから直接支払いへ進めます。 現在のプランをバックエンドから読み取り、そのまま支払いリンクを作成します。
+        - link "支払いページへ" [ref=e183] [cursor=pointer]:
+          - /url: /app/sponsor
+      - button "ログアウト" [ref=e184] [cursor=pointer]
+  - main [ref=e185]:
+    - generic [ref=e186]:
+      - generic [ref=e188]:
+        - paragraph [ref=e189]: 統一アカウントセンター
+        - heading "概要" [level=2] [ref=e190]
+      - generic [ref=e191]:
+        - generic [ref=e192]: "現在のプラン: 元 5.00 / か月"
+        - generic [ref=e193]: P
+    - generic [ref=e195]:
+      - generic [ref=e196]:
+        - article [ref=e197]:
+          - generic [ref=e199]:
+            - paragraph [ref=e200]: 本日のリクエスト
+            - text: 現在の照会範囲内の成功 / 総リクエスト数。
+          - generic [ref=e201]: 0 / 0
+          - paragraph [ref=e203]: 0%
+        - article [ref=e204]:
+          - generic [ref=e206]:
+            - paragraph [ref=e207]: 本日の枠
+            - text: 本日の使用量と残り枠。
+          - generic [ref=e208]: 0 / 1,500
+          - paragraph [ref=e210]: 0%
+        - article [ref=e211]:
+          - generic [ref=e213]:
+            - paragraph [ref=e214]: 追加パック残高
+            - text: 新しい枠モードが有効な場合のみ使用されます。
+          - generic [ref=e215]: "0"
+      - generic [ref=e216]:
+        - article [ref=e217]:
+          - paragraph [ref=e218]: 現在のプラン
+          - strong [ref=e219]: 元 5.00 / か月
+          - text: 1500/day
+        - article [ref=e220]:
+          - paragraph [ref=e221]: 本日の残り
+          - strong [ref=e222]: 1,500 / 1,500
+          - text: 今のところ枠は十分です。
+        - article [ref=e223]:
+          - paragraph [ref=e224]: アカウント状態
+          - strong [ref=e225]: 有効
+          - text: データなし
+        - article [ref=e226]:
+          - paragraph [ref=e227]: 現在の照会範囲
+          - strong [ref=e228]: 2026-03-28 ~ 2026-04-03
+          - text: API 使用量ページで日別明細と消費元を確認できます。
+      - generic [ref=e229]:
+        - article [ref=e230]:
+          - generic [ref=e231]:
+            - heading "現在のアカウント状態" [level=3] [ref=e232]
+            - link "API 使用量の詳細を見る" [ref=e233] [cursor=pointer]:
+              - /url: /app/usage
+          - paragraph [ref=e234]: ここに表示される内容はすべて実際のバックエンドデータです。
+          - list [ref=e235]:
+            - listitem [ref=e236]: 支払い成功と自動有効化後に現在プランが更新されます。
+            - listitem [ref=e237]: 金額と操作は固定プランではなくバックエンド guide に従います。
+            - listitem [ref=e238]: 詳細な呼び出し統計と枠の内訳は専用ページで確認できます。
+        - article [ref=e239]:
+          - heading "このページの要点" [level=3] [ref=e240]
+          - generic [ref=e243]:
+            - strong [ref=e244]: 支払いは直接リンク方式になりました。
+            - paragraph [ref=e245]: QR のダミー表示やローカル擬似決済はなくなりました。
+          - generic [ref=e248]:
+            - strong [ref=e249]: API 使用量は独立ページへ移動しました。
+            - paragraph [ref=e250]: 日別リクエスト数と枠消費を一か所で確認できます。

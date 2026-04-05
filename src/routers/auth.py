@@ -1,4 +1,7 @@
 import re
+import secrets
+from datetime import timedelta
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import or_
@@ -13,14 +16,22 @@ from core.dependencies import (
     hash_password,
     is_user_expired,
     issue_login_artifacts,
+    issue_noninteractive_login_artifacts,
     normalize_email,
     revoke_refresh_token,
     revoke_user_session,
     rotate_refresh_token,
     utcnow_naive,
 )
-from db.models import User
+from db.models import DeviceAuthorization, User
 from schemas.auth import (
+    AuthDeviceActionResponse,
+    AuthDeviceAuthorizeRequest,
+    AuthDeviceRequestResponse,
+    AuthDeviceStartRequest,
+    AuthDeviceStartResponse,
+    AuthDeviceTokenRequest,
+    AuthDeviceTokenResponse,
     AuthLoginRequest,
     AuthLogoutRequest,
     AuthRefreshRequest,
@@ -30,6 +41,9 @@ from schemas.auth import (
 )
 
 router = APIRouter()
+DEVICE_AUTH_TTL = timedelta(minutes=10)
+DEVICE_AUTH_INTERVAL_SECONDS = 5
+DEVICE_AUTH_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
 def _build_username(db: Session, email: str) -> str:
@@ -56,6 +70,61 @@ def _serialize_user(user: User) -> AuthUserResponse:
         display_name=display_name,
         email_verified=bool(getattr(user, "email_verified", False)),
         is_admin=bool(user.is_admin),
+    )
+
+
+def _normalize_user_code(value: str) -> str:
+    normalized = re.sub(r"[^A-Z0-9]+", "", (value or "").upper())
+    if len(normalized) == 8:
+        return f"{normalized[:4]}-{normalized[4:]}"
+    return normalized
+
+
+def _build_portal_base_url(request: Request) -> str:
+    configured_base = (settings.PORTAL_PUBLIC_BASE_URL or "").strip().rstrip("/")
+    if configured_base:
+        return configured_base
+    return f"{str(request.base_url).rstrip('/')}/app"
+
+
+def _build_device_verification_urls(request: Request, user_code: str) -> tuple[str, str]:
+    verification_uri = f"{_build_portal_base_url(request)}/authorize"
+    verification_uri_complete = f"{verification_uri}?{urlencode({'user_code': user_code})}"
+    return verification_uri, verification_uri_complete
+
+
+def _generate_device_code() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _generate_user_code() -> str:
+    raw = "".join(secrets.choice(DEVICE_AUTH_CODE_ALPHABET) for _ in range(8))
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def _is_device_authorization_expired(record: DeviceAuthorization) -> bool:
+    return record.expires_at <= utcnow_naive()
+
+
+def _mark_device_authorization_expired(record: DeviceAuthorization) -> None:
+    if record.status == "pending":
+        record.status = "expired"
+
+
+def _find_device_authorization_by_user_code(db: Session, user_code: str) -> DeviceAuthorization | None:
+    normalized = _normalize_user_code(user_code)
+    return db.query(DeviceAuthorization).filter(DeviceAuthorization.user_code == normalized).first()
+
+
+def _serialize_device_request(record: DeviceAuthorization, user: User | None = None) -> AuthDeviceRequestResponse:
+    return AuthDeviceRequestResponse(
+        user_code=record.user_code,
+        client_name=(record.client_name or "VRCLS Desktop").strip() or "VRCLS Desktop",
+        requested_scope=(record.requested_scope or "vrcls.client").strip() or "vrcls.client",
+        status=record.status,
+        expires_at=record.expires_at.isoformat() + "Z",
+        username=user.username if user is not None else "",
+        display_name=((getattr(user, "display_name", None) or user.username).strip() if user is not None else ""),
     )
 
 
@@ -166,3 +235,174 @@ async def logout(
 @router.get("/auth/me", response_model=AuthUserResponse)
 async def me(current_user: User = Depends(get_current_user)):
     return _serialize_user(current_user)
+
+
+@router.post("/auth/device/start", response_model=AuthDeviceStartResponse)
+async def start_device_authorization(
+    payload: AuthDeviceStartRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    client_name = (payload.client_name or "VRCLS Desktop").strip() or "VRCLS Desktop"
+    requested_scope = (payload.scope or "vrcls.client").strip() or "vrcls.client"
+
+    created_record: DeviceAuthorization | None = None
+    for _ in range(5):
+        candidate = DeviceAuthorization(
+            device_code=_generate_device_code(),
+            user_code=_normalize_user_code(_generate_user_code()),
+            client_name=client_name,
+            requested_scope=requested_scope,
+            status="pending",
+            ip=request.client.host if request.client is not None else None,
+            user_agent=request.headers.get("User-Agent"),
+            expires_at=utcnow_naive() + DEVICE_AUTH_TTL,
+        )
+        db.add(candidate)
+        try:
+            db.commit()
+            db.refresh(candidate)
+            created_record = candidate
+            break
+        except Exception:
+            db.rollback()
+
+    if created_record is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create device authorization")
+
+    verification_uri, verification_uri_complete = _build_device_verification_urls(request, created_record.user_code)
+    return AuthDeviceStartResponse(
+        device_code=created_record.device_code,
+        user_code=created_record.user_code,
+        verification_uri=verification_uri,
+        verification_uri_complete=verification_uri_complete,
+        expires_in=int(DEVICE_AUTH_TTL.total_seconds()),
+        interval=DEVICE_AUTH_INTERVAL_SECONDS,
+    )
+
+
+@router.get("/auth/device/requests/{user_code}", response_model=AuthDeviceRequestResponse)
+async def get_device_authorization_request(
+    user_code: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    record = _find_device_authorization_by_user_code(db, user_code)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device authorization request not found")
+
+    if _is_device_authorization_expired(record):
+        _mark_device_authorization_expired(record)
+        db.commit()
+
+    linked_user = db.query(User).filter(User.id == record.user_id).first() if record.user_id else None
+    if linked_user is not None and linked_user.id != current_user.id and record.status in {"approved", "completed"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This device request has already been authorized")
+
+    return _serialize_device_request(record, linked_user)
+
+
+@router.post("/auth/device/authorize", response_model=AuthDeviceActionResponse)
+async def authorize_device_request(
+    payload: AuthDeviceAuthorizeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    record = _find_device_authorization_by_user_code(db, payload.user_code)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device authorization request not found")
+
+    if _is_device_authorization_expired(record):
+        _mark_device_authorization_expired(record)
+        db.commit()
+        return AuthDeviceActionResponse(message="Device authorization request expired", status="expired")
+
+    if record.status == "completed":
+        return AuthDeviceActionResponse(message="Device authorization request already completed", status="completed")
+    if record.status == "denied":
+        return AuthDeviceActionResponse(message="Device authorization request already denied", status="denied")
+    if record.status == "approved":
+        if record.user_id is not None and record.user_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This device request has already been authorized")
+        return AuthDeviceActionResponse(message="Device authorization request already approved", status="approved")
+
+    decision = (payload.decision or "approve").strip().lower()
+    if decision not in {"approve", "deny"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported device authorization decision")
+
+    record.user_id = current_user.id
+    if decision == "deny":
+        record.status = "denied"
+        record.denied_at = utcnow_naive()
+        db.commit()
+        return AuthDeviceActionResponse(message="Device authorization request denied", status="denied")
+
+    record.status = "approved"
+    record.approved_at = utcnow_naive()
+    db.commit()
+    return AuthDeviceActionResponse(message="Device authorization request approved", status="approved")
+
+
+@router.post("/auth/device/token", response_model=AuthDeviceTokenResponse)
+async def exchange_device_authorization_token(
+    payload: AuthDeviceTokenRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    record = (
+        db.query(DeviceAuthorization)
+        .filter(DeviceAuthorization.device_code == payload.device_code.strip())
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device authorization request not found")
+
+    record.last_polled_at = utcnow_naive()
+
+    if _is_device_authorization_expired(record):
+        _mark_device_authorization_expired(record)
+        db.commit()
+        return AuthDeviceTokenResponse(status="expired", poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
+
+    if record.status == "pending":
+        db.commit()
+        return AuthDeviceTokenResponse(status="pending", poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
+
+    if record.status == "denied":
+        db.commit()
+        return AuthDeviceTokenResponse(status="denied", poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
+
+    if record.status == "completed":
+        db.commit()
+        return AuthDeviceTokenResponse(status="completed", poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
+
+    if record.status != "approved" or record.user_id is None:
+        db.commit()
+        return AuthDeviceTokenResponse(status=record.status, poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
+
+    user = db.query(User).filter(User.id == record.user_id).first()
+    if user is None:
+        record.status = "denied"
+        db.commit()
+        return AuthDeviceTokenResponse(status="denied", poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
+
+    access_token, refresh_token, _ = issue_noninteractive_login_artifacts(
+        db,
+        user,
+        request,
+        session_type="device",
+    )
+    user.last_login_at = utcnow_naive()
+    record.status = "completed"
+    record.completed_at = utcnow_naive()
+    db.commit()
+    db.refresh(user)
+
+    return AuthDeviceTokenResponse(
+        status="approved",
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=settings.JWT_ACCESS_TOKEN_EXPIRES_MINUTES * 60,
+        poll_interval=DEVICE_AUTH_INTERVAL_SECONDS,
+        user=_serialize_user(user),
+    )

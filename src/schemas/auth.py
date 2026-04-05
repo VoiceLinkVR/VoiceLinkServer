@@ -22,6 +22,20 @@ class AuthLogoutRequest(BaseModel):
     refresh_token: Optional[str] = Field(default=None, min_length=1, max_length=255)
 
 
+class AuthDeviceStartRequest(BaseModel):
+    client_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    scope: Optional[str] = Field(default="vrcls.client", min_length=1, max_length=255)
+
+
+class AuthDeviceAuthorizeRequest(BaseModel):
+    user_code: str = Field(..., min_length=4, max_length=32)
+    decision: str = Field(default="approve", min_length=4, max_length=16)
+
+
+class AuthDeviceTokenRequest(BaseModel):
+    device_code: str = Field(..., min_length=16, max_length=255)
+
+
 class AuthUserResponse(BaseModel):
     id: str
     username: str
@@ -36,3 +50,37 @@ class AuthTokenResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     user: AuthUserResponse
+
+
+class AuthDeviceStartResponse(BaseModel):
+    device_code: str
+    user_code: str
+    verification_uri: str
+    verification_uri_complete: str
+    expires_in: int
+    interval: int = 5
+
+
+class AuthDeviceRequestResponse(BaseModel):
+    user_code: str
+    client_name: str
+    requested_scope: str
+    status: str
+    expires_at: str
+    username: str = ""
+    display_name: str = ""
+
+
+class AuthDeviceActionResponse(BaseModel):
+    message: str
+    status: str
+
+
+class AuthDeviceTokenResponse(BaseModel):
+    status: str
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: str = "bearer"
+    expires_in: Optional[int] = None
+    poll_interval: int = 5
+    user: Optional[AuthUserResponse] = None

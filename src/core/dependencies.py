@@ -271,6 +271,21 @@ def issue_login_artifacts(db: Session, user: User, request: Request) -> tuple[st
     return access_token, refresh_token, session_record
 
 
+def issue_noninteractive_login_artifacts(
+    db: Session,
+    user: User,
+    request: Request,
+    *,
+    session_type: str = "device",
+) -> tuple[str, str, UserSession]:
+    session_record = create_user_session(db, user, request, session_type=session_type)
+    access_token = create_access_token(
+        {"sub": user.username, "uid": user.id, "sid": session_record.session_id, "type": "access"}
+    )
+    refresh_token, _ = create_refresh_token(db, user, session_id=session_record.session_id)
+    return access_token, refresh_token, session_record
+
+
 def rotate_refresh_token(
     db: Session,
     refresh_token: str,

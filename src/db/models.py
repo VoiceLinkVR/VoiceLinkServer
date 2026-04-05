@@ -93,6 +93,26 @@ class RefreshToken(Base):
     created_at = Column(DateTime, default=datetime.now, nullable=False)
 
 
+class DeviceAuthorization(Base):
+    __tablename__ = "device_authorization"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_code = Column(String(128), unique=True, nullable=False, index=True)
+    user_code = Column(String(32), unique=True, nullable=False, index=True)
+    client_name = Column(String(128), nullable=True)
+    requested_scope = Column(String(255), nullable=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    user_id = Column(Integer, nullable=True, index=True)
+    ip = Column(String(64), nullable=True)
+    user_agent = Column(String(512), nullable=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    approved_at = Column(DateTime, nullable=True)
+    denied_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    last_polled_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
 class RequestLog(Base):
     __tablename__ = "request_log"
 

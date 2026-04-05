@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     PORTAL_SESSION_EXPIRES_DAYS: int = 30
     PORTAL_SESSION_KEY: str = "portal_session_id"
     PORTAL_SESSION_USER_KEY: str = "portal_user_id"
+    PORTAL_PUBLIC_BASE_URL: Optional[str] = None
     JWT_ALGORITHM: str = "HS256"
     WHISPER_MODEL: str = "Systran/faster-whisper-large-v3"
     SQL_PATH: str = f"sqlite:///{project_root}/data/db/users.db"

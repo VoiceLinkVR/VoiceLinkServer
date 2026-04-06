@@ -61,6 +61,7 @@ class AccountToken(Base):
     username = Column(String(50), nullable=False, index=True)
     email = Column(String(255), nullable=True, index=True)
     purpose = Column(String(32), nullable=False, index=True)
+    code = Column(String(16), nullable=True, index=True)
     expires_at = Column(DateTime, nullable=False, index=True)
     used_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.now, nullable=False)

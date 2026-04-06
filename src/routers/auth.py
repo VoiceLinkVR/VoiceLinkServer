@@ -7,6 +7,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from core.account_email_service import (
+    REGISTER_EMAIL_PURPOSE,
+    consume_email_challenge,
+    create_email_challenge,
+    get_active_email_challenge,
+    send_email_code,
+)
 from core.config import settings
 from core.plan_catalog import build_limit_rule, get_free_plan
 from core.dependencies import (
@@ -35,9 +42,11 @@ from schemas.auth import (
     AuthLoginRequest,
     AuthLogoutRequest,
     AuthRefreshRequest,
+    AuthRegisterCodeRequest,
     AuthRegisterRequest,
     AuthTokenResponse,
     AuthUserResponse,
+    AuthVerificationChallengeResponse,
 )
 
 router = APIRouter()
@@ -128,6 +137,31 @@ def _serialize_device_request(record: DeviceAuthorization, user: User | None = N
     )
 
 
+@router.post("/auth/register/send-code", response_model=AuthVerificationChallengeResponse)
+async def send_register_code(
+    payload: AuthRegisterCodeRequest,
+    db: Session = Depends(get_db),
+):
+    email = normalize_email(payload.email)
+    existing_user = db.query(User).filter(or_(User.email == email, User.username == email)).first()
+    if existing_user is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+
+    challenge = create_email_challenge(
+        db,
+        username=email,
+        email=email,
+        purpose=REGISTER_EMAIL_PURPOSE,
+    )
+    send_email_code(email=email, purpose=REGISTER_EMAIL_PURPOSE, code=challenge.code or "")
+    db.commit()
+    return AuthVerificationChallengeResponse(
+        message="Verification code sent",
+        verification_token=challenge.token,
+        expires_in=settings.EMAIL_CODE_TTL_MINUTES * 60,
+    )
+
+
 @router.post("/auth/register", response_model=AuthTokenResponse)
 async def register(
     payload: AuthRegisterRequest,
@@ -141,12 +175,21 @@ async def register(
     if existing_user is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
 
+    register_challenge = get_active_email_challenge(
+        db,
+        token=payload.verification_token.strip(),
+        purpose=REGISTER_EMAIL_PURPOSE,
+        code=payload.verification_code.strip(),
+    )
+    if normalize_email(register_challenge.email or "") != email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Verification email does not match")
+
     free_plan = get_free_plan()
     user = User(
         username=_build_username(db, email),
         password=hash_password(payload.password),
         email=email,
-        email_verified=False,
+        email_verified=True,
         display_name=display_name,
         is_admin=False,
         is_active=True,
@@ -156,6 +199,7 @@ async def register(
     )
     db.add(user)
     db.flush()
+    consume_email_challenge(db, register_challenge)
 
     access_token, refresh_token, _ = issue_login_artifacts(db, user, request)
     db.commit()

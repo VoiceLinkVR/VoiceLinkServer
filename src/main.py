@@ -276,11 +276,16 @@ def check_and_update_db():
                     logger.info("Added index: %s", index_name)
 
         if "account_token" in inspector.get_table_names():
+            account_token_columns = [col["name"] for col in inspector.get_columns("account_token")]
+            if "code" not in account_token_columns:
+                db.execute(text("ALTER TABLE account_token ADD COLUMN code VARCHAR(16)"))
+                logger.info("Added code to account_token table")
             account_token_indexes = {idx.get("name") for idx in inspector.get_indexes("account_token")}
             for index_name, create_sql in [
                 ("idx_account_token_username_purpose", "CREATE INDEX idx_account_token_username_purpose ON account_token (username, purpose)"),
                 ("idx_account_token_email_purpose", "CREATE INDEX idx_account_token_email_purpose ON account_token (email, purpose)"),
                 ("idx_account_token_purpose_expires_at", "CREATE INDEX idx_account_token_purpose_expires_at ON account_token (purpose, expires_at)"),
+                ("idx_account_token_purpose_code", "CREATE INDEX idx_account_token_purpose_code ON account_token (purpose, code)"),
             ]:
                 if index_name not in account_token_indexes:
                     db.execute(text(create_sql))

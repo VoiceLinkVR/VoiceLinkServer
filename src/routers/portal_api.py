@@ -1,16 +1,24 @@
-import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from core.account_email_service import (
+    EMAIL_BIND_PURPOSE,
+    PASSWORD_CHANGE_PURPOSE,
+    PASSWORD_RESET_PURPOSE,
+    consume_email_challenge,
+    create_email_challenge,
+    get_active_email_challenge,
+    send_email_code,
+)
 from core.afdian_service import afdian_service
-from core.dependencies import get_current_user, get_db, hash_password, is_user_expired, normalize_email, verify_password
+from core.config import settings
+from core.dependencies import get_current_user, get_db, hash_password, is_user_expired, normalize_email
 from core.plan_catalog import get_paid_tiers
 from core.quota_service import build_quota_snapshot
-from db.models import AccountToken, PaymentOrder, User, set_payment_order_remark
+from db.models import PaymentOrder, User, set_payment_order_remark
 from routers.user_center import (
     _calculate_addon_resource_from_amount,
     _calculate_daily_limit_from_price,
@@ -51,10 +59,6 @@ from schemas.portal import (
 router = APIRouter()
 
 PLACEHOLDER_PORTAL_PASSWORD = "__portal_authenticated_user__"
-EMAIL_VERIFY_PURPOSE = "email_verify"
-PASSWORD_RESET_PURPOSE = "password_reset"
-EMAIL_VERIFY_TTL = timedelta(hours=24)
-PASSWORD_RESET_TTL = timedelta(minutes=30)
 
 
 def _format_datetime(value: Optional[datetime]) -> Optional[str]:
@@ -73,10 +77,6 @@ def _to_utc(value: Optional[datetime]) -> Optional[datetime]:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
-
-
-def _build_portal_next_url(path: str, token: str) -> str:
-    return f"{path}?token={quote(token)}"
 
 
 def _account_status(user: User) -> str:
@@ -385,64 +385,12 @@ def _create_order_intent(
     db.refresh(order)
     return order
 
-
-def _invalidate_account_tokens(
-    db: Session,
-    *,
-    username: Optional[str] = None,
-    email: Optional[str] = None,
-    purpose: Optional[str] = None,
-) -> None:
-    query = db.query(AccountToken).filter(AccountToken.used_at.is_(None))
-    if username is not None:
-        query = query.filter(AccountToken.username == username)
-    if email is not None:
-        query = query.filter(AccountToken.email == email)
-    if purpose is not None:
-        query = query.filter(AccountToken.purpose == purpose)
-    now = _utc_now_naive()
-    for record in query.all():
-        record.used_at = now
-
-
-def _create_account_token(
-    db: Session,
-    *,
-    username: str,
-    purpose: str,
-    email: Optional[str],
-    ttl: timedelta,
-) -> AccountToken:
-    normalized_email = normalize_email(email) if email else None
-    _invalidate_account_tokens(db, username=username, purpose=purpose)
-    if normalized_email:
-        _invalidate_account_tokens(db, email=normalized_email, purpose=purpose)
-
-    record = AccountToken(
-        token=secrets.token_urlsafe(32),
-        username=username,
-        email=normalized_email,
-        purpose=purpose,
-        expires_at=_utc_now_naive() + ttl,
+def _build_code_response(message: str, token: str) -> PortalActionResponse:
+    return PortalActionResponse(
+        message=message,
+        token=token,
+        expiresIn=settings.EMAIL_CODE_TTL_MINUTES * 60,
     )
-    db.add(record)
-    return record
-
-
-def _get_active_account_token(db: Session, token: str, purpose: str) -> AccountToken:
-    record = db.query(AccountToken).filter(AccountToken.token == token, AccountToken.purpose == purpose).first()
-    if record is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid token")
-    if record.used_at is not None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token already used")
-
-    expires_at = _to_utc(record.expires_at)
-    if expires_at is None or expires_at <= datetime.now(timezone.utc):
-        record.used_at = _utc_now_naive()
-        db.commit()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token expired")
-
-    return record
 
 
 @router.get("/account/profile", response_model=PortalUserResponse)
@@ -466,20 +414,45 @@ async def portal_orders(db: Session = Depends(get_db), current_user: User = Depe
     return [_serialize_order(order) for order in orders]
 
 
+@router.post("/account/change-password/send-code", response_model=PortalActionResponse)
+async def portal_send_change_password_code(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not current_user.email or not current_user.email_verified:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Bind and verify your email before changing password")
+
+    challenge = create_email_challenge(
+        db,
+        username=current_user.username,
+        email=current_user.email,
+        purpose=PASSWORD_CHANGE_PURPOSE,
+    )
+    send_email_code(email=current_user.email, purpose=PASSWORD_CHANGE_PURPOSE, code=challenge.code or "")
+    db.commit()
+    return _build_code_response("Verification code sent to your email", challenge.token)
+
+
 @router.post("/account/change-password", response_model=PortalActionResponse)
 async def portal_change_password(
     payload: PortalChangePasswordRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if not verify_password(payload.currentPassword, current_user.password):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
+    if not current_user.email or not current_user.email_verified:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Bind and verify your email before changing password")
 
-    if payload.currentPassword == payload.newPassword:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="New password must be different")
+    challenge = get_active_email_challenge(
+        db,
+        token=payload.verificationToken.strip(),
+        purpose=PASSWORD_CHANGE_PURPOSE,
+        code=payload.verificationCode.strip(),
+    )
+    if challenge.username != current_user.username:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Verification token does not belong to the current user")
 
     current_user.password = hash_password(payload.newPassword)
-    _invalidate_account_tokens(db, username=current_user.username, purpose=PASSWORD_RESET_PURPOSE)
+    consume_email_challenge(db, challenge)
     db.commit()
     return PortalActionResponse(message="Password updated")
 
@@ -499,29 +472,34 @@ async def portal_bind_email(
     if duplicate_user is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already in use")
 
-    current_user.email = email
-    current_user.email_verified = False
-    verification_token = _create_account_token(
+    verification_token = create_email_challenge(
         db,
         username=current_user.username,
-        purpose=EMAIL_VERIFY_PURPOSE,
+        purpose=EMAIL_BIND_PURPOSE,
         email=email,
-        ttl=EMAIL_VERIFY_TTL,
     )
+    send_email_code(email=email, purpose=EMAIL_BIND_PURPOSE, code=verification_token.code or "")
     db.commit()
-    return PortalActionResponse(
-        message="Email saved. Verify it with the generated token flow.",
-        nextUrl=_build_portal_next_url("/verify-email", verification_token.token),
-        token=verification_token.token,
-    )
+    return _build_code_response("Verification code sent to the new email address", verification_token.token)
 
 
 @router.post("/account/verify-email", response_model=PortalActionResponse)
-async def portal_verify_email(payload: PortalVerifyEmailRequest, db: Session = Depends(get_db)):
-    record = _get_active_account_token(db, payload.token.strip(), EMAIL_VERIFY_PURPOSE)
+async def portal_verify_email(
+    payload: PortalVerifyEmailRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    record = get_active_email_challenge(
+        db,
+        token=payload.token.strip(),
+        purpose=EMAIL_BIND_PURPOSE,
+        code=(payload.code or "").strip(),
+    )
     user = db.query(User).filter(User.username == record.username).first()
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if user.username != current_user.username:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Verification token does not belong to the current user")
     if not record.email:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token does not contain email")
 
@@ -531,8 +509,7 @@ async def portal_verify_email(payload: PortalVerifyEmailRequest, db: Session = D
 
     user.email = record.email
     user.email_verified = True
-    record.used_at = _utc_now_naive()
-    _invalidate_account_tokens(db, username=user.username, purpose=EMAIL_VERIFY_PURPOSE)
+    consume_email_challenge(db, record)
     db.commit()
     return PortalActionResponse(message="Email verified")
 
@@ -540,35 +517,35 @@ async def portal_verify_email(payload: PortalVerifyEmailRequest, db: Session = D
 @router.post("/account/forgot-password", response_model=PortalActionResponse)
 async def portal_forgot_password(payload: PortalForgotPasswordRequest, db: Session = Depends(get_db)):
     email = normalize_email(payload.email)
-    user = db.query(User).filter(User.email == email).first()
+    user = db.query(User).filter(User.email == email, User.email_verified == True).first()
     if user is None:
-        return PortalActionResponse(message="If the email exists, a reset token has been prepared.")
+        return PortalActionResponse(message="If the email exists, a verification code has been prepared.")
 
-    reset_token = _create_account_token(
+    reset_token = create_email_challenge(
         db,
         username=user.username,
         purpose=PASSWORD_RESET_PURPOSE,
         email=email,
-        ttl=PASSWORD_RESET_TTL,
     )
+    send_email_code(email=email, purpose=PASSWORD_RESET_PURPOSE, code=reset_token.code or "")
     db.commit()
-    return PortalActionResponse(
-        message="Password reset token created.",
-        nextUrl=_build_portal_next_url("/reset-password", reset_token.token),
-        token=reset_token.token,
-    )
+    return _build_code_response("Verification code sent to your email", reset_token.token)
 
 
 @router.post("/account/reset-password", response_model=PortalActionResponse)
 async def portal_reset_password(payload: PortalResetPasswordRequest, db: Session = Depends(get_db)):
-    record = _get_active_account_token(db, payload.token.strip(), PASSWORD_RESET_PURPOSE)
+    record = get_active_email_challenge(
+        db,
+        token=payload.token.strip(),
+        purpose=PASSWORD_RESET_PURPOSE,
+        code=payload.code.strip(),
+    )
     user = db.query(User).filter(User.username == record.username).first()
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     user.password = hash_password(payload.password)
-    record.used_at = _utc_now_naive()
-    _invalidate_account_tokens(db, username=user.username, purpose=PASSWORD_RESET_PURPOSE)
+    consume_email_challenge(db, record)
     db.commit()
     return PortalActionResponse(message="Password reset complete")
 

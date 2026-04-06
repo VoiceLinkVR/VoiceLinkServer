@@ -7,6 +7,12 @@ class AuthRegisterRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
     password: str = Field(..., min_length=6, max_length=255)
     display_name: str = Field(..., min_length=1, max_length=100)
+    verification_token: str = Field(..., min_length=8, max_length=255)
+    verification_code: str = Field(..., min_length=4, max_length=16)
+
+
+class AuthRegisterCodeRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
 
 
 class AuthLoginRequest(BaseModel):
@@ -50,6 +56,12 @@ class AuthTokenResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     user: AuthUserResponse
+
+
+class AuthVerificationChallengeResponse(BaseModel):
+    message: str
+    verification_token: str
+    expires_in: int
 
 
 class AuthDeviceStartResponse(BaseModel):

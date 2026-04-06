@@ -4,7 +4,8 @@ from pydantic import BaseModel, Field
 
 
 class PortalChangePasswordRequest(BaseModel):
-    currentPassword: str = Field(..., min_length=1, max_length=255)
+    verificationToken: str = Field(..., min_length=8, max_length=255)
+    verificationCode: str = Field(..., min_length=4, max_length=16)
     newPassword: str = Field(..., min_length=6, max_length=255)
 
 
@@ -21,12 +22,17 @@ class PortalBindEmailRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
 
 
+class PortalSendEmailCodeRequest(BaseModel):
+    email: Optional[str] = Field(default=None, min_length=3, max_length=255)
+
+
 class PortalForgotPasswordRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
 
 
 class PortalResetPasswordRequest(BaseModel):
     token: str = Field(..., min_length=1, max_length=255)
+    code: str = Field(..., min_length=4, max_length=16)
     password: str = Field(..., min_length=6, max_length=255)
 
 
@@ -39,6 +45,7 @@ class PortalActionResponse(BaseModel):
     message: str
     nextUrl: str = ""
     token: str = ""
+    expiresIn: int = 0
 
 
 class PortalUserResponse(BaseModel):

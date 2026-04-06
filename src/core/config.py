@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     PORTAL_SESSION_KEY: str = "portal_session_id"
     PORTAL_SESSION_USER_KEY: str = "portal_user_id"
     PORTAL_PUBLIC_BASE_URL: Optional[str] = None
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: int = 465
+    SMTP_USERNAME: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
+    SMTP_FROM_EMAIL: Optional[str] = None
+    SMTP_FROM_NAME: str = "VoiceLinkVR"
+    SMTP_USE_SSL: bool = True
+    EMAIL_CODE_LENGTH: int = 6
+    EMAIL_CODE_TTL_MINUTES: int = 10
     JWT_ALGORITHM: str = "HS256"
     WHISPER_MODEL: str = "Systran/faster-whisper-large-v3"
     SQL_PATH: str = f"sqlite:///{project_root}/data/db/users.db"

@@ -44,7 +44,6 @@ from routers.user_center import (
     _get_resource_increment_per_step,
     _get_user_price_and_limit_rule,
     _has_active_subscription,
-    _is_downgrade_allowed,
     _is_first_purchase_like,
     _is_new_quota_purchase_enabled,
     _normalize_action,
@@ -231,7 +230,6 @@ def _payment_title(order: PaymentOrder) -> str:
     action_map = {
         "renew": "Renew subscription",
         "upgrade": "Upgrade subscription",
-        "downgrade": "Downgrade subscription",
         "addon": "Quota addon",
     }
     return action_map.get((order.action or "").strip().lower(), "Billing order")
@@ -274,8 +272,6 @@ def _guide_option_for_action(raw_guide: dict, action: str) -> dict:
         return raw_guide.get("renew_option") or {}
     if action == "upgrade":
         return raw_guide.get("upgrade_option") or {}
-    if action == "downgrade":
-        return raw_guide.get("downgrade_option") or {}
     if action == "addon":
         return raw_guide.get("addon_option") or {}
     return {}
@@ -402,7 +398,6 @@ def _serialize_billing_guide(user: V2User) -> PortalBillingGuideResponse:
             "allowed_actions": [],
             "renew_option": {**(raw.get("renew_option") or {}), "allowed": False},
             "upgrade_option": {**(raw.get("upgrade_option") or {}), "allowed": False},
-            "downgrade_option": {**(raw.get("downgrade_option") or {}), "allowed": False},
             "addon_option": {**(raw.get("addon_option") or {}), "allowed": False},
             "addon_enabled": False,
         }
@@ -423,7 +418,6 @@ def _serialize_billing_guide(user: V2User) -> PortalBillingGuideResponse:
         allowedActions=[str(item) for item in raw.get("allowed_actions", []) if str(item).strip()],
         renewOption=_serialize_guide_option(raw.get("renew_option") or {}),
         upgradeOption=_serialize_guide_option(raw.get("upgrade_option") or {}),
-        downgradeOption=_serialize_guide_option(raw.get("downgrade_option") or {}),
         addonOption=_serialize_addon_guide(raw.get("addon_option") or {}),
         addonEnabled=bool(raw.get("addon_enabled", False)),
         addonResourceBalance=int(raw.get("addon_resource_balance") or 0),
@@ -495,10 +489,10 @@ def _resolve_plan(user: V2User, plan_id: str) -> tuple[str, int, float, float]:
     elif target_price > current_price:
         action = "upgrade"
     elif target_price < current_price:
-        action = "downgrade"
-
-    if action == "downgrade" and not _is_downgrade_allowed(user, expired, current_price):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Downgrade is not allowed")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selected tier must not be lower than current tier",
+        )
 
     if action == "upgrade":
         donation_amount = round(max(0.0, target_price - current_price) * months, 2)
@@ -513,6 +507,8 @@ def _resolve_plan(user: V2User, plan_id: str) -> tuple[str, int, float, float]:
 
 def _resolve_checkout_request(user: V2User, payload: PortalCreateOrderIntentRequest) -> tuple[str, int, float, float]:
     requested_action = (payload.action or "").strip().lower()
+    if requested_action and requested_action not in {"renew", "upgrade", "addon"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported billing action")
     if payload.planId:
         resolved = _resolve_plan(user, payload.planId)
     else:

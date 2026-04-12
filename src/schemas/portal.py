@@ -180,7 +180,6 @@ class PortalBillingGuideResponse(BaseModel):
     allowedActions: List[str]
     renewOption: PortalBillingGuideOptionResponse
     upgradeOption: PortalBillingGuideOptionResponse
-    downgradeOption: PortalBillingGuideOptionResponse
     addonOption: PortalBillingAddonGuideResponse
     addonEnabled: bool = False
     addonResourceBalance: int = 0

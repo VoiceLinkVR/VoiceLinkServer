@@ -367,7 +367,7 @@
 | `intent_no` | varchar(64) | 内部支付意图号 |
 | `user_id` | bigint fk users.id | 用户 |
 | `provider` | varchar(32) | `afdian` |
-| `action` | varchar(32) | `renew / upgrade / downgrade / addon` |
+| `action` | varchar(32) | `renew / upgrade / addon` |
 | `plan_id` | bigint fk plans.id null | 套餐 |
 | `months` | int null | 月数 |
 | `amount` | decimal(10,2) | 支付金额 |

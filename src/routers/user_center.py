@@ -57,7 +57,6 @@ ACTION_ALIASES = {
     "boost_1m": "upgrade",
     "renew": "renew",
     "upgrade": "upgrade",
-    "downgrade": "downgrade",
     "addon": "addon",
 }
 PRICE_EPSILON = 0.0001
@@ -478,170 +477,8 @@ def _get_user_price_and_limit_rule(user: Optional[User | V2User]) -> tuple[float
     price = round(float(plan["monthly_price"]), 2)
     return price, effective_rule
 
-
-def _is_downgrade_allowed(user: Optional[User], is_expired: bool, current_price: float) -> bool:
-    return False
-
-
 def _is_first_purchase_like(user: Optional[User], is_expired: bool) -> bool:
     return user is None or is_expired
-
-
-def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[str, Any]:
-    price_step = int(round(_get_price_step()))
-    resource_step = _get_resource_increment_per_step()
-    addon_step = round(_get_addon_price_step(), 2)
-    addon_resource_step = _get_addon_resource_increment()
-    current_price, effective_rule = _get_user_price_and_limit_rule(user)
-    free_plan = get_free_plan()
-    current_plan = resolve_plan_from_rule(
-        effective_rule,
-        getattr(user, "expiration_date", None) if user is not None else None,
-    )
-    is_registered = user is not None
-
-    is_expired = False
-    if user is not None:
-        is_expired, _ = is_user_expired(user)
-
-    is_free_plan = current_price <= PRICE_EPSILON
-    renew_prices = (
-        list(_list_paid_tier_prices())
-        if (not is_registered) or is_free_plan or is_expired
-        else ([round(float(current_price), 2)] if current_price > PRICE_EPSILON else list(_list_paid_tier_prices()))
-    )
-    upgrade_prices = (
-        _list_paid_tier_prices(minimum_price=round(float(current_price), 2) + PRICE_EPSILON)
-        if is_registered and (not is_free_plan) and (not is_expired)
-        else []
-    )
-    renew_price_quota_map = _build_price_quota_map(renew_prices)
-    upgrade_price_quota_map = _build_price_quota_map(upgrade_prices)
-    allowed_actions = ["renew"] if renew_prices else []
-    if upgrade_prices:
-        allowed_actions.append("upgrade")
-    addon_allowed = False
-
-    guide_payload = {
-        "v": 1,
-        "ts": int(datetime.now(timezone.utc).timestamp()),
-        "current_price": round(float(current_price), 2),
-        "price_step": price_step,
-        "resource_step": resource_step,
-        "effective_rule": effective_rule,
-        "is_expired": is_expired,
-    }
-    guide_token = _build_payment_guide_token(username, guide_payload)
-
-    renew_target_price = renew_prices[0] if renew_prices else round(float(current_price), 2)
-    if is_registered and round(float(current_price), 2) in renew_prices:
-        renew_target_price = round(float(current_price), 2)
-    renew_target_quota = renew_price_quota_map.get(_price_key(renew_target_price), int(current_plan["daily_quota"]))
-
-    renew_option = {
-        "allowed": bool(renew_prices),
-        "readonly": len(renew_prices) <= 1,
-        "default_monthly_price": renew_target_price,
-        "min_monthly_price": renew_prices[0] if renew_prices else renew_target_price,
-        "max_monthly_price": renew_prices[-1] if renew_prices else renew_target_price,
-        "step": price_step,
-        "target_resource_quota_preview": renew_target_quota,
-        "price_options": renew_prices,
-        "quota_preview_by_price": renew_price_quota_map,
-    }
-
-    upgrade_target_price = upgrade_prices[0] if upgrade_prices else None
-    upgrade_option = {
-        "allowed": bool(upgrade_prices),
-        "readonly": len(upgrade_prices) <= 1,
-        "default_monthly_price": upgrade_target_price,
-        "min_monthly_price": upgrade_prices[0] if upgrade_prices else None,
-        "max_monthly_price": upgrade_prices[-1] if upgrade_prices else None,
-        "step": price_step,
-        "target_resource_quota_preview": (
-            upgrade_price_quota_map.get(_price_key(upgrade_target_price))
-            if upgrade_target_price is not None
-            else None
-        ),
-        "price_options": upgrade_prices,
-        "quota_preview_by_price": upgrade_price_quota_map,
-    }
-
-    downgrade_allowed = False
-    downgrade_option = {
-        "allowed": downgrade_allowed,
-        "readonly": True,
-        "default_monthly_price": round(float(current_price), 2),
-        "min_monthly_price": round(float(current_price), 2),
-        "max_monthly_price": round(float(current_price), 2),
-        "step": price_step,
-        "target_resource_quota_preview": int(current_plan["daily_quota"]),
-        "price_options": [],
-        "quota_preview_by_price": {},
-    }
-
-    addon_option = {
-        "allowed": addon_allowed,
-        "readonly": False,
-        "default_amount": addon_step,
-        "min_amount": addon_step,
-        "max_amount": None,
-        "step": addon_step,
-        "resource_increment": addon_resource_step,
-        "default_resource_quota_preview": _calculate_addon_resource_from_amount(addon_step),
-        "requires_active_subscription": True,
-    }
-
-    display_monthly_price = round(float(current_price), 2)
-    display_plan_name = "Free" if is_free_plan else f"￥{display_monthly_price:.2f}/月"
-    if not is_registered:
-        display_plan_name = "首次开通（默认免费档，付费升级）"
-    display_resource_summary = (
-        f"{int(current_plan['daily_quota'])}/day"
-        if is_registered
-        else f"免费档 {int(free_plan['daily_quota'])}/day"
-    )
-
-    anchor_reason = (
-        "unregistered"
-        if not is_registered
-        else ("free" if is_free_plan else "current")
-    )
-
-    display_plan_name = "Free" if is_free_plan else f"CNY {display_monthly_price:.2f} / month"
-    if not is_registered:
-        display_plan_name = "First purchase"
-    display_resource_summary = (
-        f"{int(current_plan['daily_quota'])}/day"
-        if is_registered
-        else f"Free {int(free_plan['daily_quota'])}/day"
-    )
-    anchor_reason = "unregistered" if not is_registered else ("expired" if is_expired else ("free" if is_free_plan else "current"))
-
-    return {
-        "username": username,
-        "is_test_user": _is_test_user(username),
-        "is_registered": is_registered,
-        "is_expired": is_expired,
-        "status": "unregistered" if not is_registered else "ok",
-        "price_step": price_step,
-        "resource_increment_per_step": resource_step,
-        "display_plan_name": display_plan_name,
-        "display_monthly_price": display_monthly_price,
-        "display_resource_quota": int(current_plan["daily_quota"]),
-        "display_resource_summary": display_resource_summary,
-        "anchor_reason": anchor_reason,
-        "allowed_actions": allowed_actions,
-        "renew_option": renew_option,
-        "upgrade_option": upgrade_option,
-        "downgrade_option": downgrade_option,
-        "addon_option": addon_option,
-        "addon_enabled": False,
-        "addon_resource_balance": int(getattr(user, "addon_resource_balance", 0) or 0) if user is not None else 0,
-        "addon_resource_total": int(getattr(user, "addon_resource_total", 0) or 0) if user is not None else 0,
-        "addon_expiration_utc": _to_utc_iso(getattr(user, "addon_expiration_date", None)) if user is not None else None,
-        "guide_token": guide_token,
-    }
 
 def _get_subscription_pricing_mode() -> str:
     mode = get_subscription_mode()
@@ -806,18 +643,6 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
         "allowed_actions": allowed_actions,
         "renew_option": renew_option,
         "upgrade_option": upgrade_option,
-        "downgrade_option": {
-            "allowed": False,
-            "readonly": True,
-            "pricing_mode": pricing_mode,
-            "default_monthly_price": current_price_rounded,
-            "min_monthly_price": current_price_rounded,
-            "max_monthly_price": current_price_rounded,
-            "step": price_step,
-            "target_resource_quota_preview": int(resolved_current_plan["daily_quota"]),
-            "price_options": [],
-            "quota_preview_by_price": {},
-        },
         "addon_option": addon_option,
         "addon_enabled": addon_allowed,
         "addon_resource_balance": int(getattr(user, "addon_resource_balance", 0) or 0) if user is not None else 0,
@@ -1337,41 +1162,6 @@ async def activate_remote_afdian_order(
         user.boost_limit_rule = None
         user.is_active = True
         _sync_addon_expiration_with_subscription(user)
-    elif action == "downgrade":
-        if not _is_downgrade_allowed(user, is_expired, current_price):
-            detail = "当前账号不支持降档"
-            _record_order_activation_failure(
-                db,
-                local_order,
-                detail,
-                source,
-                remote_order,
-                source_payload,
-                {"custom_payload": custom_payload},
-            )
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-        if plan_price >= current_price - PRICE_EPSILON:
-            detail = "降档套餐必须低于当前档位"
-            _record_order_activation_failure(
-                db,
-                local_order,
-                detail,
-                source,
-                remote_order,
-                source_payload,
-                {"custom_payload": custom_payload},
-            )
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-
-        user.limit_rule = _build_limit_rule_for_plan(
-            user.limit_rule or settings.FREE_PLAN_LIMIT_RULE,
-            plan_price,
-        )
-        user.boost_expiration_date = None
-        user.boost_limit_rule = None
-        user.is_active = True
-        _sync_addon_expiration_with_subscription(user)
-
     if action == "addon":
         if not _is_new_quota_purchase_enabled():
             detail = "资源包仅在新资源模式下可激活"
@@ -1568,7 +1358,7 @@ async def create_payment_link(
             plan_price = _normalize_plan_price(payload.target_monthly_price)
         elif payload.plan_price is not None:
             plan_price = _normalize_plan_price(payload.plan_price)
-        elif payload.custom_price is not None and (action in ("upgrade", "downgrade") or first_purchase_like):
+        elif payload.custom_price is not None and (action == "upgrade" or first_purchase_like):
             plan_price = _normalize_plan_price(payload.custom_price)
         else:
             plan_price = _normalize_plan_price(guide_price if guide_price is not None else current_price)
@@ -1577,11 +1367,6 @@ async def create_payment_link(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="续费不支持升档，请选择升级")
     if action == "upgrade" and user and plan_price <= current_price + PRICE_EPSILON:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="升级档位必须高于当前档位")
-    if action == "downgrade":
-        if not _is_downgrade_allowed(user, is_expired, current_price):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前账号不支持降档")
-        if user and plan_price >= current_price - PRICE_EPSILON:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="降档档位必须低于当前档位")
 
     # 计算订单金额：
     # - renew / 首次购买：按目标月价 * 月数 收费；
@@ -1784,22 +1569,6 @@ async def activate_order(
         converted_remaining_days = float(total_days_int)
 
         user.expiration_date = now_utc + timedelta(days=total_days_int)
-        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.FREE_PLAN_LIMIT_RULE, plan_price)
-        user.boost_expiration_date = None
-        user.boost_limit_rule = None
-        user.is_active = True
-        _sync_addon_expiration_with_subscription(user)
-
-    elif action == "downgrade":
-        if not _is_downgrade_allowed(user, is_expired, current_price):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前账号不支持降档")
-        if plan_price >= current_price - PRICE_EPSILON:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="降档档位必须低于当前档位")
-
-        # Downgrade only changes limit rule; expiration remains as-is.
-        if is_new_user:
-            user = _build_new_afdian_user(username, password)
-            db.add(user)
         user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.FREE_PLAN_LIMIT_RULE, plan_price)
         user.boost_expiration_date = None
         user.boost_limit_rule = None

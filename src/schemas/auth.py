@@ -1,12 +1,11 @@
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AuthRegisterRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
     password: str = Field(..., min_length=6, max_length=255)
-    display_name: str = Field(..., min_length=1, max_length=100)
     verification_token: str = Field(..., min_length=8, max_length=255)
     verification_code: str = Field(..., min_length=4, max_length=16)
 
@@ -16,8 +15,15 @@ class AuthRegisterCodeRequest(BaseModel):
 
 
 class AuthLoginRequest(BaseModel):
-    login: str = Field(..., min_length=1, max_length=255)
+    login: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    email: Optional[str] = Field(default=None, min_length=3, max_length=255)
     password: str = Field(..., min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def ensure_login_value(self) -> "AuthLoginRequest":
+        if not (self.login or self.email):
+            raise ValueError("Either login or email is required")
+        return self
 
 
 class AuthRefreshRequest(BaseModel):
@@ -44,11 +50,15 @@ class AuthDeviceTokenRequest(BaseModel):
 
 class AuthUserResponse(BaseModel):
     id: str
+    user_uuid: str
     username: str
+    legacy_username: str = ""
     email: str = ""
     display_name: str
     email_verified: bool = False
     is_admin: bool = False
+    identity_version: int = 1
+    migration_required: bool = False
 
 
 class AuthTokenResponse(BaseModel):
@@ -80,6 +90,7 @@ class AuthDeviceRequestResponse(BaseModel):
     status: str
     expires_at: str
     username: str = ""
+    user_uuid: str = ""
     display_name: str = ""
 
 

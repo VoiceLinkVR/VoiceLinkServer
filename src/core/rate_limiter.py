@@ -1,4 +1,3 @@
-# src/core/rate_limiter.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -25,13 +24,10 @@ USER_CENTER_SCOPE = "user_center"
 
 
 def _utc_day_bucket() -> str:
-    """Daily rate-limit buckets are aligned to UTC calendar days."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 class RateLimitExceeded(Exception):
-    """Unified rate-limit exception payload used by the FastAPI app."""
-
     def __init__(self, limit: str, scope: Optional[str], key: str, triggered_limit: str):
         super().__init__("Too many request")
         self.limit = limit
@@ -60,7 +56,6 @@ def _strip_day_limits(limit_string: str) -> str:
 
 
 def get_client_ip(request: Request) -> str:
-    """Resolve the client IP using the same priority as the legacy server."""
     x_real_ip = request.headers.get("x-real-ip")
     x_forwarded_for = request.headers.get("x-forwarded-for")
     if x_real_ip:
@@ -112,12 +107,7 @@ class RateLimitContext:
             try:
                 self.limiter.strategy.hit(item, self.composite_key, cost=self.normalized_cost)
             except Exception as exc:  # pylint: disable=broad-except
-                logger.error(
-                    "[RATE-LIMITER] Failed to commit rate-limit hit (key=%s, limit=%s): %s",
-                    self.composite_key,
-                    item,
-                    exc,
-                )
+                logger.error("[RATE-LIMITER] Failed to commit hit (key=%s, limit=%s): %s", self.composite_key, item, exc)
 
     def should_deduct(self, status_code: int) -> bool:
         try:
@@ -195,39 +185,35 @@ async def enforce_user_rate_limit(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> User:
-    """Apply per-user rate limiting using the current FastAPI request context."""
-
+    client_ip = get_client_ip(request)
     request.state.quota_user = current_user
     request.state.quota_db = db
     request.state.quota_username = current_user.username
+    request.state.quota_client_ip = client_ip
     request.state.pending_quota_allocation = None
 
     if not rate_limiter.enabled:
         return current_user
 
     limit_rule = get_effective_user_limit_rule(current_user) or FALLBACK_USER_LIMIT
+    is_default_test_user = bool(getattr(current_user, "is_default_test_user", False))
 
-    is_public_test_user = (
-        settings.LIMIT_PUBLIC_TEST_USER is not None
-        and current_user.username == settings.LIMIT_PUBLIC_TEST_USER
-    )
-
-    if is_public_test_user:
+    if is_default_test_user:
+        limit_rule = settings.DEFAULT_TEST_USER_IP_RATE_LIMIT or limit_rule
         context = rate_limiter.create_context(
             limit_string=limit_rule,
-            key=f"{get_client_ip(request)}:{_utc_day_bucket()}",
-            scope=SHARED_LIMIT_SCOPE,
+            key=f"{client_ip}:{_utc_day_bucket()}",
+            scope=f"anonymous_ip:{client_ip}",
             context_type="user",
-            deduct_when=lambda status: True,
+            deduct_when=lambda status: status == 200,
         )
     else:
         if not settings.LEGACY_CLIENT_COMPAT:
             limit_rule = _strip_day_limits(limit_rule)
-        daily_key = f"{current_user.username}:{_utc_day_bucket()}"
         context = rate_limiter.create_context(
             limit_string=limit_rule,
-            key=daily_key,
-            scope=f"user:{current_user.username}",
+            key=f"{current_user.user_uuid or current_user.username}:{_utc_day_bucket()}",
+            scope=f"user:{current_user.user_uuid or current_user.username}",
             context_type="user",
             deduct_when=lambda status: status == 200,
         )
@@ -244,7 +230,6 @@ async def enforce_user_rate_limit(
 
 
 def set_user_context_cost(request: Request, cost: int) -> None:
-    """Update request-scoped quota cost and re-check the user rate-limit context."""
     desired_cost = max(1, int(cost or 1))
     if rate_limiter.enabled:
         for context in getattr(request.state, "rate_limit_contexts", []):
@@ -258,15 +243,14 @@ def set_user_context_cost(request: Request, cost: int) -> None:
 
     db = getattr(request.state, "quota_db", None)
     current_user = getattr(request.state, "quota_user", None)
+    client_ip = getattr(request.state, "quota_client_ip", None)
     if db is None or current_user is None:
         return
 
-    request.state.pending_quota_allocation = prepare_quota_allocation(db, current_user, desired_cost)
+    request.state.pending_quota_allocation = prepare_quota_allocation(db, current_user, desired_cost, client_ip=client_ip)
 
 
 async def enforce_user_center_rate_limit(request: Request) -> None:
-    """Apply a dedicated per-IP limit for user-center endpoints."""
-
     if not rate_limiter.enabled:
         return
 

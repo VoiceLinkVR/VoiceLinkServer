@@ -51,6 +51,29 @@ class AfdianService:
         token = self._fernet.encrypt(self._to_compact_json(payload).encode("utf-8"))
         return token.decode("utf-8")
 
+    def build_v2_custom_order_id(
+        self,
+        *,
+        user_uuid: str,
+        action: str,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        payload = {
+            "v": 2,
+            "kind": "portal_billing",
+            "user_uuid": user_uuid,
+            "action": action,
+            "ts": int(time.time()),
+            "nonce": uuid.uuid4().hex[:16],
+        }
+        if extra_payload:
+            for key, value in extra_payload.items():
+                if key in payload:
+                    continue
+                payload[key] = value
+        token = self._fernet.encrypt(self._to_compact_json(payload).encode("utf-8"))
+        return token.decode("utf-8")
+
     def parse_custom_id(self, custom_id: str) -> Dict[str, Any]:
         if not custom_id:
             raise ValueError("custom_id is empty")

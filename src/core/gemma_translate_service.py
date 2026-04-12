@@ -1,3 +1,4 @@
+import base64
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -247,6 +248,37 @@ def _build_completion_prompt(text: str, source_lang: str, target_lang: str) -> s
     )
 
 
+def _build_image_completion_prompt(source_lang: str, target_lang: str) -> str:
+    mapped_source = _map_lang_code(source_lang)
+    mapped_target = _map_lang_code(target_lang)
+    target_name = _language_name(target_lang)
+
+    if is_auto_lang_code(source_lang):
+        return (
+            f"<start_of_turn>user\n"
+            f"You are a professional translator. Detect the source language text in the provided image and translate it into "
+            f"{target_name} ({mapped_target}). Produce only the {target_name} translation, without any additional explanations, "
+            f"alternatives or commentary. Focus only on the text, do not output where the text is located, surrounding objects "
+            f"or any other explanation about the picture. Ignore symbols, pictogram, and arrows!\n\n\n"
+            f"<__media__><end_of_turn>\n"
+            f"<start_of_turn>model\n"
+        )
+
+    source_name = _language_name(source_lang)
+    return (
+        f"<start_of_turn>user\n"
+        f"You are a professional {source_name} ({mapped_source}) to {target_name} ({mapped_target}) translator. "
+        f"Your goal is to accurately convey the meaning and nuances of the original {source_name} text while adhering "
+        f"to {target_name} grammar, vocabulary, and cultural sensitivities.\n"
+        f"Please translate the {source_name} text in the provided image into {target_name}. Produce only the {target_name} "
+        f"translation, without any additional explanations, alternatives or commentary. Focus only on the text, do not "
+        f"output where the text is located, surrounding objects or any other explanation about the picture. Ignore "
+        f"symbols, pictogram, and arrows!\n\n\n"
+        f"<__media__><end_of_turn>\n"
+        f"<start_of_turn>model\n"
+    )
+
+
 def _build_completion_payload(
     text: str,
     source_lang: str,
@@ -260,6 +292,103 @@ def _build_completion_payload(
         "n_predict": _resolve_max_new_tokens(text, max_new_tokens),
         "temperature": 0.2,
         "cache_prompt": True,
+    }
+
+    resolved_model = model if model is not None else settings.GEMMA_TRANSLATE_MODEL
+    if resolved_model:
+        payload["model"] = resolved_model
+
+    return _apply_extra_params(payload, extra_params)
+
+
+def _guess_image_media_type(image_bytes: bytes, media_type: Optional[str]) -> str:
+    normalized = (media_type or "").strip().lower()
+    if normalized in {"image/png", "image/jpeg", "image/jpg", "image/webp"}:
+        return "image/jpeg" if normalized == "image/jpg" else normalized
+
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+def _build_image_data_url(image_bytes: bytes, media_type: Optional[str]) -> str:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{_guess_image_media_type(image_bytes, media_type)};base64,{encoded}"
+
+
+def is_gemma_image_translation_supported(source_lang: str, target_lang: str) -> bool:
+    if is_auto_lang_code(target_lang):
+        return False
+
+    normalized_target = _normalize_lang_code(target_lang)
+    if normalized_target not in GEMMA_SUPPORTED_LANG_CODES:
+        return False
+
+    if is_auto_lang_code(source_lang):
+        return True
+
+    normalized_source = _normalize_lang_code(source_lang)
+    return normalized_source in GEMMA_SUPPORTED_LANG_CODES
+
+
+def _build_image_completion_payload(
+    image_bytes: bytes,
+    media_type: Optional[str],
+    source_lang: str,
+    target_lang: str,
+    model: Optional[str],
+    max_new_tokens: Optional[int],
+    extra_params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "prompt": {
+            "prompt_string": _build_image_completion_prompt(source_lang, target_lang),
+            "multimodal_data": [
+                base64.b64encode(image_bytes).decode("ascii"),
+            ],
+        },
+        "n_predict": _resolve_max_new_tokens("", max_new_tokens),
+        "temperature": 0.2,
+        "stream": False,
+        "cache_prompt": True,
+    }
+
+    resolved_model = model if model is not None else settings.GEMMA_TRANSLATE_MODEL
+    if resolved_model:
+        payload["model"] = resolved_model
+
+    return _apply_extra_params(payload, extra_params)
+
+
+def _build_image_openai_payload(
+    image_bytes: bytes,
+    media_type: Optional[str],
+    source_lang: str,
+    target_lang: str,
+    model: Optional[str],
+    max_new_tokens: Optional[int],
+    extra_params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source_lang_code": _map_lang_code(source_lang),
+                        "target_lang_code": _map_lang_code(target_lang),
+                        "url": _build_image_data_url(image_bytes, media_type),
+                    }
+                ],
+            }
+        ],
+        "max_tokens": _resolve_max_new_tokens("", max_new_tokens),
+        "temperature": 0.2,
     }
 
     resolved_model = model if model is not None else settings.GEMMA_TRANSLATE_MODEL
@@ -537,3 +666,92 @@ async def async_gemma_translate(
     if translated is not None:
         return translated
     return await _try_openai_async(text, source_lang, target_lang, model, max_new_tokens, extra_params)
+
+
+async def async_gemma_image_translate(
+    image_bytes: bytes,
+    source_lang: str,
+    target_lang: str,
+    media_type: Optional[str] = None,
+    model: Optional[str] = None,
+    max_new_tokens: Optional[int] = None,
+    extra_params: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    if not image_bytes:
+        return ""
+
+    if not is_gemma_image_translation_supported(source_lang, target_lang):
+        logger.warning(
+            "[GEMMA_TRANSLATE] unsupported image translation language pair: source=%s, target=%s",
+            source_lang,
+            target_lang,
+        )
+        return None
+
+    mode = _resolve_api_mode()
+    if mode in {"completion", "auto"}:
+        payload = _build_image_completion_payload(
+            image_bytes=image_bytes,
+            media_type=media_type,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            model=model,
+            max_new_tokens=max_new_tokens,
+            extra_params=extra_params,
+        )
+        translate_url = f"{_resolve_base_url()}/completion"
+        prefix = "[GEMMA_TRANSLATE][IMAGE][COMPLETION]"
+
+        try:
+            _log_request_context(prefix, source_lang, target_lang, _map_lang_code(source_lang), _map_lang_code(target_lang), "<image>")
+            async with httpx.AsyncClient(timeout=settings.GEMMA_TRANSLATE_TIMEOUT) as client:
+                response = await client.post(translate_url, json=payload)
+                response.raise_for_status()
+                translated = _extract_completion_translation(response.json())
+                if translated is None:
+                    logger.warning("%s invalid response payload from %s", prefix, translate_url)
+                if translated is not None or mode == "completion":
+                    return translated
+        except httpx.TimeoutException:
+            logger.warning("%s timeout calling %s", prefix, translate_url)
+            if mode == "completion":
+                return None
+        except httpx.HTTPStatusError as exc:
+            logger.warning("%s http error: %s, body=%s", prefix, exc.response.status_code, exc.response.text[:300])
+            if mode == "completion":
+                return None
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("%s unexpected error: %s", prefix, exc)
+            if mode == "completion":
+                return None
+
+    payload = _build_image_openai_payload(
+        image_bytes=image_bytes,
+        media_type=media_type,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        model=model,
+        max_new_tokens=max_new_tokens,
+        extra_params=extra_params,
+    )
+    translate_url = f"{_resolve_base_url()}/v1/chat/completions"
+    prefix = "[GEMMA_TRANSLATE][IMAGE][OPENAI]"
+
+    try:
+        _log_request_context(prefix, source_lang, target_lang, _map_lang_code(source_lang), _map_lang_code(target_lang), "<image>")
+        async with httpx.AsyncClient(timeout=settings.GEMMA_TRANSLATE_TIMEOUT) as client:
+            response = await client.post(translate_url, json=payload)
+            response.raise_for_status()
+            translated = _extract_openai_translation(response.json())
+            if translated is None:
+                logger.warning("%s invalid response payload from %s", prefix, translate_url)
+            return translated
+    except httpx.TimeoutException:
+        logger.warning("%s timeout calling %s", prefix, translate_url)
+        return None
+    except httpx.HTTPStatusError as exc:
+        logger.warning("%s http error: %s, body=%s", prefix, exc.response.status_code, exc.response.text[:300])
+        return None
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("%s unexpected error: %s", prefix, exc)
+        return None

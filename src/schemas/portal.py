@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -20,6 +20,11 @@ class PortalCreateOrderIntentRequest(BaseModel):
 
 class PortalBindEmailRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
+    migrationToken: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+
+class PortalUpdateProfileRequest(BaseModel):
+    displayName: Optional[str] = Field(default=None, max_length=100)
 
 
 class PortalSendEmailCodeRequest(BaseModel):
@@ -39,6 +44,17 @@ class PortalResetPasswordRequest(BaseModel):
 class PortalVerifyEmailRequest(BaseModel):
     token: str = Field(..., min_length=1, max_length=255)
     code: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    migrationToken: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+
+class PortalLegacyLoginRequest(BaseModel):
+    legacyUsername: str = Field(..., min_length=1, max_length=50)
+    legacyPassword: str = Field(..., min_length=1, max_length=255)
+
+
+class PortalLegacyLinkRequest(BaseModel):
+    legacyUsername: str = Field(..., min_length=1, max_length=50)
+    legacyPassword: str = Field(..., min_length=1, max_length=255)
 
 
 class PortalActionResponse(BaseModel):
@@ -48,12 +64,39 @@ class PortalActionResponse(BaseModel):
     expiresIn: int = 0
 
 
+class PortalLegacyLoginResponse(BaseModel):
+    migrationRequired: bool = True
+    emailBound: bool = False
+    emailVerified: bool = False
+    legacyUserId: Optional[int] = None
+    legacyUsername: str
+    migrationToken: str
+
+
+class PortalLegacyLinkResponse(BaseModel):
+    message: str
+    mergedOrders: int = 0
+    mergedAddons: int = 0
+
+
+class PortalMigrationStatusResponse(BaseModel):
+    migrationRequired: bool = False
+    emailBound: bool = False
+    emailVerified: bool = False
+    legacyUsername: str = ""
+    identityVersion: int = 1
+
+
 class PortalUserResponse(BaseModel):
     id: str
+    userUuid: str
     username: str
+    legacyUsername: str = ""
     displayName: str
     email: str = ""
     emailVerified: bool = False
+    identityVersion: int = 1
+    migrationRequired: bool = False
     planName: str
     planPrice: float = 0
     accountStatus: str
@@ -63,6 +106,7 @@ class PortalUserResponse(BaseModel):
 
 
 class PortalEntitlementResponse(BaseModel):
+    userUuid: str
     planName: str
     planPrice: float = 0
     status: str
@@ -80,6 +124,7 @@ class PortalOrderResponse(BaseModel):
     status: str
     createdAt: Optional[str] = None
     payUrl: str = ""
+    cancellable: bool = False
 
 
 class PortalBillingPlanResponse(BaseModel):
@@ -96,11 +141,14 @@ class PortalBillingPlanResponse(BaseModel):
 class PortalBillingGuideOptionResponse(BaseModel):
     allowed: bool
     readonly: bool
+    pricingMode: str = "fixed_tiers"
     defaultMonthlyPrice: Optional[float] = None
     minMonthlyPrice: Optional[float] = None
     maxMonthlyPrice: Optional[float] = None
     step: Optional[float] = None
     targetResourceQuotaPreview: Optional[int] = None
+    priceOptions: List[float] = Field(default_factory=list)
+    quotaPreviewByPrice: Dict[str, int] = Field(default_factory=dict)
 
 
 class PortalBillingAddonGuideResponse(BaseModel):
@@ -116,11 +164,13 @@ class PortalBillingAddonGuideResponse(BaseModel):
 
 
 class PortalBillingGuideResponse(BaseModel):
+    userUuid: str = ""
     username: str
     isRegistered: bool
     isExpired: bool
     status: str
-    priceStep: int
+    subscriptionMode: str = "fixed_tiers"
+    priceStep: float
     resourceIncrementPerStep: int
     displayPlanName: str
     displayMonthlyPrice: float

@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from core import admin_service
+import core.site_config_service as site_config_service
 from core.dependencies import (
     authenticate_user,
     get_current_admin_user,
@@ -13,15 +14,16 @@ from core.dependencies import (
     revoke_user_session,
     utcnow_naive,
 )
-from core.plan_catalog import save_plan_catalog, load_plan_catalog
 from db.models import User
 from routers.user_center import activate_afdian_order_by_lookup
 from schemas.admin import (
     AdminAuthBootstrapRequest,
     AdminAuthLoginRequest,
-    AdminPlanCatalogResponse,
-    AdminPlanCatalogUpdateRequest,
     AdminAuthStateResponse,
+    AdminSiteConfigAuditResponse,
+    AdminSiteConfigListResponse,
+    AdminSiteConfigUpdateRequest,
+    AdminSiteConfigUpdateResponse,
     AdminAuthTokenResponse,
     AdminOrderActivateRequest,
     AdminOrderLookupRequest,
@@ -45,6 +47,17 @@ def _current_admin_if_any(request: Request, db: Session) -> User | None:
     if session_user is None or not session_user.is_admin:
         return None
     return session_user
+
+
+def _resolve_request_ip(request: Request) -> str:
+    for header_name in ("x-real-ip", "x-forwarded-for"):
+        header_value = request.headers.get(header_name, "")
+        candidate = header_value.split(",")[0].strip()
+        if candidate:
+            return candidate[:64]
+    if request.client and request.client.host:
+        return str(request.client.host).strip()[:64]
+    return "unknown"
 
 
 @router.get("/auth/state", response_model=AdminAuthStateResponse)
@@ -243,30 +256,55 @@ async def stats(hour: str | None = None, _: User = Depends(get_current_admin_use
     return admin_service.build_stats_payload(db, hour)
 
 
-@router.get("/plans", response_model=AdminPlanCatalogResponse)
-async def get_plan_catalog(_: User = Depends(get_current_admin_user)):
-    return load_plan_catalog()
-
-
-@router.put("/plans", response_model=AdminPlanCatalogResponse)
-async def update_plan_catalog(
-    payload: AdminPlanCatalogUpdateRequest,
+@router.get("/configs", response_model=AdminSiteConfigListResponse)
+async def list_site_configs(
+    group: str | None = Query(default=None, max_length=64),
     _: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
 ):
-    return save_plan_catalog(
-        {
-            "free_plan": {
-                "daily_quota": payload.free_daily_quota,
-            },
-            "tiers": [
-                {
-                    "monthly_price": item.monthly_price,
-                    "daily_quota": item.daily_quota,
-                }
-                for item in payload.tiers
-            ],
-        }
-    )
+    try:
+        return site_config_service.list_site_configs(db, group=group)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.put("/configs", response_model=AdminSiteConfigUpdateResponse)
+async def update_site_configs(
+    payload: AdminSiteConfigUpdateRequest,
+    request: Request,
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return site_config_service.update_site_configs(
+            db,
+            actor=current_user,
+            request_ip=_resolve_request_ip(request),
+            updates=[item.model_dump() for item in payload.items],
+            change_note=payload.change_note,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/configs/audit", response_model=AdminSiteConfigAuditResponse)
+async def list_site_config_audit_logs(
+    config_key: str | None = Query(default=None, max_length=100),
+    group: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=100, ge=1, le=500),
+    _: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return site_config_service.list_site_config_audit_logs(
+            db,
+            config_key=config_key,
+            group=group,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.post("/afdian/parse-token")

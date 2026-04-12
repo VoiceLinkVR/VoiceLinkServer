@@ -1,6 +1,6 @@
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from core.config import settings
+from core.plan_catalog import build_limit_rule, get_free_plan
 from db.base import SessionLocal
 from db.models import RefreshToken, User, UserSession
 
@@ -22,7 +23,7 @@ def hash_password(password: str) -> str:
     return generate_password_hash(password)
 
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login", auto_error=False)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/v2/auth/login", auto_error=False)
 
 
 def get_db() -> Generator:
@@ -37,7 +38,7 @@ def utcnow_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(data: dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRES_MINUTES)
@@ -61,6 +62,24 @@ def is_user_expired(user: User) -> tuple[bool, Optional[datetime]]:
     return expires_at_utc <= datetime.now(timezone.utc), expires_at_utc
 
 
+def fallback_expired_user_to_free(db: Session, user: User) -> tuple[bool, Optional[datetime]]:
+    expired, expires_at_utc = is_user_expired(user)
+    if not expired:
+        return False, expires_at_utc
+
+    free_plan = get_free_plan()
+    user.limit_rule = build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"])
+    user.expiration_date = None
+    user.boost_limit_rule = None
+    user.boost_expiration_date = None
+    user.addon_resource_balance = 0
+    user.addon_resource_total = 0
+    user.addon_expiration_date = None
+    user.is_active = True
+    db.flush()
+    return True, expires_at_utc
+
+
 def get_effective_user_limit_rule(user: User) -> str:
     default_rule = (settings.FREE_PLAN_LIMIT_RULE or "").strip() or "800/day;8/minute"
     now_utc = datetime.now(timezone.utc)
@@ -75,9 +94,24 @@ def normalize_email(value: str) -> str:
     return value.strip().lower()
 
 
-def authenticate_user(db: Session, login: str, password: str) -> Optional[User]:
-    normalized_login = normalize_email(login)
-    user = db.query(User).filter(or_(User.username == login, User.email == normalized_login)).first()
+def _normalize_login(value: str) -> str:
+    return (value or "").strip()
+
+
+def authenticate_user(
+    db: Session,
+    login: str,
+    password: str,
+    *,
+    allow_legacy_username: bool = True,
+) -> Optional[User]:
+    raw_login = _normalize_login(login)
+    normalized_email = normalize_email(raw_login)
+    filters = [User.email == normalized_email]
+    if allow_legacy_username:
+        filters.append(User.username == raw_login)
+
+    user = db.query(User).filter(or_(*filters)).first()
     if user is None or not verify_password(password, user.password):
         return None
     return user
@@ -105,6 +139,31 @@ def _request_session(request: Request) -> Optional[dict]:
     return request.session
 
 
+def build_access_token_payload(
+    user: User,
+    *,
+    session_id: Optional[str] = None,
+    session_type: str = "portal",
+    token_type: str = "access",
+) -> dict[str, Any]:
+    user_uuid = (user.user_uuid or "").strip() or user.username
+    identity_version = int(getattr(user, "identity_version", 1) or 1)
+    payload: dict[str, Any] = {
+        "sub": user_uuid,
+        "uid": user.id,
+        "sid": session_id,
+        "type": token_type,
+        "user_uuid": user_uuid,
+        "username": user.username,
+        "email": (user.email or "").strip(),
+        "session_type": session_type,
+        "identity_version": identity_version,
+    }
+    if bool(getattr(user, "is_default_test_user", False)):
+        payload["actor_type"] = "anonymous_test"
+    return payload
+
+
 def create_user_session(
     db: Session,
     user: User,
@@ -116,6 +175,7 @@ def create_user_session(
     record = UserSession(
         session_id=secrets.token_urlsafe(48),
         user_id=user.id,
+        user_uuid=user.user_uuid,
         session_type=session_type,
         ip=_request_ip(request),
         user_agent=_request_user_agent(request),
@@ -160,7 +220,6 @@ def get_active_portal_session(
         db.query(UserSession)
         .filter(
             UserSession.session_id == session_id,
-            UserSession.session_type == "portal",
             UserSession.revoked_at.is_(None),
         )
         .first()
@@ -191,6 +250,7 @@ def create_refresh_token(
     record = RefreshToken(
         token=token_value,
         user_id=user.id,
+        user_uuid=user.user_uuid,
         session_id=session_id,
         expires_at=expires_at,
     )
@@ -260,12 +320,22 @@ def revoke_user_session(
     return record
 
 
-def issue_login_artifacts(db: Session, user: User, request: Request) -> tuple[str, str, UserSession]:
+def issue_login_artifacts(
+    db: Session,
+    user: User,
+    request: Request,
+    *,
+    session_type: str = "portal",
+) -> tuple[str, str, UserSession]:
     revoke_user_session(db, request)
-    session_record = create_user_session(db, user, request)
+    session_record = create_user_session(db, user, request, session_type=session_type)
     bind_portal_session(request, session_record)
     access_token = create_access_token(
-        {"sub": user.username, "uid": user.id, "sid": session_record.session_id, "type": "access"}
+        build_access_token_payload(
+            user,
+            session_id=session_record.session_id,
+            session_type=session_type,
+        )
     )
     refresh_token, _ = create_refresh_token(db, user, session_id=session_record.session_id)
     return access_token, refresh_token, session_record
@@ -280,7 +350,11 @@ def issue_noninteractive_login_artifacts(
 ) -> tuple[str, str, UserSession]:
     session_record = create_user_session(db, user, request, session_type=session_type)
     access_token = create_access_token(
-        {"sub": user.username, "uid": user.id, "sid": session_record.session_id, "type": "access"}
+        build_access_token_payload(
+            user,
+            session_id=session_record.session_id,
+            session_type=session_type,
+        )
     )
     refresh_token, _ = create_refresh_token(db, user, session_id=session_record.session_id)
     return access_token, refresh_token, session_record
@@ -294,7 +368,11 @@ def rotate_refresh_token(
     if record is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
-    user = db.query(User).filter(User.id == record.user_id).first()
+    user = None
+    if record.user_uuid:
+        user = db.query(User).filter(User.user_uuid == record.user_uuid).first()
+    if user is None:
+        user = db.query(User).filter(User.id == record.user_id).first()
     if user is None:
         record.revoked_at = utcnow_naive()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
@@ -302,40 +380,49 @@ def rotate_refresh_token(
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
 
-    expired, expires_at_utc = is_user_expired(user)
-    if expired:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "account_expired",
-                "message": "User account expired",
-                "expiration_utc": expires_at_utc.isoformat().replace("+00:00", "Z") if expires_at_utc else None,
-            },
-        )
+    fallback_expired_user_to_free(db, user)
 
     record.revoked_at = utcnow_naive()
     new_refresh_token, _ = create_refresh_token(db, user, session_id=record.session_id)
     new_access_token = create_access_token(
-        {"sub": user.username, "uid": user.id, "sid": record.session_id, "type": "access"}
+        build_access_token_payload(
+            user,
+            session_id=record.session_id,
+            session_type="portal",
+        )
     )
     return user, new_access_token, new_refresh_token
 
 
-def _get_user_from_access_token(token: str, db: Session) -> Optional[User]:
+def decode_access_token(token: str) -> Optional[dict[str, Any]]:
     try:
         payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
     except JWTError:
         return None
+    return payload
 
+
+def _get_user_from_access_token(token: str, db: Session) -> Optional[User]:
+    payload = decode_access_token(token)
+    if payload is None:
+        return None
+
+    user_uuid = str(payload.get("user_uuid") or payload.get("sub") or "").strip()
     user_id = payload.get("uid")
-    username = payload.get("sub")
+    username = str(payload.get("username") or "").strip()
+    if not username:
+        username = str(payload.get("sub") or "").strip()
 
     query = db.query(User)
+    if user_uuid:
+        user = query.filter(User.user_uuid == user_uuid).first()
+        if user is not None:
+            return user
     if user_id is not None:
         user = query.filter(User.id == user_id).first()
         if user is not None:
             return user
-    if username is not None:
+    if username:
         return query.filter(User.username == username).first()
     return None
 
@@ -352,7 +439,10 @@ def resolve_authenticated_user(
     if user is None:
         session_record = get_active_portal_session(request, db)
         if session_record is not None:
-            user = db.query(User).filter(User.id == session_record.user_id).first()
+            if session_record.user_uuid:
+                user = db.query(User).filter(User.user_uuid == session_record.user_uuid).first()
+            if user is None:
+                user = db.query(User).filter(User.id == session_record.user_id).first()
 
     if user is None:
         return None
@@ -364,22 +454,9 @@ def resolve_authenticated_user(
         )
 
     if not allow_expired:
-        expired, expires_at_utc = is_user_expired(user)
-        if expired:
-            try:
-                user.is_active = False
-                db.commit()
-            except Exception:
-                db.rollback()
-
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "code": "account_expired",
-                    "message": "User account expired",
-                    "expiration_utc": expires_at_utc.isoformat().replace("+00:00", "Z") if expires_at_utc else None,
-                },
-            )
+        downgraded, _ = fallback_expired_user_to_free(db, user)
+        if downgraded:
+            db.commit()
 
     return user
 

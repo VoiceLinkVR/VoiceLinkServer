@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>使用统计 - VoiceLink Server</title>
+    <style>
+        body{margin:0;font-family:"Segoe UI","Noto Sans SC",sans-serif;background:#f5f7fb;color:#172033}
+        .topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 20px;background:#fff;border-bottom:1px solid #dbe4f0;position:sticky;top:0}
+        .nav{display:flex;flex-wrap:wrap;gap:10px}.nav a,button{border:1px solid #dbe4f0;background:#fff;border-radius:8px;padding:8px 12px;color:#172033;text-decoration:none;cursor:pointer}
+        button{background:#2563eb;border-color:#2563eb;color:#fff}
+        .page{max-width:1440px;margin:0 auto;padding:16px;display:grid;gap:16px}
+        .card{background:#fff;border:1px solid #dbe4f0;border-radius:12px;overflow:hidden}
+        .head{padding:14px 16px;border-bottom:1px solid #edf2f7}.head h2{margin:0 0 6px;font-size:18px}.head p{margin:0;color:#64748b;font-size:13px}
+        .body{padding:16px}
+        .controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+        label{display:grid;gap:6px;font-size:13px}
+        input,select{height:38px;border:1px solid #dbe4f0;border-radius:8px;padding:0 10px}
+        .meta{margin-top:10px;color:#64748b;font-size:12px;display:flex;gap:10px;flex-wrap:wrap}
+        .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+        .kpi{border:1px solid #edf2f7;border-radius:10px;padding:10px;background:#fafcff}.kpi b{display:block;font-size:26px;margin-top:6px}
+        .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+        .chip{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef4ff;color:#2d4eb2;font-size:11px;margin-left:6px}
+        .wrap{overflow:auto;border:1px solid #edf2f7;border-radius:10px}
+        table{width:100%;min-width:640px;border-collapse:collapse;font-size:13px}
+        th,td{padding:9px 10px;border-bottom:1px solid #edf2f7;text-align:left} th{background:#f8fbff;color:#64748b}
+        .right{text-align:right}.mono{font-family:Consolas,monospace}.ok{color:#166534}.bad{color:#b42318}.warn{color:#c2410c}
+        .bar-wrap{width:110px;height:7px;background:#e8eefc;border-radius:999px;overflow:hidden}.bar{height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa)}
+        .empty{color:#64748b;text-align:center;padding:16px}.tips{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;color:#64748b;font-size:12px;margin-top:10px}
+        .mask{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(255,255,255,.7);color:#1d4ed8;font-weight:700}
+        @media (max-width:960px){.grid2{grid-template-columns:1fr}}
+    </style>
+</head>
+<body>
+    <header class="topbar">
+        <strong>使用统计看板</strong>
+        <nav class="nav">
+            <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
+            <a href="{{ request.url_for('afdian_management_ui') }}">爱发电管理</a>
+            <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
+            <a href="{{ request.url_for('site_configs_ui') }}">站点配置</a>
+            <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
+        </nav>
+    </header>
+
+    <main class="page">
+        <section class="card">
+            <div class="head"><h2>查询条件</h2><p>统计时区为 UTC+8，明细按“用户 + IP + 接口”聚合。</p></div>
+            <div class="body">
+                <div class="controls">
+                    <label>统计小时 (UTC+8)<select id="hourSelect"></select></label>
+                    <label>明细关键字<input id="detailSearch" type="text" placeholder="用户名 / IP / 接口"></label>
+                    <label>状态过滤<select id="statusFilter"><option value="all">全部</option><option value="failed">失败 > 0</option><option value="rate_limited">限流 > 0</option><option value="success">成功 > 0</option></select></label>
+                    <label>明细行数<select id="rowLimit"><option value="50">50</option><option value="100" selected>100</option><option value="300">300</option></select></label>
+                    <label>自动刷新<select id="refreshSec"><option value="0">关闭</option><option value="30">30 秒</option><option value="60" selected>60 秒</option><option value="120">120 秒</option></select></label>
+                    <label>&nbsp;<button id="refreshBtn" type="button">刷新数据</button></label>
+                </div>
+                <div class="meta"><span id="rangeInfo">时间范围: -</span><span id="generatedInfo">更新时间: -</span><span id="limitInfo">明细上限: -</span><span id="hourInfo">当前小时: -</span></div>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="head"><h2>概览指标</h2></div>
+            <div class="body"><div class="kpis" id="summaryCards"></div></div>
+        </section>
+
+        <section class="card">
+            <div class="head"><h2>七日趋势 <span class="chip">按天聚合</span></h2></div>
+            <div class="body"><div id="dailyTableWrap"></div></div>
+        </section>
+
+        <section class="grid2">
+            <section class="card">
+                <div class="head"><h2>接口调用排行 <span class="chip">当前小时</span></h2></div>
+                <div class="body"><div id="endpointTableWrap"></div></div>
+            </section>
+            <section class="card">
+                <div class="head"><h2>耗时分布 <span class="chip">当前小时</span></h2></div>
+                <div class="body"><div id="durationTableWrap"></div></div>
+            </section>
+        </section>
+
+        <section class="card">
+            <div class="head"><h2>请求明细 <span class="chip">当前筛选可导出</span></h2></div>
+            <div class="body">
+                <div id="detailTableWrap"></div>
+                <div class="tips"><span>说明：明细仅展示服务端返回的 Top 数据，默认已按调用量降序。</span><button id="exportCsvBtn" type="button">导出当前明细 CSV</button></div>
+            </div>
+        </section>
+    </main>
+
+    <div class="mask" id="loadingMask">正在加载统计数据...</div>
+
+    <script>
+        const API_URL="{{ request.url_for('stats_data_ui') }}";
+        const initialHour="{{ selected_hour or '' }}";
+        const state={data:null,filteredDetails:[],timer:null};
+        function escapeHtml(text){return String(text??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;")}
+        function fmtNum(value){return Number(value||0).toLocaleString()}
+        function setLoading(show){document.getElementById("loadingMask").style.display=show?"flex":"none"}
+        function buildHourOptions(hours,selectedHour){const select=document.getElementById("hourSelect");if(!hours||hours.length===0){select.innerHTML='<option value="">暂无数据</option>';return}select.innerHTML=hours.map((hour)=>`<option value="${escapeHtml(hour)}" ${hour===selectedHour?"selected":""}>${escapeHtml(hour)}</option>`).join("")}
+        function renderSummary(summary){document.getElementById("summaryCards").innerHTML=`<div class="kpi"><span>总请求</span><b>${fmtNum(summary.total_count)}</b></div><div class="kpi"><span>成功</span><b class="ok">${fmtNum(summary.total_success)}</b></div><div class="kpi"><span>失败</span><b class="bad">${fmtNum(summary.total_fail)}</b></div><div class="kpi"><span>限流</span><b class="warn">${fmtNum(summary.total_rate_limited)}</b></div><div class="kpi"><span>成功率</span><b>${summary.success_rate||0}%</b></div><div class="kpi"><span>失败率</span><b>${summary.fail_rate||0}%</b></div>`}
+        function renderDaily(dailyStats){const wrap=document.getElementById("dailyTableWrap");if(!dailyStats||dailyStats.length===0){wrap.innerHTML='<div class="empty">暂无七日数据</div>';return}const maxTotal=Math.max(...dailyStats.map((x)=>x.daily_total||0),1);const rows=dailyStats.map((day)=>{const pct=Math.round(((day.daily_total||0)/maxTotal)*100);return `<tr><td class="mono">${escapeHtml(day.day)}</td><td class="right">${fmtNum(day.daily_success)}</td><td class="right">${fmtNum(day.daily_fail)}</td><td class="right">${fmtNum(day.daily_rate_limited)}</td><td class="right"><strong>${fmtNum(day.daily_total)}</strong></td><td><div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div></td></tr>`}).join("");wrap.innerHTML=`<div class="wrap"><table><thead><tr><th>日期</th><th class="right">成功</th><th class="right">失败</th><th class="right">限流</th><th class="right">总计</th><th>趋势</th></tr></thead><tbody>${rows}</tbody></table></div>`}
+        function renderEndpoints(rows){const wrap=document.getElementById("endpointTableWrap");if(!rows||rows.length===0){wrap.innerHTML='<div class="empty">当前小时暂无接口调用</div>';return}const maxTotal=Math.max(...rows.map((x)=>x.total_count||0),1);const htmlRows=rows.map((row,idx)=>{const pct=Math.round(((row.total_count||0)/maxTotal)*100);return `<tr><td>${idx+1}</td><td class="mono">${escapeHtml(row.endpoint)}</td><td class="right">${fmtNum(row.total_count)}</td><td class="right ok">${fmtNum(row.success_count)}</td><td class="right bad">${fmtNum(row.fail_count)}</td><td><div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div></td></tr>`}).join("");wrap.innerHTML=`<div class="wrap"><table><thead><tr><th>#</th><th>接口</th><th class="right">总计</th><th class="right">成功</th><th class="right">失败</th><th>占比</th></tr></thead><tbody>${htmlRows}</tbody></table></div>`}
+        function renderDuration(rows){const wrap=document.getElementById("durationTableWrap");if(!rows||rows.length===0){wrap.innerHTML='<div class="empty">当前小时暂无耗时数据</div>';return}const maxCount=Math.max(...rows.map((x)=>x.count||0),1);const htmlRows=rows.map((row)=>{const pct=Math.round(((row.count||0)/maxCount)*100);return `<tr><td class="mono">${escapeHtml(row.duration_range)}</td><td class="right">${fmtNum(row.count)}</td><td><div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div></td></tr>`}).join("");wrap.innerHTML=`<div class="wrap"><table><thead><tr><th>耗时区间</th><th class="right">数量</th><th>分布</th></tr></thead><tbody>${htmlRows}</tbody></table></div>`}
+        function applyDetailFilter(){const data=state.data;const wrap=document.getElementById("detailTableWrap");if(!data||!data.hourly_stats){wrap.innerHTML='<div class="empty">暂无明细数据</div>';return}const keyword=document.getElementById("detailSearch").value.trim().toLowerCase();const status=document.getElementById("statusFilter").value;const rowLimit=Number(document.getElementById("rowLimit").value||100);const filtered=data.hourly_stats.filter((row)=>{const text=`${row.username} ${row.ip} ${row.endpoint}`.toLowerCase();if(keyword&&!text.includes(keyword))return false;if(status==="failed"&&!(row.fail_count>0))return false;if(status==="rate_limited"&&!(row.rate_limited_count>0))return false;if(status==="success"&&!(row.success_count>0))return false;return true}).slice(0,rowLimit);state.filteredDetails=filtered;if(filtered.length===0){wrap.innerHTML='<div class="empty">没有匹配的明细数据</div>';return}const rows=filtered.map((row,idx)=>`<tr><td>${idx+1}</td><td>${escapeHtml(row.username)}</td><td class="mono">${escapeHtml(row.ip)}</td><td class="mono">${escapeHtml(row.endpoint)}</td><td class="right ok">${fmtNum(row.success_count)}</td><td class="right bad">${fmtNum(row.fail_count)}</td><td class="right warn">${fmtNum(row.rate_limited_count)}</td><td class="right"><strong>${fmtNum(row.total_count)}</strong></td></tr>`).join("");wrap.innerHTML=`<div class="wrap"><table><thead><tr><th>#</th><th>用户</th><th>IP</th><th>接口</th><th class="right">成功</th><th class="right">失败</th><th class="right">限流</th><th class="right">总计</th></tr></thead><tbody>${rows}</tbody></table></div>`}
+        function renderMeta(data){const info=data.date_filter_info||{};document.getElementById("rangeInfo").textContent=`时间范围: ${info.start_date||"-"} ~ ${info.end_date||"-"}`;document.getElementById("generatedInfo").textContent=`更新时间: ${data.meta?.generated_at||"-"}`;document.getElementById("limitInfo").textContent=`明细上限: ${data.meta?.max_detail_rows||"-"}`;document.getElementById("hourInfo").textContent=`当前小时: ${data.selected_hour||"-"}`}
+        function exportCurrentCsv(){const rows=state.filteredDetails||[];if(rows.length===0){alert("当前没有可导出的明细数据");return}const headers=["username","ip","endpoint","success_count","fail_count","rate_limited_count","total_count"];const lines=[headers.join(",")];rows.forEach((row)=>{const values=headers.map((key)=>`"${String(row[key]??"").replace(/"/g,'""')}"`);lines.push(values.join(","))});const csv="\ufeff"+lines.join("\n");const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});const url=URL.createObjectURL(blob);const link=document.createElement("a");link.href=url;link.download=`stats_detail_${(state.data?.selected_hour||"latest").replace(/[ :]/g,"_")}.csv`;document.body.appendChild(link);link.click();document.body.removeChild(link);URL.revokeObjectURL(url)}
+        async function fetchStats(hourValue){const hour=typeof hourValue==="string"?hourValue:document.getElementById("hourSelect").value;const url=hour?`${API_URL}?hour=${encodeURIComponent(hour)}`:API_URL;setLoading(true);try{const res=await fetch(url,{credentials:"same-origin"});if(!res.ok)throw new Error(`HTTP ${res.status}`);const data=await res.json();state.data=data;buildHourOptions(data.hours||[],data.selected_hour||"");renderSummary(data.summary||{});renderDaily(data.daily_stats||[]);renderEndpoints(data.top_endpoints||[]);renderDuration(data.duration_stats||[]);renderMeta(data);applyDetailFilter()}catch(err){console.error(err);document.getElementById("summaryCards").innerHTML='<div class="empty">加载失败，请重试</div>'}finally{setLoading(false)}}
+        function setupAutoRefresh(){const sec=Number(document.getElementById("refreshSec").value||0);if(state.timer){clearInterval(state.timer);state.timer=null}if(sec>0){state.timer=setInterval(()=>fetchStats(),sec*1000)}}
+        document.getElementById("hourSelect").addEventListener("change",()=>fetchStats());
+        document.getElementById("refreshBtn").addEventListener("click",()=>fetchStats());
+        document.getElementById("detailSearch").addEventListener("input",applyDetailFilter);
+        document.getElementById("statusFilter").addEventListener("change",applyDetailFilter);
+        document.getElementById("rowLimit").addEventListener("change",applyDetailFilter);
+        document.getElementById("refreshSec").addEventListener("change",setupAutoRefresh);
+        document.getElementById("exportCsvBtn").addEventListener("click",exportCurrentCsv);
+        (async()=>{await fetchStats(initialHour);setupAutoRefresh()})()
+    </script>
+</body>
+</html>

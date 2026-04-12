@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>站点配置 - VoiceLink Server</title>
+    <style>
+        body{margin:0;font-family:"Segoe UI","Noto Sans SC",sans-serif;background:#f5f7fb;color:#172033}
+        .topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 20px;background:#fff;border-bottom:1px solid #dbe4f0;position:sticky;top:0;z-index:10}
+        .nav{display:flex;flex-wrap:wrap;gap:10px}.nav a,.btn,.ghost,select,input,textarea{border:1px solid #dbe4f0;border-radius:8px}
+        .nav a,.btn,.ghost{background:#fff;padding:8px 12px;color:#172033;text-decoration:none;cursor:pointer}
+        .btn{background:#2563eb;border-color:#2563eb;color:#fff}
+        .ghost{background:#fff}
+        .page{max-width:1600px;margin:0 auto;padding:16px;display:grid;gap:16px}
+        .card{background:#fff;border:1px solid #dbe4f0;border-radius:12px;overflow:hidden}
+        .head{padding:14px 16px;border-bottom:1px solid #edf2f7}.head h1,.head h2{margin:0 0 6px}.head p{margin:0;color:#64748b;font-size:13px}
+        .body{padding:16px}
+        .summary,.filters,.grid{display:grid;gap:10px}
+        .summary{grid-template-columns:repeat(4,minmax(120px,1fr))}
+        .stat,.kv{border:1px solid #edf2f7;border-radius:10px;background:#fafcff;padding:10px}
+        .stat b{display:block;font-size:26px;margin-top:6px}
+        .filters{grid-template-columns:220px 1fr 220px 1fr auto;align-items:end}
+        label{display:grid;gap:6px;font-size:13px}
+        input,select{height:38px;padding:0 10px}
+        textarea{min-height:120px;padding:10px;resize:vertical}
+        .meta{display:flex;gap:12px;flex-wrap:wrap;color:#64748b;font-size:12px}
+        .tip{padding:12px 14px;border:1px solid #fde68a;border-radius:10px;background:#fffbeb;color:#92400e;font-size:13px}
+        table{width:100%;border-collapse:collapse;font-size:13px}
+        th,td{padding:10px;border-bottom:1px solid #edf2f7;text-align:left;vertical-align:top}
+        th{background:#f8fbff;color:#64748b}
+        .mono{font-family:Consolas,monospace}
+        .truncate{max-width:280px;overflow:hidden;text-overflow:ellipsis}
+        .tag{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px}
+        .tag.base{background:#eef2ff;color:#3730a3}
+        .tag.override{background:#ecfdf3;color:#166534}
+        .tag.secret{background:#f3f4f6;color:#475569}
+        .tag.restart{background:#fff7ed;color:#c2410c}
+        .tag.group{background:#eff6ff;color:#1d4ed8}
+        .empty{padding:18px;color:#64748b;text-align:center}
+        .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+        .dialog,.drawer{position:fixed;inset:0;display:none;z-index:20}
+        .dialog.open,.drawer.open{display:block}
+        .mask{position:absolute;inset:0;background:rgba(15,23,42,.45)}
+        .panel{position:relative;width:min(820px,calc(100vw - 24px));max-height:calc(100vh - 24px);margin:12px auto;background:#fff;border-radius:14px;border:1px solid #dbe4f0;display:grid;grid-template-rows:auto 1fr;overflow:hidden}
+        .drawer .panel{position:absolute;right:0;top:0;width:min(920px,100vw);height:100%;margin:0;border-radius:0}
+        .panel-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;padding:16px;border-bottom:1px solid #edf2f7}
+        .panel-head h3{margin:0 0 6px}
+        .panel-body{padding:16px;overflow:auto;background:#f7faff;display:grid;gap:12px}
+        .section{background:#fff;border:1px solid #e4edf7;border-radius:12px;padding:14px}
+        .section h4{margin:0 0 8px}
+        .section p{margin:0 0 10px;color:#64748b;font-size:13px}
+        .kv-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+        .audit-list{display:grid;gap:10px}
+        .audit-item{border:1px solid #e4edf7;border-radius:12px;background:#fff;padding:12px}
+        .audit-item h4{margin:0 0 8px}
+        .status{font-size:12px;color:#64748b}
+        @media (max-width:1080px){.filters{grid-template-columns:1fr 1fr}.summary,.kv-grid{grid-template-columns:1fr 1fr}}
+        @media (max-width:760px){.filters,.summary,.kv-grid{grid-template-columns:1fr}}
+    </style>
+</head>
+<body>
+    <header class="topbar">
+        <strong>后台管理</strong>
+        <nav class="nav">
+            <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
+            <a href="{{ request.url_for('afdian_management_ui') }}">爱发电管理</a>
+            <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
+            <a href="{{ request.url_for('site_configs_ui') }}">站点配置</a>
+            <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
+        </nav>
+    </header>
+
+    <main class="page">
+        <section class="card">
+            <div class="head">
+                <h1>站点配置中心</h1>
+                <p>所有配置变更都会写入审计表和覆盖文件。服务端会执行类型校验、路径校验、URL 校验、主机校验与字符净化，防止通过后台写入危险内容。</p>
+            </div>
+            <div class="body">
+                <div class="tip">请只修改你确认理解的配置项。标记为“需要重启”的项目虽然会被保存，但进程或中间件依赖可能不会即时生效。</div>
+            </div>
+        </section>
+
+        <section class="summary" id="summaryCards">
+            <article class="stat"><span>配置总数</span><b id="totalCount">0</b></article>
+            <article class="stat"><span>覆盖项</span><b id="overrideCount">0</b></article>
+            <article class="stat"><span>密钥项</span><b id="secretCount">0</b></article>
+            <article class="stat"><span>需重启项</span><b id="restartCount">0</b></article>
+        </section>
+
+        <section class="card">
+            <div class="body">
+                <div class="filters">
+                    <label>配置分组<select id="groupFilter"></select></label>
+                    <label>关键字搜索<input id="searchInput" type="text" placeholder="搜索 key、标签、描述、当前值"></label>
+                    <label>来源<select id="sourceFilter"><option value="all">全部来源</option><option value="override">仅覆盖项</option><option value="base">仅基础值</option></select></label>
+                    <label>修改备注<input id="changeNote" type="text" placeholder="本次变更原因，会进入审计记录"></label>
+                    <button type="button" class="btn" id="reloadBtn">刷新列表</button>
+                </div>
+                <div class="meta">
+                    <span id="visibleCount">显示 0 / 0</span>
+                    <span id="pageStatus">最后刷新: -</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="head">
+                <h2>配置列表</h2>
+                <p>“编辑”用于设置覆盖值，“清空覆盖”会回退到基础配置，“审计”可查看该配置项的修改历史。</p>
+            </div>
+            <div class="body" style="overflow:auto">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>配置项</th>
+                            <th>分组</th>
+                            <th>当前值</th>
+                            <th>基础值</th>
+                            <th>最近修改</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="configTableBody"></tbody>
+                </table>
+                <div id="tableEmpty" class="empty" hidden>暂无匹配的配置项</div>
+            </div>
+        </section>
+    </main>
+
+    <div class="dialog" id="editDialog" hidden>
+        <div class="mask js-close-edit"></div>
+        <div class="panel">
+            <div class="panel-head">
+                <div>
+                    <h3 id="editTitle">编辑配置</h3>
+                    <div class="status" id="editMeta">加载中...</div>
+                </div>
+                <button type="button" class="ghost js-close-edit">关闭</button>
+            </div>
+            <div class="panel-body">
+                <section class="section">
+                    <h4>配置说明</h4>
+                    <div class="kv-grid" id="editInfo"></div>
+                </section>
+                <section class="section">
+                    <h4>修改值</h4>
+                    <p>字符串按原文填写，布尔值请选择，数值项请输入数字。密钥项不会回显真实值，重新保存会直接覆盖旧值。</p>
+                    <div class="row" id="editFieldWrap"></div>
+                    <div class="row">
+                        <button type="button" class="btn" id="saveBtn">保存配置</button>
+                        <button type="button" class="ghost" id="clearBtn">清空覆盖</button>
+                    </div>
+                    <div class="status" id="editStatus">尚未提交</div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <div class="drawer" id="auditDrawer" hidden>
+        <div class="mask js-close-audit"></div>
+        <div class="panel">
+            <div class="panel-head">
+                <div>
+                    <h3 id="auditTitle">配置审计</h3>
+                    <div class="status" id="auditMeta">加载中...</div>
+                </div>
+                <button type="button" class="ghost js-close-audit">关闭</button>
+            </div>
+            <div class="panel-body">
+                <section class="section">
+                    <div class="row">
+                        <label>审计条数<select id="auditLimit"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
+                        <button type="button" class="btn" id="auditReloadBtn">刷新审计</button>
+                    </div>
+                </section>
+                <section class="section">
+                    <div class="audit-list" id="auditList"></div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const dataUrl="{{ request.url_for('site_configs_data_ui') }}";
+        const auditUrl="{{ request.url_for('site_configs_audit_ui') }}";
+        const updateUrl="{{ request.url_for('site_configs_update_ui') }}";
+        const state={items:[],groups:[],filtered:[],selected:null,auditKey:null};
+
+        function escapeHtml(value){return String(value??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
+        function formatValue(value){if(value===null||value===undefined||value==="")return"-";if(typeof value==="object")return JSON.stringify(value);return String(value)}
+        function yesNo(value){return value?"是":"否"}
+        function showPageStatus(text){document.getElementById("pageStatus").textContent=`最后刷新: ${text}`}
+        function setVisibleCount(shown,total){document.getElementById("visibleCount").textContent=`显示 ${shown} / ${total}`}
+        function openDialog(id){const node=document.getElementById(id);if(!node)return;node.hidden=false;node.classList.add("open");document.body.style.overflow="hidden"}
+        function closeDialog(id){const node=document.getElementById(id);if(!node)return;node.classList.remove("open");node.hidden=true;document.body.style.overflow=""}
+
+        function renderSummary(items){
+            document.getElementById("totalCount").textContent=items.length;
+            document.getElementById("overrideCount").textContent=items.filter((item)=>item.source==="override").length;
+            document.getElementById("secretCount").textContent=items.filter((item)=>item.is_secret).length;
+            document.getElementById("restartCount").textContent=items.filter((item)=>item.requires_restart).length;
+        }
+
+        function renderGroupOptions(groups){
+            const select=document.getElementById("groupFilter");
+            const current=select.value||"all";
+            select.innerHTML=['<option value="all">全部分组</option>',...groups.map((group)=>`<option value="${escapeHtml(group.key)}">${escapeHtml(group.label)} (${group.count})</option>`)].join("");
+            if([...select.options].some((option)=>option.value===current))select.value=current;
+        }
+
+        function renderTable(items){
+            const tbody=document.getElementById("configTableBody");
+            const empty=document.getElementById("tableEmpty");
+            if(items.length===0){
+                tbody.innerHTML="";
+                empty.hidden=false;
+                return;
+            }
+            empty.hidden=true;
+            tbody.innerHTML=items.map((item)=>`
+                <tr data-key="${escapeHtml(item.key)}">
+                    <td>
+                        <strong class="mono">${escapeHtml(item.key)}</strong><br>
+                        <span>${escapeHtml(item.label)}</span><br>
+                        <span class="status">${escapeHtml(item.description)}</span>
+                    </td>
+                    <td>
+                        <span class="tag group">${escapeHtml(item.group_label)}</span>
+                        <div class="row" style="margin-top:8px">
+                            <span class="tag ${item.source==='override'?'override':'base'}">${item.source==='override'?'覆盖值':'基础值'}</span>
+                            ${item.is_secret?'<span class="tag secret">密钥</span>':''}
+                            ${item.requires_restart?'<span class="tag restart">需要重启</span>':''}
+                        </div>
+                    </td>
+                    <td class="mono truncate" title="${escapeHtml(item.value)}">${escapeHtml(item.value)}</td>
+                    <td class="mono truncate" title="${escapeHtml(item.base_value)}">${escapeHtml(item.base_value)}</td>
+                    <td>
+                        <div>${escapeHtml(item.updated_by_username||'-')}</div>
+                        <div class="status">${escapeHtml(item.updated_at||'-')}</div>
+                        <div class="status">${escapeHtml(item.updated_note||'-')}</div>
+                    </td>
+                    <td>
+                        <div class="row">
+                            <button type="button" class="ghost js-edit" data-key="${escapeHtml(item.key)}">编辑</button>
+                            <button type="button" class="ghost js-clear" data-key="${escapeHtml(item.key)}">清空覆盖</button>
+                            <button type="button" class="ghost js-audit" data-key="${escapeHtml(item.key)}">审计</button>
+                        </div>
+                    </td>
+                </tr>
+            `).join("");
+            tbody.querySelectorAll(".js-edit").forEach((button)=>button.addEventListener("click",()=>openEdit(button.dataset.key)));
+            tbody.querySelectorAll(".js-clear").forEach((button)=>button.addEventListener("click",()=>submitUpdate(button.dataset.key,true)));
+            tbody.querySelectorAll(".js-audit").forEach((button)=>button.addEventListener("click",()=>openAudit(button.dataset.key)));
+        }
+
+        function applyFilters(){
+            const group=document.getElementById("groupFilter").value;
+            const keyword=document.getElementById("searchInput").value.trim().toLowerCase();
+            const source=document.getElementById("sourceFilter").value;
+            state.filtered=state.items.filter((item)=>{
+                const matchGroup=group==="all"||item.group===group;
+                const matchSource=source==="all"||item.source===source;
+                const haystack=`${item.key} ${item.label} ${item.description} ${item.value} ${item.base_value}`.toLowerCase();
+                const matchKeyword=!keyword||haystack.includes(keyword);
+                return matchGroup&&matchSource&&matchKeyword;
+            });
+            renderTable(state.filtered);
+            setVisibleCount(state.filtered.length,state.items.length);
+        }
+
+        function buildEditor(item){
+            const wrap=document.getElementById("editFieldWrap");
+            wrap.innerHTML="";
+            if(typeof item.raw_value==="boolean"){
+                wrap.innerHTML=`<label style="width:100%">布尔值<select id="editValue"><option value="true"${item.raw_value?' selected':''}>true</option><option value="false"${!item.raw_value?' selected':''}>false</option></select></label>`;
+                return;
+            }
+            if(typeof item.raw_value==="number"){
+                wrap.innerHTML=`<label style="width:100%">数值<input id="editValue" type="text" value="${escapeHtml(String(item.raw_value))}"></label>`;
+                return;
+            }
+            wrap.innerHTML=`<label style="width:100%">配置值<textarea id="editValue" placeholder="输入新的配置值">${escapeHtml(item.is_secret?'':String(item.raw_value??''))}</textarea></label>`;
+        }
+
+        function openEdit(key){
+            const item=state.items.find((entry)=>entry.key===key);
+            if(!item)return;
+            state.selected=item;
+            document.getElementById("editTitle").textContent=`编辑配置 ${item.key}`;
+            document.getElementById("editMeta").textContent=`${item.group_label} / ${item.source==='override'?'当前为覆盖值':'当前为基础值'}`;
+            document.getElementById("editInfo").innerHTML=`
+                <div class="kv"><small>标签</small><div>${escapeHtml(item.label)}</div></div>
+                <div class="kv"><small>分组</small><div>${escapeHtml(item.group_label)}</div></div>
+                <div class="kv"><small>当前值</small><div class="mono">${escapeHtml(item.value)}</div></div>
+                <div class="kv"><small>基础值</small><div class="mono">${escapeHtml(item.base_value)}</div></div>
+                <div class="kv"><small>密钥项</small><div>${yesNo(item.is_secret)}</div></div>
+                <div class="kv"><small>需要重启</small><div>${yesNo(item.requires_restart)}</div></div>
+            `;
+            document.getElementById("editStatus").textContent="尚未提交";
+            buildEditor(item);
+            openDialog("editDialog");
+        }
+
+        function parseEditorValue(item){
+            const input=document.getElementById("editValue");
+            if(!input)return null;
+            if(typeof item.raw_value==="boolean"){
+                return input.value==="true";
+            }
+            if(typeof item.raw_value==="number"){
+                const raw=input.value.trim();
+                if(raw==="")throw new Error("数值不能为空");
+                const numeric=Number(raw);
+                if(Number.isNaN(numeric))throw new Error("请输入合法数字");
+                return numeric;
+            }
+            return input.value;
+        }
+
+        async function submitUpdate(key,clear){
+            const item=state.items.find((entry)=>entry.key===key);
+            if(!item)return;
+            if(clear&&!confirm(`确认清空 ${key} 的覆盖值吗？`))return;
+            const statusNode=document.getElementById("editStatus");
+            const note=document.getElementById("changeNote").value.trim();
+            const body={items:[{key,clear:Boolean(clear)}],change_note:note||null};
+            if(!clear){
+                try{
+                    body.items[0].value=parseEditorValue(item);
+                }catch(error){
+                    if(statusNode)statusNode.textContent=error.message;
+                    else alert(error.message);
+                    return;
+                }
+            }
+            if(statusNode)statusNode.textContent="正在提交...";
+            try{
+                const response=await fetch(updateUrl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+                const data=await response.json();
+                if(!response.ok)throw new Error(data.detail||"保存失败");
+                if(statusNode)statusNode.textContent=data.message||"保存成功";
+                await loadConfigs();
+                if(clear){closeDialog("editDialog")}
+            }catch(error){
+                if(statusNode)statusNode.textContent=error.message||String(error);
+                else alert(error.message||String(error));
+            }
+        }
+
+        async function loadConfigs(){
+            const response=await fetch(dataUrl,{credentials:"same-origin"});
+            const data=await response.json();
+            if(!response.ok)throw new Error(data.detail||"加载配置失败");
+            state.items=Array.isArray(data.items)?data.items:[];
+            state.groups=Array.isArray(data.groups)?data.groups:[];
+            renderGroupOptions(state.groups);
+            renderSummary(state.items);
+            applyFilters();
+            showPageStatus(new Date().toLocaleString("zh-CN",{hour12:false}));
+        }
+
+        function renderAuditList(items){
+            const list=document.getElementById("auditList");
+            if(!items||items.length===0){
+                list.innerHTML='<div class="empty">该配置项暂无审计记录</div>';
+                return;
+            }
+            list.innerHTML=items.map((item)=>`
+                <article class="audit-item">
+                    <h4><span class="mono">${escapeHtml(item.config_key)}</span> / ${escapeHtml(item.operation)}</h4>
+                    <div class="kv-grid">
+                        <div class="kv"><small>修改人</small><div>${escapeHtml(item.changed_by_username||'-')}</div></div>
+                        <div class="kv"><small>来源 IP</small><div class="mono">${escapeHtml(item.changed_from_ip||'-')}</div></div>
+                        <div class="kv"><small>修改时间</small><div>${escapeHtml(item.created_at||'-')}</div></div>
+                        <div class="kv"><small>备注</small><div>${escapeHtml(item.change_note||'-')}</div></div>
+                        <div class="kv"><small>旧值</small><div class="mono">${escapeHtml(item.old_value||'-')}</div></div>
+                        <div class="kv"><small>新值</small><div class="mono">${escapeHtml(item.new_value||'-')}</div></div>
+                    </div>
+                </article>
+            `).join("");
+        }
+
+        async function loadAudit(){
+            if(!state.auditKey)return;
+            const limit=document.getElementById("auditLimit").value;
+            document.getElementById("auditMeta").textContent="加载中...";
+            const response=await fetch(`${auditUrl}?config_key=${encodeURIComponent(state.auditKey)}&limit=${encodeURIComponent(limit)}`,{credentials:"same-origin"});
+            const data=await response.json();
+            if(!response.ok)throw new Error(data.detail||"加载审计失败");
+            document.getElementById("auditMeta").textContent=`${state.auditKey} 最近 ${data.items.length} 条审计`;
+            renderAuditList(data.items||[]);
+        }
+
+        async function openAudit(key){
+            state.auditKey=key;
+            document.getElementById("auditTitle").textContent=`配置审计 ${key}`;
+            document.getElementById("auditList").innerHTML='<div class="empty">正在加载审计记录...</div>';
+            openDialog("auditDrawer");
+            try{
+                await loadAudit();
+            }catch(error){
+                document.getElementById("auditMeta").textContent="加载失败";
+                document.getElementById("auditList").innerHTML=`<div class="empty">${escapeHtml(error.message||String(error))}</div>`;
+            }
+        }
+
+        document.getElementById("reloadBtn").addEventListener("click",async()=>{
+            try{await loadConfigs()}catch(error){alert(error.message||String(error))}
+        });
+        document.getElementById("groupFilter").addEventListener("change",applyFilters);
+        document.getElementById("searchInput").addEventListener("input",applyFilters);
+        document.getElementById("sourceFilter").addEventListener("change",applyFilters);
+        document.getElementById("saveBtn").addEventListener("click",()=>state.selected&&submitUpdate(state.selected.key,false));
+        document.getElementById("clearBtn").addEventListener("click",()=>state.selected&&submitUpdate(state.selected.key,true));
+        document.getElementById("auditReloadBtn").addEventListener("click",async()=>{
+            try{await loadAudit()}catch(error){alert(error.message||String(error))}
+        });
+        document.querySelectorAll(".js-close-edit").forEach((node)=>node.addEventListener("click",()=>closeDialog("editDialog")));
+        document.querySelectorAll(".js-close-audit").forEach((node)=>node.addEventListener("click",()=>closeDialog("auditDrawer")));
+        document.addEventListener("keydown",(event)=>{
+            if(event.key==="Escape"){
+                closeDialog("editDialog");
+                closeDialog("auditDrawer");
+            }
+        });
+
+        (async()=>{
+            try{
+                await loadConfigs();
+            }catch(error){
+                document.getElementById("configTableBody").innerHTML="";
+                document.getElementById("tableEmpty").hidden=false;
+                showPageStatus(`加载失败: ${error.message||String(error)}`);
+            }
+        })();
+    </script>
+</body>
+</html>

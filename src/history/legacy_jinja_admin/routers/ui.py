@@ -10,6 +10,7 @@ from sqlalchemy import text, func, case, desc, or_
 from sqlalchemy.orm import Session
 
 from core.afdian_service import afdian_service
+import core.site_config_service as site_config_service
 from core.dependencies import get_db, hash_password, verify_password, get_admin_user_from_session
 from core.logging_config import logger
 from db.models import PaymentOrder, RequestLog, User, normalize_payment_lookup_value, payment_lookup_digest
@@ -34,8 +35,8 @@ EXCLUDED_ENDPOINTS = [
 ]
 
 AFDIAN_ACTION_LABELS = {
-    "renew": "renew",
-    "upgrade": "upgrade",
+    "renew": "续费",
+    "upgrade": "升级",
 }
 
 AFDIAN_ACTIVATION_SOURCE_LABELS = {
@@ -214,7 +215,7 @@ def _build_afdian_order_payload(order: PaymentOrder) -> Dict[str, Any]:
         "status": status,
         "status_label": {
             "activated": "已激活",
-            "pending": "未激活",
+            "pending": "待激活",
             "unpaid": "已关闭",
         }.get(status, status),
         "default_collapsed": status == "unpaid",
@@ -334,6 +335,17 @@ def _build_afdian_order_list_payload(db: Session) -> Dict[str, Any]:
         },
         "orders": parsed_orders,
     }
+
+
+def _resolve_admin_request_ip(request: Request) -> str:
+    for header_name in ("x-real-ip", "x-forwarded-for"):
+        header_value = request.headers.get(header_name, "")
+        candidate = header_value.split(",")[0].strip()
+        if candidate:
+            return candidate[:64]
+    if request.client and request.client.host:
+        return str(request.client.host).strip()[:64]
+    return "unknown"
 
 
 def _find_local_order_by_keyword(db: Session, query_value: str) -> Optional[PaymentOrder]:
@@ -456,7 +468,7 @@ async def login_ui_post(
         logger.info(f"[ADMIN] Login success: {username}")
         return RedirectResponse(url=request.url_for("manage_users_ui"), status_code=303)
 
-    request.session["flash_messages"] = ["Invalid username or password"]
+    request.session["flash_messages"] = ["用户名或密码错误"]
     logger.warning(f"[AUTH] Admin login failed: {username}")
     return RedirectResponse(url=request.url_for("login_ui_get"), status_code=303)
 
@@ -534,15 +546,88 @@ async def afdian_management_ui(request: Request, db: Session = Depends(get_db)):
     )
 
 
+@router.get("/site-configs", response_class=HTMLResponse)
+async def site_configs_ui(request: Request, db: Session = Depends(get_db)):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return RedirectResponse(url=request.url_for("login_ui_get"))
+    return templates.TemplateResponse(request, "site_configs.html", {"request": request})
+
+
+@router.get("/site-configs/data", response_class=JSONResponse)
+async def site_configs_data_ui(
+    request: Request,
+    group: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
+    try:
+        payload = site_config_service.list_site_configs(db, group=group)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    return JSONResponse(content=jsonable_encoder(payload))
+
+
+@router.get("/site-configs/audit", response_class=JSONResponse)
+async def site_configs_audit_ui(
+    request: Request,
+    config_key: Optional[str] = None,
+    group: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
+    try:
+        payload = site_config_service.list_site_config_audit_logs(
+            db,
+            config_key=config_key,
+            group=group,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    return JSONResponse(content=jsonable_encoder(payload))
+
+
+@router.post("/site-configs/update", response_class=JSONResponse)
+async def site_configs_update_ui(request: Request, db: Session = Depends(get_db)):
+    admin_user = get_admin_user_from_session(request, db)
+    if not admin_user:
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"detail": "请求体必须是 JSON"})
+
+    try:
+        result = site_config_service.update_site_configs(
+            db,
+            actor=admin_user,
+            request_ip=_resolve_admin_request_ip(request),
+            updates=list(payload.get("items") or []),
+            change_note=payload.get("change_note"),
+        )
+    except ValueError as exc:
+        db.rollback()
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    return JSONResponse(content=jsonable_encoder(result))
+
+
 @router.get("/afdian/orders/{order_id}", response_class=JSONResponse)
 async def afdian_order_detail_ui(request: Request, order_id: int, db: Session = Depends(get_db)):
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
-        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
 
     order = db.query(PaymentOrder).filter(PaymentOrder.id == order_id).first()
     if not order:
-        return JSONResponse(status_code=404, content={"detail": "Order not found"})
+        return JSONResponse(status_code=404, content={"detail": "订单不存在"})
 
     return JSONResponse(content=jsonable_encoder(_build_afdian_order_payload(order)))
 
@@ -551,12 +636,12 @@ async def afdian_order_detail_ui(request: Request, order_id: int, db: Session = 
 async def manage_user_detail_ui(request: Request, user_id: int, db: Session = Depends(get_db)):
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
-        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
 
     _close_expired_pending_orders(db)
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        return JSONResponse(status_code=404, content={"detail": "User not found"})
+        return JSONResponse(status_code=404, content={"detail": "用户不存在"})
 
     payload = _build_user_detail_payload(db, user)
     return JSONResponse(content=jsonable_encoder(payload))
@@ -570,11 +655,11 @@ async def parse_afdian_token_ui(
 ):
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
-        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
 
     token = (token or "").strip()
     if not token:
-        return JSONResponse(status_code=400, content={"detail": "token is required"})
+        return JSONResponse(status_code=400, content={"detail": "token 不能为空"})
 
     try:
         payload = _build_afdian_token_result(token)
@@ -592,11 +677,11 @@ async def query_afdian_order_ui(
 ):
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
-        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
 
     lookup_value = (order_keyword or "").strip()
     if not lookup_value:
-        return JSONResponse(status_code=400, content={"detail": "order_keyword is required"})
+        return JSONResponse(status_code=400, content={"detail": "订单关键字不能为空"})
 
     payload = await _lookup_afdian_order_payload(db, lookup_value)
     return JSONResponse(content=jsonable_encoder(payload))
@@ -610,11 +695,11 @@ async def activate_afdian_order_ui(
 ):
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
-        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
 
     lookup_value = (order_keyword or "").strip()
     if not lookup_value:
-        return JSONResponse(status_code=400, content={"detail": "order_keyword is required"})
+        return JSONResponse(status_code=400, content={"detail": "订单关键字不能为空"})
 
     from routers.user_center import activate_afdian_order_by_lookup
 
@@ -669,11 +754,11 @@ async def manage_users_post(request: Request, db: Session = Depends(get_db)):
                 user.limit_rule = limit_rule
             logger.info(f"[ADMIN] Updated user: {username}")
         else:
-            request.session["flash_messages"] = [f"User '{username}' not found for update."]
+            request.session["flash_messages"] = [f"用户 {username} 不存在，无法更新。"]
             return RedirectResponse(url=request.url_for("manage_users_ui"), status_code=303)
     else:
         if not password:
-            request.session["flash_messages"] = ["Password is required for new user."]
+            request.session["flash_messages"] = ["新增用户时必须填写密码。"]
             return RedirectResponse(url=request.url_for("manage_users_ui"), status_code=303)
 
         hashed_password = hash_password(password)
@@ -689,7 +774,7 @@ async def manage_users_post(request: Request, db: Session = Depends(get_db)):
         logger.info(f"[ADMIN] Added user: {username}")
 
     db.commit()
-    request.session["flash_messages"] = ["User added/updated successfully."]
+    request.session["flash_messages"] = ["用户信息已保存。"]
     return RedirectResponse(url=request.url_for("manage_users_ui"), status_code=303)
 
 
@@ -705,7 +790,7 @@ async def delete_user_ui(request: Request, db: Session = Depends(get_db)):
     if user:
         db.delete(user)
         db.commit()
-        request.session["flash_messages"] = [f"User {user.username} deleted."]
+        request.session["flash_messages"] = [f"用户 {user.username} 已删除。"]
     return RedirectResponse(url=request.url_for("manage_users_ui"), status_code=303)
 
 
@@ -977,7 +1062,7 @@ def _build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> Dic
         ],
         "hourly_stats": [
             {
-                "username": row.username or "anonymous",
+                "username": row.username or "匿名用户",
                 "ip": row.ip,
                 "endpoint": row.endpoint,
                 "success_count": row.success_count or 0,
@@ -1007,6 +1092,6 @@ async def stats_ui(request: Request, hour: Optional[str] = None, db: Session = D
 async def stats_data_ui(request: Request, hour: Optional[str] = None, db: Session = Depends(get_db)):
     admin_user = get_admin_user_from_session(request, db)
     if not admin_user:
-        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
     payload = _build_stats_payload(db, hour)
     return JSONResponse(content=jsonable_encoder(payload))

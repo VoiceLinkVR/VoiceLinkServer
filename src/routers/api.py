@@ -11,11 +11,12 @@ from pydantic import BaseModel
 from typing import Optional
 
 from core.dependencies import (
+    build_access_token_payload,
     get_db,
     create_access_token,
+    fallback_expired_user_to_free,
     verify_password,
     get_current_user_for_status,
-    is_user_expired,
     get_effective_user_limit_rule,
     utcnow_naive,
 )
@@ -37,6 +38,7 @@ from core.services import (
     normalize_translation_language_code,
     detect_translation_source_language,
 )
+from core.image_translate_service import translate_image_to_targets_async
 from core.logging_config import logger
 # 导入用于接收JSON体的Pydantic模型
 from schemas.user import UserLogin
@@ -174,8 +176,8 @@ async def login(db: Session = Depends(get_db), user_credentials: UserLogin = Bod
         logger.warning(f"[LOGIN] 用户被禁用: {user_credentials.username}")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户已被禁用")
 
-    expired, expiration_utc = is_user_expired(user)
-    if expired:
+    downgraded_to_free, expiration_utc = fallback_expired_user_to_free(db, user)
+    if False and downgraded_to_free:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -186,9 +188,18 @@ async def login(db: Session = Depends(get_db), user_credentials: UserLogin = Bod
         )
 
     logger.info(f"[LOGIN] 用户登录成功: {user_credentials.username}")
+    if downgraded_to_free:
+        logger.info(
+            "[LOGIN] Expired account downgraded to free plan during legacy login: %s, expired_at=%s",
+            user_credentials.username,
+            expiration_utc.isoformat().replace("+00:00", "Z") if expiration_utc else None,
+        )
+
     user.last_login_at = utcnow_naive()
     db.commit()
-    access_token = create_access_token(data={"sub": user.username, "uid": user.id, "type": "access"})
+    access_token = create_access_token(
+        data=build_access_token_payload(user, session_type="legacy", token_type="access")
+    )
     return {"message": "Login successful", "access_token": access_token}
 
 @router.get("/latestVersionInfo")
@@ -255,6 +266,8 @@ async def account_status(
 
     return {
         "username": current_user.username,
+        "user_uuid": (current_user.user_uuid or "").strip(),
+        "display_name": (getattr(current_user, "display_name", None) or current_user.username or "").strip(),
         "is_active": bool(current_user.is_active),
         "is_expired": is_expired,
         "expiration_utc": expiration_utc,
@@ -440,7 +453,9 @@ async def account_usage(
 
     return {
         "username": current_user.username,
-        "is_test_user": False,
+        "user_uuid": (current_user.user_uuid or "").strip(),
+        "display_name": (getattr(current_user, "display_name", None) or current_user.username or "").strip(),
+        "is_test_user": bool(getattr(current_user, "is_default_test_user", False)),
         "is_active": bool(current_user.is_active),
         "is_expired": is_expired,
         "expiration_utc": expiration_utc,
@@ -716,6 +731,52 @@ async def multitranscription(
             if text_to_return == '。' or text_to_return == '': return {"text": "", "message": "filtered"}
 
     return {"text": text_to_return}
+
+
+@router.post("/func/photoTranslate")
+async def photo_translate(
+    request: Request,
+    file: UploadFile = File(...),
+    sourceLanguage: str = Form("auto"),
+    targetLanguage: str = Form(...),
+    targetLanguage2: str = Form("none"),
+    targetLanguage3: str = Form("none"),
+    current_user: User = Depends(enforce_user_rate_limit),
+):
+    targetLanguage = _validate_runtime_target_language("targetLanguage", targetLanguage)
+    targetLanguage2 = _validate_runtime_target_language("targetLanguage2", targetLanguage2, allow_none=True)
+    targetLanguage3 = _validate_runtime_target_language("targetLanguage3", targetLanguage3, allow_none=True)
+
+    requested_source_language = (sourceLanguage or "").strip()
+    if requested_source_language and requested_source_language.lower() != "auto":
+        sourceLanguage = _validate_runtime_source_language("sourceLanguage", requested_source_language)
+    else:
+        sourceLanguage = "auto"
+
+    translation_count = 1 + int(targetLanguage2 != "none") + int(targetLanguage3 != "none")
+    _apply_effective_resource_cost(request, 1 + translation_count)
+
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="image file is empty")
+
+    try:
+        result = await translate_image_to_targets_async(
+            image_bytes=image_bytes,
+            media_type=file.content_type,
+            source_language=sourceLanguage,
+            target_language=targetLanguage,
+            target_language2=targetLanguage2,
+            target_language3=targetLanguage3,
+        )
+    except RuntimeError as exc:
+        logger.warning("[PHOTO_TRANSLATE] service unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("[PHOTO_TRANSLATE] unexpected error")
+        raise HTTPException(status_code=500, detail=f"photo translate failed: {exc}") from exc
+
+    return result
 
 class TTSRequest(BaseModel):
     input: str

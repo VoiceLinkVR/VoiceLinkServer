@@ -4,6 +4,8 @@ from typing import Optional
 
 from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text
 
+from core.identity import generate_user_uuid
+
 from .base import Base
 
 
@@ -35,11 +37,14 @@ class User(Base):
     __tablename__ = "user"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_uuid = Column(String(36), unique=True, nullable=False, index=True, default=generate_user_uuid)
     username = Column(String(50), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)
     email = Column(String(255), nullable=True, index=True)
     email_verified = Column(Boolean, default=False, nullable=False)
     display_name = Column(String(100), nullable=True)
+    is_default_test_user = Column(Boolean, default=False, nullable=False, index=True)
+    identity_version = Column(Integer, default=1, nullable=False)
     is_admin = Column(Boolean, default=False)
     limit_rule = Column(String(100), nullable=True)
     expiration_date = Column(DateTime, nullable=True)
@@ -53,12 +58,53 @@ class User(Base):
     last_login_at = Column(DateTime, nullable=True)
 
 
+class V2User(Base):
+    __tablename__ = "v2_user"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_uuid = Column(String(36), unique=True, nullable=False, index=True, default=generate_user_uuid)
+    legacy_user_id = Column(Integer, nullable=True, index=True)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    password = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=False, index=True)
+    email_verified = Column(Boolean, default=False, nullable=False)
+    display_name = Column(String(100), nullable=True)
+    identity_version = Column(Integer, default=2, nullable=False)
+    is_admin = Column(Boolean, default=False)
+    limit_rule = Column(String(100), nullable=True)
+    expiration_date = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    boost_expiration_date = Column(DateTime, nullable=True)
+    boost_limit_rule = Column(String(100), nullable=True)
+    addon_resource_balance = Column(Integer, nullable=False, default=0)
+    addon_resource_total = Column(Integer, nullable=False, default=0)
+    addon_expiration_date = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=True)
+    last_login_at = Column(DateTime, nullable=True)
+
+
+class UserIdentityLink(Base):
+    __tablename__ = "user_identity_link"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_uuid = Column(String(36), nullable=False, index=True)
+    legacy_user_id = Column(Integer, nullable=True, index=True)
+    legacy_username = Column(String(50), nullable=True, index=True)
+    legacy_email = Column(String(255), nullable=True)
+    link_type = Column(String(32), nullable=False, default="legacy_password_bind")
+    status = Column(String(32), nullable=False, default="linked", index=True)
+    linked_at = Column(DateTime, default=datetime.now, nullable=False)
+    linked_by_ip = Column(String(64), nullable=True)
+    audit_note = Column(Text, nullable=True)
+
+
 class AccountToken(Base):
     __tablename__ = "account_token"
 
     id = Column(Integer, primary_key=True, index=True)
     token = Column(String(255), unique=True, nullable=False, index=True)
-    username = Column(String(50), nullable=False, index=True)
+    username = Column(String(50), nullable=True, index=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
     email = Column(String(255), nullable=True, index=True)
     purpose = Column(String(32), nullable=False, index=True)
     code = Column(String(16), nullable=True, index=True)
@@ -73,6 +119,7 @@ class UserSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String(128), unique=True, nullable=False, index=True)
     user_id = Column(Integer, nullable=False, index=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
     session_type = Column(String(32), nullable=False, default="portal", index=True)
     ip = Column(String(64), nullable=True)
     user_agent = Column(String(512), nullable=True)
@@ -88,6 +135,7 @@ class RefreshToken(Base):
     id = Column(Integer, primary_key=True, index=True)
     token = Column(String(255), unique=True, nullable=False, index=True)
     user_id = Column(Integer, nullable=False, index=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
     session_id = Column(String(128), nullable=True, index=True)
     expires_at = Column(DateTime, nullable=False, index=True)
     revoked_at = Column(DateTime, nullable=True, index=True)
@@ -104,6 +152,7 @@ class DeviceAuthorization(Base):
     requested_scope = Column(String(255), nullable=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
     user_id = Column(Integer, nullable=True, index=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
     ip = Column(String(64), nullable=True)
     user_agent = Column(String(512), nullable=True)
     expires_at = Column(DateTime, nullable=False, index=True)
@@ -119,6 +168,10 @@ class RequestLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), nullable=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
+    actor_type = Column(String(32), nullable=True, default="authenticated")
+    rate_limit_scope = Column(String(32), nullable=True)
+    quota_scope = Column(String(32), nullable=True)
     ip = Column(String(45), nullable=False)
     endpoint = Column(String(100), nullable=False, index=True)
     timestamp = Column(DateTime, default=datetime.now, index=True)
@@ -127,6 +180,30 @@ class RequestLog(Base):
     resource_cost = Column(Integer, nullable=False, default=0, index=True)
     resource_deducted = Column(Boolean, nullable=False, default=False, index=True)
     quota_source = Column(String(20), nullable=False, default="none", index=True)
+
+
+class V2RequestLog(Base):
+    __tablename__ = "v2_request_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(String(64), nullable=True, index=True)
+    username = Column(String(50), nullable=True, index=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
+    actor_type = Column(String(32), nullable=True, default="authenticated")
+    rate_limit_scope = Column(String(32), nullable=True)
+    quota_scope = Column(String(32), nullable=True)
+    ip = Column(String(45), nullable=False, index=True)
+    host = Column(String(255), nullable=True, index=True)
+    method = Column(String(16), nullable=True, index=True)
+    endpoint = Column(String(255), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.now, index=True)
+    duration = Column(Float, nullable=False)
+    status = Column(String(20), nullable=False, index=True)
+    status_code = Column(Integer, nullable=True, index=True)
+    resource_cost = Column(Integer, nullable=False, default=0, index=True)
+    resource_deducted = Column(Boolean, nullable=False, default=False, index=True)
+    quota_source = Column(String(20), nullable=False, default="none", index=True)
+    extra_payload = Column(Text, nullable=True)
 
 
 class PaymentOrder(Base):
@@ -140,6 +217,10 @@ class PaymentOrder(Base):
     remark = Column(Text, nullable=True)
     remark_digest = Column(String(64), nullable=True, index=True)
     username = Column(String(50), nullable=True, index=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
+    email = Column(String(255), nullable=True)
+    plan_id = Column(String(64), nullable=True, index=True)
+    billing_version = Column(Integer, nullable=False, default=1)
     action = Column(String(32), nullable=True)
     amount = Column(Float, nullable=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
@@ -150,3 +231,43 @@ class PaymentOrder(Base):
     raw_payload = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.now, nullable=False)
     updated_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
+class SiteConfig(Base):
+    __tablename__ = "site_config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    config_key = Column(String(100), unique=True, nullable=False, index=True)
+    config_group = Column(String(64), nullable=False, index=True)
+    value_json = Column(Text, nullable=False)
+    value_type = Column(String(32), nullable=False)
+    is_secret = Column(Boolean, nullable=False, default=False)
+    requires_restart = Column(Boolean, nullable=False, default=False)
+    value_fingerprint = Column(String(64), nullable=False, index=True)
+    updated_by_user_id = Column(Integer, nullable=True, index=True)
+    updated_by_username = Column(String(50), nullable=True, index=True)
+    updated_from_ip = Column(String(64), nullable=True)
+    updated_note = Column(String(500), nullable=True)
+    updated_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+
+class SiteConfigAuditLog(Base):
+    __tablename__ = "site_config_audit_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    config_key = Column(String(100), nullable=False, index=True)
+    config_group = Column(String(64), nullable=False, index=True)
+    operation = Column(String(32), nullable=False, index=True)
+    is_secret = Column(Boolean, nullable=False, default=False)
+    requires_restart = Column(Boolean, nullable=False, default=False)
+    old_value_json = Column(Text, nullable=True)
+    new_value_json = Column(Text, nullable=True)
+    old_value_summary = Column(Text, nullable=True)
+    new_value_summary = Column(Text, nullable=True)
+    old_value_fingerprint = Column(String(64), nullable=True, index=True)
+    new_value_fingerprint = Column(String(64), nullable=True, index=True)
+    changed_by_user_id = Column(Integer, nullable=True, index=True)
+    changed_by_username = Column(String(50), nullable=True, index=True)
+    changed_from_ip = Column(String(64), nullable=True)
+    change_note = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)

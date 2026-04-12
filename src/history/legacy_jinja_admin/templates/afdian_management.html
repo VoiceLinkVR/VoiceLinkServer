@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>爱发电管理 - VoiceLink Server</title>
+    <style>
+        body{margin:0;font-family:"Segoe UI","Noto Sans SC",sans-serif;background:#f5f7fb;color:#172033}
+        .topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 20px;background:#fff;border-bottom:1px solid #dbe4f0;position:sticky;top:0}
+        .nav{display:flex;flex-wrap:wrap;gap:10px}.nav a,.btn{border:1px solid #dbe4f0;background:#fff;border-radius:8px;padding:8px 12px;color:#172033;text-decoration:none;cursor:pointer}
+        .btn.primary{background:#2563eb;border-color:#2563eb;color:#fff}
+        .page{max-width:1480px;margin:0 auto;padding:16px;display:grid;gap:16px}
+        .card{background:#fff;border:1px solid #dbe4f0;border-radius:12px;overflow:hidden}
+        .head{padding:14px 16px;border-bottom:1px solid #edf2f7}.head h2,.head h1{margin:0 0 6px}.head p{margin:0;color:#64748b;font-size:13px}
+        .body{padding:16px}
+        .toolbar{display:grid;gap:12px}
+        .toolbar-top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start}
+        .toolbar-actions,.toolbar-filters,.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+        input,select,textarea{border:1px solid #dbe4f0;border-radius:8px;padding:0 10px;height:38px}
+        textarea{height:120px;padding:10px;resize:vertical}
+        .summary{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px}
+        .stat,.kv,.section{border:1px solid #edf2f7;border-radius:10px;background:#fafcff}
+        .stat{padding:10px}.stat b{display:block;font-size:26px;margin-top:6px}
+        .meta{color:#64748b;font-size:12px}
+        table{width:100%;border-collapse:collapse;font-size:13px}
+        th,td{padding:10px;border-bottom:1px solid #edf2f7;text-align:left;vertical-align:top}th{background:#f8fbff;color:#64748b}
+        .mono{font-family:Consolas,monospace}.truncate{max-width:260px;overflow:hidden;text-overflow:ellipsis}
+        .tag{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px}.ok{background:#ecfdf3;color:#166534}.pending{background:#fff7ed;color:#c2410c}.bad{background:#f3f4f6;color:#475569}
+        .empty{padding:18px;color:#64748b;text-align:center}
+        .modal{position:fixed;inset:0;display:none}.modal.open{display:block}
+        .mask{position:absolute;inset:0;background:rgba(15,23,42,.45)}
+        .panel{position:relative;width:min(1040px,calc(100vw - 24px));max-height:calc(100vh - 24px);margin:12px auto;background:#fff;border-radius:14px;border:1px solid #dbe4f0;display:grid;grid-template-rows:auto 1fr;overflow:hidden}
+        .modal-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;padding:16px;border-bottom:1px solid #edf2f7}
+        .modal-body{padding:16px;overflow:auto;background:#f7faff;display:grid;gap:12px}
+        .section{padding:14px;background:#fff}.section h3{margin:0 0 6px}.section p{margin:0 0 10px;color:#64748b;font-size:13px}
+        .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.kv{padding:10px;display:grid;gap:6px}.kv small{color:#64748b}
+        pre{margin:0;padding:12px;border-radius:10px;background:#0f172a;color:#dbeafe;white-space:pre-wrap;word-break:break-word;font-size:12px}
+        @media (max-width:960px){.summary,.grid{grid-template-columns:1fr 1fr}} @media (max-width:760px){.summary,.grid{grid-template-columns:1fr}}
+    </style>
+</head>
+<body>
+    <header class="topbar">
+        <strong>后台管理</strong>
+        <nav class="nav">
+            <a href="{{ request.url_for('manage_users_ui') }}">用户管理</a>
+            <a href="{{ request.url_for('afdian_management_ui') }}">爱发电管理</a>
+            <a href="{{ request.url_for('stats_ui') }}">使用统计</a>
+            <a href="{{ request.url_for('site_configs_ui') }}">站点配置</a>
+            <a href="{{ request.url_for('logout_ui') }}">退出登录</a>
+        </nav>
+    </header>
+
+    <main class="page">
+        <section class="card">
+            <div class="body toolbar">
+                <div class="toolbar-top">
+                    <div>
+                        <h1 style="margin:0 0 6px">爱发电管理</h1>
+                        <p class="meta">查看本地订单，并在弹窗中完成 token 解析、订单查询、手动激活和详情检查。</p>
+                    </div>
+                    <div class="toolbar-actions">
+                        <button type="button" class="btn primary" data-open-modal="tokenModal">Token 解析</button>
+                        <button type="button" class="btn" data-open-modal="activateModal">订单激活</button>
+                        <button type="button" class="btn" data-open-modal="lookupModal">订单查询</button>
+                    </div>
+                </div>
+                <div class="toolbar-filters">
+                    <input id="tableSearch" type="text" placeholder="搜索用户名、out_trade_no、order_no、custom_id">
+                    <select id="statusFilter"><option value="all">全部状态</option><option value="activated">已激活</option><option value="pending">待激活</option><option value="unpaid">已关闭</option></select>
+                    <span class="meta" id="visibleCount">显示 0 / 0</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="summary">
+            <article class="stat"><span>订单总数</span><b>{{ summary.total_orders }}</b></article>
+            <article class="stat"><span>已激活</span><b>{{ summary.activated_orders }}</b></article>
+            <article class="stat"><span>待激活</span><b>{{ summary.pending_orders }}</b></article>
+            <article class="stat"><span>已支付总额</span><b>{{ '%.2f'|format(summary.activated_amount_total or 0) }}</b></article>
+        </section>
+
+        <section class="card">
+            <div class="head"><h2>本地订单列表</h2><p>点击“详情”可查看结构化订单信息、custom_id 解析结果与原始 payload。</p></div>
+            <div class="body" style="overflow:auto">
+                <table>
+                    <thead><tr><th>ID / 状态</th><th>用户 / 动作</th><th>订单号</th><th>商户单号</th><th>custom_id</th><th>金额</th><th>激活失败原因</th><th>创建时间</th><th>操作</th></tr></thead>
+                    <tbody id="orderTableBody">
+                        {% for order in orders %}
+                        <tr data-order-id="{{ order.id }}" data-status="{{ order.status or '' }}" data-search="{{ (order.username or '') ~ ' ' ~ (order.action or '') ~ ' ' ~ (order.order_no or '') ~ ' ' ~ (order.out_trade_no or '') ~ ' ' ~ (order.custom_id or '') ~ ' ' ~ (order.activation_error or '') }}">
+                            <td><strong>#{{ order.id }}</strong><br><span class="tag {% if order.status == 'activated' %}ok{% elif order.status == 'pending' %}pending{% else %}bad{% endif %}">{{ order.status_label or order.status or '-' }}</span></td>
+                            <td><strong>{{ order.username or '-' }}</strong><br><span class="meta">{{ order.action or '-' }}</span></td>
+                            <td class="mono">{{ order.order_no or '-' }}</td>
+                            <td class="mono">{{ order.out_trade_no or '-' }}</td>
+                            <td class="mono truncate" title="{{ order.custom_id or '' }}">{{ order.custom_id or '-' }}</td>
+                            <td>{% if order.amount is not none %}CNY {{ '%.2f'|format(order.amount) }}{% else %}-{% endif %}</td>
+                            <td class="truncate" title="{{ order.activation_error or '' }}">{{ order.activation_error or '-' }}</td>
+                            <td>{{ order.created_at or '-' }}</td>
+                            <td><button type="button" class="btn js-detail">详情</button></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% if orders|length == 0 %}<div class="empty">暂无爱发电订单数据</div>{% endif %}
+            </div>
+        </section>
+    </main>
+
+    <div class="modal" id="tokenModal" hidden>
+        <div class="mask" data-close-modal></div>
+        <div class="panel">
+            <div class="modal-head"><div><h3 style="margin:0 0 6px">Token 解析</h3><p class="meta">输入 custom_id 后查看解析字段和原始内容。</p></div><button type="button" class="btn" data-close-modal>关闭</button></div>
+            <div class="modal-body">
+                <section class="section"><form id="tokenForm"><div class="row"><textarea id="tokenInput" placeholder="粘贴 custom_id" style="width:100%"></textarea></div><div class="row"><button type="submit" class="btn primary">开始解析</button><button type="button" class="btn" id="tokenClear">清空</button></div></form></section>
+                <div id="tokenResult"><section class="section">提交后在这里显示解析结果。</section></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="lookupModal" hidden>
+        <div class="mask" data-close-modal></div>
+        <div class="panel">
+            <div class="modal-head"><div><h3 style="margin:0 0 6px">订单查询</h3><p class="meta">支持使用 out_trade_no、order_no、custom_id 或 remark 查询。</p></div><button type="button" class="btn" data-close-modal>关闭</button></div>
+            <div class="modal-body">
+                <section class="section"><form id="lookupForm"><div class="row"><input id="lookupInput" type="text" placeholder="输入订单关键字" style="min-width:280px;flex:1"></div><div class="row"><button type="submit" class="btn primary">查询订单</button><button type="button" class="btn" id="lookupClear">清空</button></div></form></section>
+                <div id="lookupResult"><section class="section">提交后在这里显示本地订单、远端订单和原始返回。</section></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="activateModal" hidden>
+        <div class="mask" data-close-modal></div>
+        <div class="panel">
+            <div class="modal-head"><div><h3 style="margin:0 0 6px">订单激活</h3><p class="meta">用于 webhook 失效时手动补激活，支持商户订单号、订单号、custom_id 或 remark。</p></div><button type="button" class="btn" data-close-modal>关闭</button></div>
+            <div class="modal-body">
+                <section class="section"><form id="activateForm"><div class="row"><input id="activateInput" type="text" placeholder="输入订单关键字" style="min-width:280px;flex:1"></div><div class="row"><button type="submit" class="btn primary">执行激活</button><button type="button" class="btn" id="activateClear">清空</button></div></form></section>
+                <div id="activateResult"><section class="section">提交后在这里显示激活结果。</section></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="detailModal" hidden>
+        <div class="mask" data-close-modal></div>
+        <div class="panel">
+            <div class="modal-head"><div><h3 id="detailModalTitle" style="margin:0 0 6px">订单详情</h3><p id="detailModalMeta" class="meta">加载中...</p></div><button type="button" class="btn" data-close-modal>关闭</button></div>
+            <div class="modal-body" id="detailResult"><section class="section">正在加载订单详情。</section></div>
+        </div>
+    </div>
+
+    <script>
+        const tokenUrl="{{ request.url_for('parse_afdian_token_ui') }}";
+        const lookupUrl="{{ request.url_for('query_afdian_order_ui') }}";
+        const activateUrl="{{ request.url_for('activate_afdian_order_ui') }}";
+        const detailUrlTemplate="{{ request.url_for('afdian_order_detail_ui', order_id=0) }}";
+        const tableSearch=document.getElementById("tableSearch");
+        const statusFilter=document.getElementById("statusFilter");
+        const orderTableBody=document.getElementById("orderTableBody");
+        const visibleCount=document.getElementById("visibleCount");
+        const tokenResult=document.getElementById("tokenResult");
+        const lookupResult=document.getElementById("lookupResult");
+        const activateResult=document.getElementById("activateResult");
+        const detailResult=document.getElementById("detailResult");
+        const detailModalMeta=document.getElementById("detailModalMeta");
+        const detailModalTitle=document.getElementById("detailModalTitle");
+        function escapeHtml(v){return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
+        function pretty(v){if(v===null||v===undefined||v==="")return "-";if(typeof v==="string")return v;try{return JSON.stringify(v,null,2)}catch{return String(v)}}
+        function valueView(v){if(v===null||v===undefined||v==="")return "-";if(typeof v==="boolean")return v?"是":"否";if(typeof v==="object")return `<span class="mono">${escapeHtml(JSON.stringify(v))}</span>`;return escapeHtml(String(v))}
+        function fieldCards(fields){return Object.entries(fields).map(([k,v])=>`<div class="kv"><small>${escapeHtml(k)}</small><div>${valueView(v)}</div></div>`).join("")}
+        function jsonSection(title,data){return `<section class="section"><h3>${escapeHtml(title)}</h3><pre>${escapeHtml(pretty(data))}</pre></section>`}
+        function activationSourceText(source,label){if(label&&source&&label!==source)return `${label} (${source})`;return label||source||"-"}
+        function openModal(id){const modal=document.getElementById(id);if(!modal)return;modal.hidden=false;modal.classList.add("open");document.body.style.overflow="hidden"}
+        function closeModal(modal){modal.classList.remove("open");modal.hidden=true;document.body.style.overflow=""}
+        function closeAllModals(){document.querySelectorAll(".modal.open").forEach(closeModal)}
+        function renderOrderSection(title,order,sourceLabel){if(!order){return `<section class="section"><h3>${escapeHtml(title)}</h3><p>${escapeHtml(sourceLabel)}未命中。</p></section>`}const fields={"状态":order.status_label||order.status,"动作":order.action,"用户名":order.username,"订单号":order.order_no,"商户单号":order.out_trade_no,"金额":order.amount,"激活方式":activationSourceText(order.activation_source,order.activation_source_label),"custom_id":order.custom_id,"remark":order.remark,"激活失败原因":order.activation_error,"失败记录时间":order.activation_error_at,"创建时间":order.created_at||order.create_time_local,"更新时间":order.updated_at,"激活时间":order.activated_at};const parsed=order.parsed_custom_id||null;const parseBlock=parsed||order.custom_id_parse_error?`<section class="section"><h3>custom_id 解析</h3>${order.custom_id_parse_error?`<div class="kv"><small>解析错误</small><div>${escapeHtml(order.custom_id_parse_error)}</div></div>`:`<div class="grid">${fieldCards(parsed)}</div>`}</section>`:"";const errorBlock=order.activation_error?`<section class="section"><h3>激活失败</h3><div class="grid">${fieldCards({"失败原因":order.activation_error,"失败时间":order.activation_error_at})}</div></section>`:"";return `<section class="section"><div class="row" style="justify-content:space-between"><h3>${escapeHtml(title)}</h3><span class="tag ${order.status==="activated"?"ok":order.status==="pending"?"pending":"bad"}">${escapeHtml(order.status_label||order.status||"-")}</span></div><div class="grid">${fieldCards(fields)}</div></section>${errorBlock}${parseBlock}${jsonSection(`${sourceLabel} 原始数据`,order.raw_payload||order.raw_payload_text)}`}
+        function renderTokenResult(payload){const fields=Object.assign({"token 长度":payload.token_length,"是否过期":payload.expired},payload.fields||{});tokenResult.innerHTML=`<section class="section"><h3>解析结果</h3><div class="grid">${fieldCards(fields)}</div></section>${jsonSection("原始解析 payload",payload.payload)}`}
+        function renderLookupResult(payload){const summary={"查询值":payload.query_value,"解析后的 out_trade_no":payload.resolved_out_trade_no,"本地命中":payload.local_found,"远端命中":payload.remote_found,"远端错误":payload.remote_error};lookupResult.innerHTML=`<section class="section"><h3>查询摘要</h3><div class="grid">${fieldCards(summary)}</div></section>${renderOrderSection("本地订单",payload.local_order,"本地订单")}${renderOrderSection("远端订单",payload.remote_order,"远端订单")}${jsonSection("远端接口返回",payload.remote_payload)}`}
+        function renderActivateResult(payload){const summary={"结果":payload.message,"查询值":payload.lookup_value,"是否重复提交":payload.idempotent,"商户订单号":payload.out_trade_no||payload.resolved_out_trade_no,"订单号":payload.order_no,"动作":payload.action,"金额":payload.amount,"月份":payload.months,"套餐月价":payload.plan_price,"限流规则":payload.limit_rule,"激活方式":activationSourceText(payload.activation_source,payload.activation_source_label),"到期时间(UTC)":payload.new_expiration_utc,"Boost 到期(UTC)":payload.boost_expiration_utc};activateResult.innerHTML=`<section class="section"><h3>激活结果</h3><div class="grid">${fieldCards(summary)}</div></section>`}
+        function applyFilters(){const keyword=(tableSearch.value||"").trim().toLowerCase();const status=statusFilter.value;const rows=Array.from(orderTableBody.querySelectorAll("tr"));let shown=0;rows.forEach((row)=>{const text=(row.dataset.search||"").toLowerCase();const visible=(!keyword||text.includes(keyword))&&(status==="all"||row.dataset.status===status);row.style.display=visible?"":"none";if(visible)shown+=1});visibleCount.textContent=`显示 ${shown} / ${rows.length}`}
+        function detailUrl(orderId){return detailUrlTemplate.replace(/0$/,String(orderId))}
+        async function postForm(url,body){const resp=await fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:new URLSearchParams(body)});const data=await resp.json();if(!resp.ok)throw new Error(data.detail||"请求失败");return data}
+        async function loadOrderDetail(orderId){openModal("detailModal");detailModalTitle.textContent=`订单详情 #${orderId}`;detailModalMeta.textContent="正在加载...";detailResult.innerHTML='<section class="section">正在加载订单详情。</section>';try{const resp=await fetch(detailUrl(orderId));const data=await resp.json();if(!resp.ok)throw new Error(data.detail||"加载失败");detailModalMeta.textContent=`${data.username||"-"} / ${data.created_at||"-"}`;detailResult.innerHTML=renderOrderSection("本地订单详情",data,"本地订单")}catch(err){detailModalMeta.textContent="加载失败";detailResult.innerHTML=`<section class="section">${escapeHtml(err.message||String(err))}</section>`}}
+        document.querySelectorAll("[data-open-modal]").forEach((btn)=>btn.addEventListener("click",()=>openModal(btn.dataset.openModal)));
+        document.querySelectorAll(".modal").forEach((modal)=>modal.addEventListener("click",(event)=>{if(event.target.hasAttribute("data-close-modal")||event.target===modal)closeModal(modal)}));
+        document.addEventListener("keydown",(event)=>{if(event.key==="Escape")closeAllModals()});
+        document.getElementById("tokenForm").addEventListener("submit",async(event)=>{event.preventDefault();const token=document.getElementById("tokenInput").value.trim();if(!token){tokenResult.innerHTML='<section class="section">请先输入 custom_id。</section>';return}tokenResult.innerHTML='<section class="section">正在解析...</section>';try{renderTokenResult(await postForm(tokenUrl,{token}))}catch(err){tokenResult.innerHTML=`<section class="section">${escapeHtml(err.message||String(err))}</section>`}});
+        document.getElementById("lookupForm").addEventListener("submit",async(event)=>{event.preventDefault();const orderKeyword=document.getElementById("lookupInput").value.trim();if(!orderKeyword){lookupResult.innerHTML='<section class="section">请先输入订单关键字。</section>';return}lookupResult.innerHTML='<section class="section">正在查询...</section>';try{renderLookupResult(await postForm(lookupUrl,{order_keyword:orderKeyword}))}catch(err){lookupResult.innerHTML=`<section class="section">${escapeHtml(err.message||String(err))}</section>`}});
+        document.getElementById("activateForm").addEventListener("submit",async(event)=>{event.preventDefault();const orderKeyword=document.getElementById("activateInput").value.trim();if(!orderKeyword){activateResult.innerHTML='<section class="section">请先输入订单关键字。</section>';return}activateResult.innerHTML='<section class="section">正在激活...</section>';try{renderActivateResult(await postForm(activateUrl,{order_keyword:orderKeyword}))}catch(err){activateResult.innerHTML=`<section class="section">${escapeHtml(err.message||String(err))}</section>`}});
+        document.getElementById("tokenClear").addEventListener("click",()=>{document.getElementById("tokenInput").value="";tokenResult.innerHTML='<section class="section">提交后在这里显示解析结果。</section>'});
+        document.getElementById("lookupClear").addEventListener("click",()=>{document.getElementById("lookupInput").value="";lookupResult.innerHTML='<section class="section">提交后在这里显示本地订单、远端订单和原始返回。</section>'});
+        document.getElementById("activateClear").addEventListener("click",()=>{document.getElementById("activateInput").value="";activateResult.innerHTML='<section class="section">提交后在这里显示激活结果。</section>'});
+        document.querySelectorAll(".js-detail").forEach((btn)=>btn.addEventListener("click",()=>loadOrderDetail(btn.closest("tr").dataset.orderId)));
+        tableSearch.addEventListener("input",applyFilters);
+        statusFilter.addEventListener("change",applyFilters);
+        applyFilters();
+    </script>
+</body>
+</html>

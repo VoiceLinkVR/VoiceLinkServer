@@ -30,12 +30,15 @@ def invalidate_account_tokens(
     db: Session,
     *,
     username: Optional[str] = None,
+    user_uuid: Optional[str] = None,
     email: Optional[str] = None,
     purpose: Optional[str] = None,
 ) -> None:
     query = db.query(AccountToken).filter(AccountToken.used_at.is_(None))
     if username is not None:
         query = query.filter(AccountToken.username == username)
+    if user_uuid is not None:
+        query = query.filter(AccountToken.user_uuid == user_uuid)
     if email is not None:
         query = query.filter(AccountToken.email == normalize_email(email))
     if purpose is not None:
@@ -51,14 +54,16 @@ def create_email_challenge(
     username: str,
     email: str,
     purpose: str,
+    user_uuid: Optional[str] = None,
 ) -> AccountToken:
     normalized_email = normalize_email(email)
-    invalidate_account_tokens(db, username=username, purpose=purpose)
+    invalidate_account_tokens(db, username=username, user_uuid=user_uuid, purpose=purpose)
     invalidate_account_tokens(db, email=normalized_email, purpose=purpose)
 
     record = AccountToken(
         token=secrets.token_urlsafe(32),
         username=username,
+        user_uuid=user_uuid,
         email=normalized_email,
         purpose=purpose,
         code=build_email_code(),

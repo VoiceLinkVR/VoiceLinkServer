@@ -76,22 +76,69 @@ class AdminStatsQuery(BaseModel):
     hour: Optional[str] = Field(default=None, max_length=32)
 
 
-class AdminPlanTierPayload(BaseModel):
-    monthly_price: float = Field(..., gt=0)
-    daily_quota: int = Field(..., gt=0)
+class AdminSiteConfigGroupResponse(BaseModel):
+    key: str
+    label: str
+    description: str
+    count: int
 
 
-class AdminPlanTierResponse(BaseModel):
+class AdminSiteConfigItemResponse(BaseModel):
+    key: str
+    group: str
+    group_label: str
+    label: str
+    description: str
+    is_secret: bool
+    requires_restart: bool
+    source: str
+    value: str
+    raw_value: Any = None
+    base_value: str
+    base_raw_value: Any = None
+    updated_at: Optional[str] = None
+    updated_by_username: Optional[str] = None
+    updated_note: Optional[str] = None
+
+
+class AdminSiteConfigListResponse(BaseModel):
+    groups: list[AdminSiteConfigGroupResponse]
+    items: list[AdminSiteConfigItemResponse]
+
+
+class AdminSiteConfigUpdateItemRequest(BaseModel):
+    key: str = Field(..., min_length=1, max_length=100)
+    value: Any = None
+    clear: bool = False
+
+
+class AdminSiteConfigUpdateRequest(BaseModel):
+    items: list[AdminSiteConfigUpdateItemRequest] = Field(default_factory=list, min_length=1)
+    change_note: Optional[str] = Field(default=None, max_length=500)
+
+
+class AdminSiteConfigUpdateResponse(AdminSiteConfigListResponse):
+    applied: bool
+    message: str
+
+
+class AdminSiteConfigAuditItemResponse(BaseModel):
     id: str
-    monthly_price: float
-    daily_quota: int
+    config_key: str
+    config_group: str
+    operation: str
+    is_secret: bool
+    requires_restart: bool
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    old_fingerprint: Optional[str] = None
+    new_fingerprint: Optional[str] = None
+    changed_by_user_id: Optional[str] = None
+    changed_by_username: Optional[str] = None
+    changed_from_ip: Optional[str] = None
+    change_note: Optional[str] = None
+    created_at: Optional[str] = None
 
 
-class AdminPlanCatalogResponse(BaseModel):
-    free_plan: AdminPlanTierResponse
-    tiers: list[AdminPlanTierResponse]
-
-
-class AdminPlanCatalogUpdateRequest(BaseModel):
-    free_daily_quota: int = Field(..., gt=0)
-    tiers: list[AdminPlanTierPayload] = Field(default_factory=list, min_length=1)
+class AdminSiteConfigAuditResponse(BaseModel):
+    items: list[AdminSiteConfigAuditItemResponse]

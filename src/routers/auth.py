@@ -15,22 +15,26 @@ from core.account_email_service import (
     send_email_code,
 )
 from core.config import settings
-from core.plan_catalog import build_limit_rule, get_free_plan
 from core.dependencies import (
-    authenticate_user,
-    get_current_user,
     get_db,
     hash_password,
-    is_user_expired,
-    issue_login_artifacts,
-    issue_noninteractive_login_artifacts,
     normalize_email,
     revoke_refresh_token,
-    revoke_user_session,
-    rotate_refresh_token,
     utcnow_naive,
 )
-from db.models import DeviceAuthorization, User
+from core.identity import build_default_display_name, generate_user_uuid, is_v2_identity_ready
+from core.plan_catalog import build_limit_rule, get_free_plan
+from core.v2_dependencies import (
+    authenticate_v2_user,
+    fallback_expired_v2_user_to_free,
+    get_current_v2_user,
+    get_v2_user_by_device_authorization,
+    issue_noninteractive_v2_login_artifacts,
+    issue_v2_login_artifacts,
+    revoke_v2_user_session,
+    rotate_v2_refresh_token,
+)
+from db.models import DeviceAuthorization, V2User
 from schemas.auth import (
     AuthDeviceActionResponse,
     AuthDeviceAuthorizeRequest,
@@ -55,6 +59,13 @@ DEVICE_AUTH_INTERVAL_SECONDS = 5
 DEVICE_AUTH_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
+def _migration_required(user: V2User) -> bool:
+    return not is_v2_identity_ready(
+        email=getattr(user, "email", None),
+        identity_version=getattr(user, "identity_version", 2),
+    )
+
+
 def _build_username(db: Session, email: str) -> str:
     local_part = email.split("@", 1)[0]
     slug = re.sub(r"[^a-zA-Z0-9_.-]+", "_", local_part).strip("._-") or "user"
@@ -62,7 +73,7 @@ def _build_username(db: Session, email: str) -> str:
     candidate = slug
     counter = 1
 
-    while db.query(User).filter(User.username == candidate).first() is not None:
+    while db.query(V2User).filter(V2User.username == candidate).first() is not None:
         suffix = f"_{counter}"
         candidate = f"{slug[: max(1, 50 - len(suffix))]}{suffix}"
         counter += 1
@@ -70,15 +81,24 @@ def _build_username(db: Session, email: str) -> str:
     return candidate
 
 
-def _serialize_user(user: User) -> AuthUserResponse:
-    display_name = (getattr(user, "display_name", None) or user.username or "").strip()
+def _serialize_user(user: V2User) -> AuthUserResponse:
+    identity_version = int(getattr(user, "identity_version", 2) or 2)
+    migration_required = _migration_required(user)
+    display_name = (getattr(user, "display_name", None) or "").strip() or build_default_display_name(
+        user_uuid=user.user_uuid,
+        user_id=user.id,
+    )
     return AuthUserResponse(
         id=str(user.id),
+        user_uuid=(user.user_uuid or "").strip(),
         username=user.username,
+        legacy_username="",
         email=(user.email or "").strip(),
         display_name=display_name,
         email_verified=bool(getattr(user, "email_verified", False)),
         is_admin=bool(user.is_admin),
+        identity_version=identity_version,
+        migration_required=migration_required,
     )
 
 
@@ -125,7 +145,7 @@ def _find_device_authorization_by_user_code(db: Session, user_code: str) -> Devi
     return db.query(DeviceAuthorization).filter(DeviceAuthorization.user_code == normalized).first()
 
 
-def _serialize_device_request(record: DeviceAuthorization, user: User | None = None) -> AuthDeviceRequestResponse:
+def _serialize_device_request(record: DeviceAuthorization, user: V2User | None = None) -> AuthDeviceRequestResponse:
     return AuthDeviceRequestResponse(
         user_code=record.user_code,
         client_name=(record.client_name or "VRCLS Desktop").strip() or "VRCLS Desktop",
@@ -133,17 +153,18 @@ def _serialize_device_request(record: DeviceAuthorization, user: User | None = N
         status=record.status,
         expires_at=record.expires_at.isoformat() + "Z",
         username=user.username if user is not None else "",
+        user_uuid=(user.user_uuid or "").strip() if user is not None else "",
         display_name=((getattr(user, "display_name", None) or user.username).strip() if user is not None else ""),
     )
 
 
-@router.post("/auth/register/send-code", response_model=AuthVerificationChallengeResponse)
+@router.post("/register/send-code", response_model=AuthVerificationChallengeResponse)
 async def send_register_code(
     payload: AuthRegisterCodeRequest,
     db: Session = Depends(get_db),
 ):
     email = normalize_email(payload.email)
-    existing_user = db.query(User).filter(or_(User.email == email, User.username == email)).first()
+    existing_user = db.query(V2User).filter(or_(V2User.email == email, V2User.username == email)).first()
     if existing_user is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
 
@@ -162,16 +183,14 @@ async def send_register_code(
     )
 
 
-@router.post("/auth/register", response_model=AuthTokenResponse)
+@router.post("/register", response_model=AuthTokenResponse)
 async def register(
     payload: AuthRegisterRequest,
     request: Request,
     db: Session = Depends(get_db),
 ):
     email = normalize_email(payload.email)
-    display_name = payload.display_name.strip()
-
-    existing_user = db.query(User).filter(or_(User.email == email, User.username == email)).first()
+    existing_user = db.query(V2User).filter(or_(V2User.email == email, V2User.username == email)).first()
     if existing_user is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
 
@@ -185,14 +204,18 @@ async def register(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Verification email does not match")
 
     free_plan = get_free_plan()
-    user = User(
+    user_uuid = generate_user_uuid()
+    user = V2User(
+        user_uuid=user_uuid,
+        legacy_user_id=None,
         username=_build_username(db, email),
         password=hash_password(payload.password),
         email=email,
         email_verified=True,
-        display_name=display_name,
+        display_name=build_default_display_name(user_uuid=user_uuid),
         is_admin=False,
         is_active=True,
+        identity_version=2,
         limit_rule=build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"]),
         created_at=utcnow_naive(),
         last_login_at=utcnow_naive(),
@@ -201,7 +224,7 @@ async def register(
     db.flush()
     consume_email_challenge(db, register_challenge)
 
-    access_token, refresh_token, _ = issue_login_artifacts(db, user, request)
+    access_token, refresh_token, _ = issue_v2_login_artifacts(db, user, request)
     db.commit()
     db.refresh(user)
 
@@ -212,32 +235,24 @@ async def register(
     )
 
 
-@router.post("/auth/login", response_model=AuthTokenResponse)
+@router.post("/login", response_model=AuthTokenResponse)
 async def login(
     payload: AuthLoginRequest,
     request: Request,
     db: Session = Depends(get_db),
 ):
-    user = authenticate_user(db, payload.login.strip(), payload.password)
+    login_value = (payload.email or payload.login or "").strip()
+    user = authenticate_v2_user(db, login_value, payload.password)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
 
-    expired, expires_at_utc = is_user_expired(user)
-    if expired:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "account_expired",
-                "message": "User account expired",
-                "expiration_utc": expires_at_utc.isoformat().replace("+00:00", "Z") if expires_at_utc else None,
-            },
-        )
+    fallback_expired_v2_user_to_free(db, user)
 
     user.last_login_at = utcnow_naive()
-    access_token, refresh_token, _ = issue_login_artifacts(db, user, request)
+    access_token, refresh_token, _ = issue_v2_login_artifacts(db, user, request)
     db.commit()
     db.refresh(user)
 
@@ -248,9 +263,9 @@ async def login(
     )
 
 
-@router.post("/auth/refresh", response_model=AuthTokenResponse)
+@router.post("/refresh", response_model=AuthTokenResponse)
 async def refresh(payload: AuthRefreshRequest, db: Session = Depends(get_db)):
-    user, access_token, refresh_token = rotate_refresh_token(db, payload.refresh_token.strip())
+    user, access_token, refresh_token = rotate_v2_refresh_token(db, payload.refresh_token.strip())
 
     user.last_login_at = utcnow_naive()
     db.commit()
@@ -263,7 +278,7 @@ async def refresh(payload: AuthRefreshRequest, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/auth/logout")
+@router.post("/logout")
 async def logout(
     request: Request,
     payload: AuthLogoutRequest | None = None,
@@ -271,17 +286,17 @@ async def logout(
 ):
     if payload and payload.refresh_token:
         revoke_refresh_token(db, payload.refresh_token.strip())
-    revoke_user_session(db, request)
+    revoke_v2_user_session(db, request)
     db.commit()
     return {"message": "Logged out"}
 
 
-@router.get("/auth/me", response_model=AuthUserResponse)
-async def me(current_user: User = Depends(get_current_user)):
+@router.get("/me", response_model=AuthUserResponse)
+async def me(current_user: V2User = Depends(get_current_v2_user)):
     return _serialize_user(current_user)
 
 
-@router.post("/auth/device/start", response_model=AuthDeviceStartResponse)
+@router.post("/device/start", response_model=AuthDeviceStartResponse)
 async def start_device_authorization(
     payload: AuthDeviceStartRequest,
     request: Request,
@@ -325,11 +340,11 @@ async def start_device_authorization(
     )
 
 
-@router.get("/auth/device/requests/{user_code}", response_model=AuthDeviceRequestResponse)
+@router.get("/device/requests/{user_code}", response_model=AuthDeviceRequestResponse)
 async def get_device_authorization_request(
     user_code: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: V2User = Depends(get_current_v2_user),
 ):
     record = _find_device_authorization_by_user_code(db, user_code)
     if record is None:
@@ -339,18 +354,23 @@ async def get_device_authorization_request(
         _mark_device_authorization_expired(record)
         db.commit()
 
-    linked_user = db.query(User).filter(User.id == record.user_id).first() if record.user_id else None
+    linked_user = None
+    if record.user_uuid:
+        linked_user = db.query(V2User).filter(V2User.user_uuid == record.user_uuid).first()
+    if linked_user is None and record.user_id:
+        linked_user = db.query(V2User).filter(V2User.id == record.user_id).first()
+
     if linked_user is not None and linked_user.id != current_user.id and record.status in {"approved", "completed"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This device request has already been authorized")
 
     return _serialize_device_request(record, linked_user)
 
 
-@router.post("/auth/device/authorize", response_model=AuthDeviceActionResponse)
+@router.post("/device/authorize", response_model=AuthDeviceActionResponse)
 async def authorize_device_request(
     payload: AuthDeviceAuthorizeRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: V2User = Depends(get_current_v2_user),
 ):
     record = _find_device_authorization_by_user_code(db, payload.user_code)
     if record is None:
@@ -366,7 +386,7 @@ async def authorize_device_request(
     if record.status == "denied":
         return AuthDeviceActionResponse(message="Device authorization request already denied", status="denied")
     if record.status == "approved":
-        if record.user_id is not None and record.user_id != current_user.id:
+        if record.user_uuid and record.user_uuid != current_user.user_uuid:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This device request has already been authorized")
         return AuthDeviceActionResponse(message="Device authorization request already approved", status="approved")
 
@@ -375,6 +395,7 @@ async def authorize_device_request(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported device authorization decision")
 
     record.user_id = current_user.id
+    record.user_uuid = current_user.user_uuid
     if decision == "deny":
         record.status = "denied"
         record.denied_at = utcnow_naive()
@@ -387,7 +408,7 @@ async def authorize_device_request(
     return AuthDeviceActionResponse(message="Device authorization request approved", status="approved")
 
 
-@router.post("/auth/device/token", response_model=AuthDeviceTokenResponse)
+@router.post("/device/token", response_model=AuthDeviceTokenResponse)
 async def exchange_device_authorization_token(
     payload: AuthDeviceTokenRequest,
     request: Request,
@@ -411,26 +432,23 @@ async def exchange_device_authorization_token(
     if record.status == "pending":
         db.commit()
         return AuthDeviceTokenResponse(status="pending", poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
-
     if record.status == "denied":
         db.commit()
         return AuthDeviceTokenResponse(status="denied", poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
-
     if record.status == "completed":
         db.commit()
         return AuthDeviceTokenResponse(status="completed", poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
-
-    if record.status != "approved" or record.user_id is None:
+    if record.status != "approved":
         db.commit()
         return AuthDeviceTokenResponse(status=record.status, poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
 
-    user = db.query(User).filter(User.id == record.user_id).first()
+    user = get_v2_user_by_device_authorization(db, record)
     if user is None:
         record.status = "denied"
         db.commit()
         return AuthDeviceTokenResponse(status="denied", poll_interval=DEVICE_AUTH_INTERVAL_SECONDS)
 
-    access_token, refresh_token, _ = issue_noninteractive_login_artifacts(
+    access_token, refresh_token, _ = issue_noninteractive_v2_login_artifacts(
         db,
         user,
         request,

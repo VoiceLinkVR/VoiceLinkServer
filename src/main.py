@@ -487,8 +487,8 @@ async def request_logging_middleware(request: Request, call_next):
 
     try:
         token = await oauth2_scheme(request)
+        authenticated_user = None
         if db:
-            authenticated_user = None
             if is_v2_request:
                 authenticated_v2_user = resolve_authenticated_v2_user(
                     request,
@@ -528,10 +528,16 @@ async def request_logging_middleware(request: Request, call_next):
             request.method,
         )
 
-        default_context = rate_limiter.create_default_context(request)
-        if default_context:
-            default_context.check()
-            request.state.rate_limit_contexts.append(default_context)
+        should_apply_default_limit = (
+            authenticated_user is None
+            and request.method.upper() != "OPTIONS"
+            and request.url.path != "/v2/auth/me"
+        )
+        if should_apply_default_limit:
+            default_context = rate_limiter.create_default_context(request)
+            if default_context:
+                default_context.check()
+                request.state.rate_limit_contexts.append(default_context)
 
         response = await call_next(request)
         response_status_code = response.status_code

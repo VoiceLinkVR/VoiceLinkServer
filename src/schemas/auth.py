@@ -1,13 +1,20 @@
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from core.security_policy import validate_password_strength
 
 
 class AuthRegisterRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
-    password: str = Field(..., min_length=6, max_length=255)
+    password: str = Field(..., min_length=10, max_length=255)
     verification_token: str = Field(..., min_length=8, max_length=255)
     verification_code: str = Field(..., min_length=4, max_length=16)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        return validate_password_strength(value, context="password")
 
 
 class AuthRegisterCodeRequest(BaseModel):
@@ -54,7 +61,6 @@ class AuthUserResponse(BaseModel):
     username: str
     legacy_username: str = ""
     email: str = ""
-    display_name: str
     email_verified: bool = False
     is_admin: bool = False
     identity_version: int = 1
@@ -91,7 +97,6 @@ class AuthDeviceRequestResponse(BaseModel):
     expires_at: str
     username: str = ""
     user_uuid: str = ""
-    display_name: str = ""
 
 
 class AuthDeviceActionResponse(BaseModel):

@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
+
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
+from core.afdian_service import afdian_service
 from core.config import settings
-from core.dependencies import hash_password, utcnow_naive
-from core.identity import (
-    build_default_display_name,
-    generate_stable_user_uuid,
-    generate_user_uuid,
-    has_bound_email,
-    is_v2_identity_ready,
+from core.dependencies import hash_password, normalize_expiration_utc, utcnow_naive
+from core.entitlement_service import (
+    get_payment_order_snapshot,
+    rebuild_user_entitlement_state_from_legacy_fields,
+    set_payment_order_snapshot,
+    update_user_subscription_state,
 )
+from core.identity import generate_stable_user_uuid, generate_user_uuid, has_bound_email, is_v2_identity_ready
 from core.logging_config import logger
-from core.plan_catalog import build_limit_rule, get_default_test_plan, get_free_plan
+from core.plan_catalog import build_limit_rule, get_addons, get_default_test_plan, get_free_plan
 from db.base import Base, engine
 from db.models import (
     AccountToken,
@@ -22,7 +26,9 @@ from db.models import (
     RefreshToken,
     RequestLog,
     User,
+    UserAddonWallet,
     UserIdentityLink,
+    UserSubscriptionState,
     UserSession,
     V2RequestLog,
     V2User,
@@ -37,15 +43,44 @@ def _add_column_if_missing(db: Session, columns: list[str], column_name: str, dd
     logger.info("Added column %s", column_name)
 
 
-def _ensure_table_columns(db: Session) -> None:
-    inspector = inspect(engine)
+def _drop_column_if_present(db: Session, columns: list[str], table_name: str, column_name: str) -> None:
+    if column_name not in columns:
+        return
+    try:
+        db.execute(text(f"ALTER TABLE `{table_name}` DROP COLUMN `{column_name}`"))
+        columns.remove(column_name)
+        logger.info("Dropped legacy column %s.%s", table_name, column_name)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to drop legacy column %s.%s: %s", table_name, column_name, exc)
 
-    if "user" in inspector.get_table_names():
-        user_columns = [col["name"] for col in inspector.get_columns("user")]
+
+def _table_names(db: Session) -> list[str]:
+    inspector = inspect(engine)
+    try:
+        return inspector.get_table_names()
+    except Exception:
+        rows = db.execute(text("SHOW TABLES")).fetchall()
+        return [str(row[0]) for row in rows if row and row[0]]
+
+
+def _table_columns(db: Session, table_name: str) -> list[str]:
+    try:
+        rows = db.execute(text(f"SHOW COLUMNS FROM `{table_name}`")).fetchall()
+        return [str(row[0]) for row in rows if row and row[0]]
+    except Exception:
+        inspector = inspect(engine)
+        return [str(col["name"]) for col in inspector.get_columns(table_name)]
+
+
+def _ensure_table_columns(db: Session) -> None:
+    table_names = set(_table_names(db))
+
+    if "user" in table_names:
+        user_columns = _table_columns(db, "user")
+        _drop_column_if_present(db, user_columns, "user", "display_name")
         _add_column_if_missing(db, user_columns, "user_uuid", "ALTER TABLE user ADD COLUMN user_uuid VARCHAR(36)")
         _add_column_if_missing(db, user_columns, "email", "ALTER TABLE user ADD COLUMN email VARCHAR(255)")
         _add_column_if_missing(db, user_columns, "email_verified", "ALTER TABLE user ADD COLUMN email_verified BOOLEAN DEFAULT 0")
-        _add_column_if_missing(db, user_columns, "display_name", "ALTER TABLE user ADD COLUMN display_name VARCHAR(100)")
         _add_column_if_missing(db, user_columns, "is_default_test_user", "ALTER TABLE user ADD COLUMN is_default_test_user BOOLEAN DEFAULT 0")
         _add_column_if_missing(db, user_columns, "identity_version", "ALTER TABLE user ADD COLUMN identity_version INTEGER DEFAULT 1")
         _add_column_if_missing(db, user_columns, "expiration_date", "ALTER TABLE user ADD COLUMN expiration_date DATETIME")
@@ -58,14 +93,14 @@ def _ensure_table_columns(db: Session) -> None:
         _add_column_if_missing(db, user_columns, "addon_resource_total", "ALTER TABLE user ADD COLUMN addon_resource_total INTEGER DEFAULT 0")
         _add_column_if_missing(db, user_columns, "addon_expiration_date", "ALTER TABLE user ADD COLUMN addon_expiration_date DATETIME")
 
-    if "v2_user" in inspector.get_table_names():
-        v2_user_columns = [col["name"] for col in inspector.get_columns("v2_user")]
+    if "v2_user" in table_names:
+        v2_user_columns = _table_columns(db, "v2_user")
+        _drop_column_if_present(db, v2_user_columns, "v2_user", "display_name")
         _add_column_if_missing(db, v2_user_columns, "legacy_user_id", "ALTER TABLE v2_user ADD COLUMN legacy_user_id INTEGER")
         _add_column_if_missing(db, v2_user_columns, "username", "ALTER TABLE v2_user ADD COLUMN username VARCHAR(50)")
         _add_column_if_missing(db, v2_user_columns, "password", "ALTER TABLE v2_user ADD COLUMN password VARCHAR(255)")
         _add_column_if_missing(db, v2_user_columns, "email", "ALTER TABLE v2_user ADD COLUMN email VARCHAR(255)")
         _add_column_if_missing(db, v2_user_columns, "email_verified", "ALTER TABLE v2_user ADD COLUMN email_verified BOOLEAN DEFAULT 0")
-        _add_column_if_missing(db, v2_user_columns, "display_name", "ALTER TABLE v2_user ADD COLUMN display_name VARCHAR(100)")
         _add_column_if_missing(db, v2_user_columns, "identity_version", "ALTER TABLE v2_user ADD COLUMN identity_version INTEGER DEFAULT 2")
         _add_column_if_missing(db, v2_user_columns, "is_admin", "ALTER TABLE v2_user ADD COLUMN is_admin BOOLEAN DEFAULT 0")
         _add_column_if_missing(db, v2_user_columns, "limit_rule", "ALTER TABLE v2_user ADD COLUMN limit_rule VARCHAR(100)")
@@ -102,6 +137,18 @@ def _ensure_table_columns(db: Session) -> None:
         ("payment_order", "email", "ALTER TABLE payment_order ADD COLUMN email VARCHAR(255)"),
         ("payment_order", "plan_id", "ALTER TABLE payment_order ADD COLUMN plan_id VARCHAR(64)"),
         ("payment_order", "billing_version", "ALTER TABLE payment_order ADD COLUMN billing_version INTEGER DEFAULT 1"),
+        ("payment_order", "order_kind", "ALTER TABLE payment_order ADD COLUMN order_kind VARCHAR(32)"),
+        ("payment_order", "pricing_mode_snapshot", "ALTER TABLE payment_order ADD COLUMN pricing_mode_snapshot VARCHAR(32)"),
+        ("payment_order", "plan_ref", "ALTER TABLE payment_order ADD COLUMN plan_ref VARCHAR(100)"),
+        ("payment_order", "plan_price_snapshot", "ALTER TABLE payment_order ADD COLUMN plan_price_snapshot FLOAT"),
+        ("payment_order", "months_snapshot", "ALTER TABLE payment_order ADD COLUMN months_snapshot INTEGER"),
+        ("payment_order", "expected_amount_snapshot", "ALTER TABLE payment_order ADD COLUMN expected_amount_snapshot FLOAT"),
+        ("payment_order", "paid_amount_snapshot", "ALTER TABLE payment_order ADD COLUMN paid_amount_snapshot FLOAT"),
+        ("payment_order", "daily_quota_snapshot", "ALTER TABLE payment_order ADD COLUMN daily_quota_snapshot INTEGER"),
+        ("payment_order", "rate_limit_rule_snapshot", "ALTER TABLE payment_order ADD COLUMN rate_limit_rule_snapshot VARCHAR(255)"),
+        ("payment_order", "addon_resource_snapshot", "ALTER TABLE payment_order ADD COLUMN addon_resource_snapshot INTEGER"),
+        ("payment_order", "catalog_version_snapshot", "ALTER TABLE payment_order ADD COLUMN catalog_version_snapshot VARCHAR(64)"),
+        ("payment_order", "entitlement_snapshot_json", "ALTER TABLE payment_order ADD COLUMN entitlement_snapshot_json TEXT"),
         ("v2_request_log", "request_id", "ALTER TABLE v2_request_log ADD COLUMN request_id VARCHAR(64)"),
         ("v2_request_log", "username", "ALTER TABLE v2_request_log ADD COLUMN username VARCHAR(50)"),
         ("v2_request_log", "user_uuid", "ALTER TABLE v2_request_log ADD COLUMN user_uuid VARCHAR(36)"),
@@ -116,10 +163,11 @@ def _ensure_table_columns(db: Session) -> None:
         ("v2_request_log", "resource_deducted", "ALTER TABLE v2_request_log ADD COLUMN resource_deducted BOOLEAN DEFAULT 0"),
         ("v2_request_log", "quota_source", "ALTER TABLE v2_request_log ADD COLUMN quota_source VARCHAR(20) DEFAULT 'none'"),
         ("v2_request_log", "extra_payload", "ALTER TABLE v2_request_log ADD COLUMN extra_payload TEXT"),
+        ("announcement_entry", "show_in_overview", "ALTER TABLE announcement_entry ADD COLUMN show_in_overview BOOLEAN DEFAULT 0"),
     ]:
-        if table_name not in inspector.get_table_names():
+        if table_name not in table_names:
             continue
-        columns = [col["name"] for col in inspector.get_columns(table_name)]
+        columns = _table_columns(db, table_name)
         _add_column_if_missing(db, columns, column_name, ddl)
 
 
@@ -128,8 +176,6 @@ def _backfill_users(db: Session) -> None:
     for user in db.query(User).all():
         if not (user.user_uuid or "").strip():
             user.user_uuid = generate_stable_user_uuid(user.id, user.username)
-        if not (getattr(user, "display_name", None) or "").strip():
-            user.display_name = build_default_display_name(user_uuid=user.user_uuid, user_id=user.id)
         if bool(getattr(user, "is_default_test_user", False)):
             user.identity_version = 1
         elif has_bound_email(getattr(user, "email", None)) and int(getattr(user, "identity_version", 1) or 1) < 2:
@@ -137,7 +183,7 @@ def _backfill_users(db: Session) -> None:
         elif getattr(user, "identity_version", None) in (None, 0):
             user.identity_version = 2 if is_v2_identity_ready(email=user.email, identity_version=user.identity_version) else 1
         if user.limit_rule is None:
-            user.limit_rule = build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"])
+            user.limit_rule = build_limit_rule(free_plan.get("rate_limit"), free_plan["id"], free_plan["daily_quota"])
         if user.is_active is None:
             user.is_active = True
         if user.created_at is None:
@@ -182,10 +228,9 @@ def _backfill_v2_users(db: Session) -> None:
                 password=legacy_user.password,
                 email=legacy_user.email,
                 email_verified=bool(getattr(legacy_user, "email_verified", False)),
-                display_name=(getattr(legacy_user, "display_name", None) or "").strip() or build_default_display_name(user_uuid=user_uuid, user_id=legacy_user.id),
                 identity_version=2,
                 is_admin=bool(getattr(legacy_user, "is_admin", False)),
-                limit_rule=legacy_user.limit_rule or build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"]),
+                limit_rule=legacy_user.limit_rule or build_limit_rule(free_plan.get("rate_limit"), free_plan["id"], free_plan["daily_quota"]),
                 expiration_date=legacy_user.expiration_date,
                 is_active=True if legacy_user.is_active is None else bool(legacy_user.is_active),
                 boost_expiration_date=legacy_user.boost_expiration_date,
@@ -204,12 +249,10 @@ def _backfill_v2_users(db: Session) -> None:
         v2_user.legacy_user_id = v2_user.legacy_user_id or legacy_user.id
         v2_user.password = v2_user.password or legacy_user.password
         v2_user.email = v2_user.email or legacy_user.email
-        if not (v2_user.display_name or "").strip():
-            v2_user.display_name = (getattr(legacy_user, "display_name", None) or "").strip() or build_default_display_name(user_uuid=user_uuid, user_id=legacy_user.id)
         v2_user.email_verified = bool(v2_user.email_verified or getattr(legacy_user, "email_verified", False))
         v2_user.identity_version = 2
         if not v2_user.limit_rule:
-            v2_user.limit_rule = legacy_user.limit_rule or build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"])
+            v2_user.limit_rule = legacy_user.limit_rule or build_limit_rule(free_plan.get("rate_limit"), free_plan["id"], free_plan["daily_quota"])
         if v2_user.expiration_date is None or (legacy_user.expiration_date and legacy_user.expiration_date > v2_user.expiration_date):
             v2_user.expiration_date = legacy_user.expiration_date
         v2_user.is_active = True if v2_user.is_active is None else bool(v2_user.is_active)
@@ -312,57 +355,269 @@ def _backfill_related_tables(db: Session) -> None:
             record.quota_scope = "user"
 
 
+def _safe_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_legacy_custom_payload(order: PaymentOrder) -> dict:
+    if order.custom_id:
+        try:
+            parsed = afdian_service.parse_custom_id(order.custom_id)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    raw_payload = getattr(order, "raw_payload", None)
+    if not raw_payload:
+        return {}
+    try:
+        parsed = json.loads(raw_payload)
+    except Exception:
+        return {}
+
+    if isinstance(parsed, dict):
+        custom_payload = parsed.get("custom_payload")
+        if isinstance(custom_payload, dict):
+            merged = dict(parsed)
+            merged.update(custom_payload)
+            return merged
+        return parsed
+    return {}
+
+
+def _calculate_migrated_addon_resource_amount(amount: float | None) -> int:
+    addons = get_addons()
+    if not addons:
+        return 0
+    anchor = addons[0]
+    anchor_price = _safe_float(anchor.get("price")) or 0
+    anchor_resource = _safe_int(anchor.get("resource_amount")) or 0
+    if anchor_price <= 0 or anchor_resource <= 0 or amount is None or amount <= 0:
+        return 0
+    units = int(round(amount / anchor_price))
+    if units <= 0:
+        return 0
+    return units * anchor_resource
+
+
+def _extract_daily_limit_from_rule(limit_rule: str | None) -> int | None:
+    for part in (segment.strip() for segment in str(limit_rule or "").split(";") if segment.strip()):
+        lowered = part.lower()
+        if lowered.endswith("/day"):
+            value = part.split("/", 1)[0].strip()
+            return _safe_int(value)
+    return None
+
+
+def _latest_subscription_order_map(db: Session) -> dict[str, PaymentOrder]:
+    result: dict[str, PaymentOrder] = {}
+    orders = (
+        db.query(PaymentOrder)
+        .filter(PaymentOrder.status == "activated")
+        .order_by(PaymentOrder.activated_at.desc(), PaymentOrder.updated_at.desc(), PaymentOrder.id.desc())
+        .all()
+    )
+    for order in orders:
+        snapshot = get_payment_order_snapshot(order)
+        if str(snapshot.get("order_kind") or "").strip().lower() != "subscription":
+            continue
+        keys = []
+        if (order.user_uuid or "").strip():
+            keys.append(order.user_uuid.strip())
+        if (order.username or "").strip():
+            keys.append(order.username.strip())
+        for key in keys:
+            result.setdefault(key, order)
+    return result
+
+
+def _backfill_entitlement_state_tables(db: Session) -> None:
+    latest_orders = _latest_subscription_order_map(db)
+    for user in db.query(User).all():
+        rebuild_user_entitlement_state_from_legacy_fields(db, user)
+        expires_at_utc = normalize_expiration_utc(getattr(user, "expiration_date", None))
+        if expires_at_utc is not None and expires_at_utc <= datetime.now(timezone.utc):
+            continue
+        latest_order = latest_orders.get((user.user_uuid or "").strip()) or latest_orders.get((user.username or "").strip())
+        if latest_order is None:
+            continue
+        snapshot = get_payment_order_snapshot(latest_order)
+        plan_price = _safe_float(snapshot.get("plan_price"))
+        if plan_price is None or plan_price <= 0:
+            continue
+        daily_quota = _safe_int(snapshot.get("daily_quota"))
+        if daily_quota is None:
+            daily_quota = _extract_daily_limit_from_rule(getattr(user, "limit_rule", None)) or 0
+        update_user_subscription_state(
+            db,
+            user,
+            plan_price=plan_price,
+            expires_at=getattr(user, "expiration_date", None),
+            source_order_id=latest_order.id,
+            pricing_mode=str(snapshot.get("pricing_mode_snapshot") or "") or None,
+            status="active" if bool(getattr(user, "is_active", True)) else "inactive",
+            plan_ref=str(snapshot.get("plan_ref") or ""),
+            daily_quota=daily_quota,
+            rate_limit_rule=str(snapshot.get("rate_limit_rule") or ""),
+            catalog_version=str(snapshot.get("catalog_version") or ""),
+        )
+    for user in db.query(V2User).all():
+        rebuild_user_entitlement_state_from_legacy_fields(db, user)
+        expires_at_utc = normalize_expiration_utc(getattr(user, "expiration_date", None))
+        if expires_at_utc is not None and expires_at_utc <= datetime.now(timezone.utc):
+            continue
+        latest_order = latest_orders.get((user.user_uuid or "").strip()) or latest_orders.get((user.username or "").strip())
+        if latest_order is None:
+            continue
+        snapshot = get_payment_order_snapshot(latest_order)
+        plan_price = _safe_float(snapshot.get("plan_price"))
+        if plan_price is None or plan_price <= 0:
+            continue
+        daily_quota = _safe_int(snapshot.get("daily_quota"))
+        if daily_quota is None:
+            daily_quota = _extract_daily_limit_from_rule(getattr(user, "limit_rule", None)) or 0
+        update_user_subscription_state(
+            db,
+            user,
+            plan_price=plan_price,
+            expires_at=getattr(user, "expiration_date", None),
+            source_order_id=latest_order.id,
+            pricing_mode=str(snapshot.get("pricing_mode_snapshot") or "") or None,
+            status="active" if bool(getattr(user, "is_active", True)) else "inactive",
+            plan_ref=str(snapshot.get("plan_ref") or ""),
+            daily_quota=daily_quota,
+            rate_limit_rule=str(snapshot.get("rate_limit_rule") or ""),
+            catalog_version=str(snapshot.get("catalog_version") or ""),
+        )
+
+
+def _backfill_payment_order_snapshots(db: Session) -> None:
+    for order in db.query(PaymentOrder).all():
+        has_snapshot = getattr(order, "plan_price_snapshot", None) is not None and getattr(order, "order_kind", None)
+        needs_normalization = str(getattr(order, "plan_ref", "") or "").startswith("legacy-") or str(getattr(order, "pricing_mode_snapshot", "") or "").strip().lower() == "legacy_migrated"
+        if has_snapshot and not needs_normalization:
+            if getattr(order, "paid_amount_snapshot", None) is None and order.amount is not None:
+                order.paid_amount_snapshot = _safe_float(order.amount)
+            continue
+
+        custom_payload = _extract_legacy_custom_payload(order)
+        action = str(custom_payload.get("action") or order.action or "").strip().lower()
+        if not action:
+            continue
+
+        months = _safe_int(custom_payload.get("months")) or 1
+        raw_plan_price = custom_payload.get("plan_price")
+        if raw_plan_price is None:
+            raw_plan_price = custom_payload.get("target_monthly_price")
+        if raw_plan_price is None and order.amount is not None:
+            raw_plan_price = order.amount if action == "addon" else (float(order.amount) / max(1, months))
+        plan_price = _safe_float(raw_plan_price)
+        expected_amount = _safe_float(custom_payload.get("requested_amount"))
+        if expected_amount is None:
+            expected_amount = _safe_float(order.amount)
+        paid_amount = _safe_float(order.amount)
+        limit_rule = str(custom_payload.get("limit_rule") or "").strip() or None
+        daily_quota = _extract_daily_limit_from_rule(limit_rule)
+        rate_limit_rule = None
+        if limit_rule:
+            rate_limit_rule = ";".join(
+                [
+                    part
+                    for part in (segment.strip() for segment in limit_rule.split(";") if segment.strip())
+                    if not part.lower().startswith("plan_id=") and not part.lower().endswith("/day")
+                ]
+            )
+
+        addon_resource_amount = _safe_int(custom_payload.get("addon_resource_amount")) or 0
+        if action == "addon" and addon_resource_amount <= 0:
+            addon_resource_amount = _calculate_migrated_addon_resource_amount(plan_price)
+
+        try:
+            set_payment_order_snapshot(
+                order,
+                action=action,
+                plan_price=plan_price,
+                months=months,
+                expected_amount=expected_amount,
+                paid_amount=paid_amount,
+                addon_resource_amount=addon_resource_amount,
+                pricing_mode_snapshot=None,
+                daily_quota=daily_quota,
+                rate_limit_rule=rate_limit_rule,
+                catalog_version_snapshot=None,
+            )
+        except Exception:
+            logger.exception("Failed to backfill payment order snapshot. order_id=%s", order.id)
+
+
 def _ensure_default_test_user(db: Session) -> None:
     if not settings.DEFAULT_TEST_USER_ENABLED:
         return
 
     plan = get_default_test_plan()
+    generated_password = generate_user_uuid()
     user = db.query(User).filter(User.user_uuid == settings.DEFAULT_TEST_USER_UUID).first()
     if user is None and settings.DEFAULT_TEST_USER_USERNAME:
         user = db.query(User).filter(User.username == settings.DEFAULT_TEST_USER_USERNAME).first()
 
     if user is None:
-        password = settings.DEFAULT_TEST_USER_PASSWORD or generate_user_uuid()
         user = User(
             user_uuid=settings.DEFAULT_TEST_USER_UUID,
             username=settings.DEFAULT_TEST_USER_USERNAME,
-            password=hash_password(password),
+            password=hash_password(generated_password),
             email=settings.DEFAULT_TEST_USER_EMAIL,
             email_verified=False,
-            display_name=settings.DEFAULT_TEST_USER_DISPLAY_NAME,
             is_default_test_user=True,
             identity_version=1,
             is_active=bool(settings.DEFAULT_TEST_USER_ACTIVE),
-            limit_rule=build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, plan["id"], plan["daily_quota"]),
+            limit_rule=build_limit_rule(plan.get("rate_limit"), plan["id"], plan["daily_quota"]),
             created_at=utcnow_naive(),
         )
         db.add(user)
         db.flush()
-        logger.info("Created default test user %s", user.user_uuid)
+        logger.info("Created internal guest principal %s", user.user_uuid)
     else:
         user.user_uuid = settings.DEFAULT_TEST_USER_UUID
         user.username = settings.DEFAULT_TEST_USER_USERNAME or user.username
-        user.email = user.email or settings.DEFAULT_TEST_USER_EMAIL
-        user.display_name = user.display_name or settings.DEFAULT_TEST_USER_DISPLAY_NAME
+        user.password = hash_password(generated_password)
+        user.email = settings.DEFAULT_TEST_USER_EMAIL
+        user.email_verified = False
         user.is_default_test_user = True
         user.identity_version = 1
         user.is_active = bool(settings.DEFAULT_TEST_USER_ACTIVE)
-        user.limit_rule = build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, plan["id"], plan["daily_quota"])
+        user.limit_rule = build_limit_rule(plan.get("rate_limit"), plan["id"], plan["daily_quota"])
 
 
 def run_schema_upgrade() -> None:
     Base.metadata.create_all(bind=engine)
     db = Session(bind=engine)
     try:
-        legacy_user_count_before = db.query(User).count()
-        v2_user_count_before = db.query(V2User).count()
         _ensure_table_columns(db)
         db.flush()
+        legacy_user_count_before = db.query(User).count()
+        v2_user_count_before = db.query(V2User).count()
         _backfill_users(db)
         _backfill_v2_users(db)
         _ensure_upgraded_user_identity_links(db)
         _backfill_related_tables(db)
         _ensure_default_test_user(db)
+        _backfill_payment_order_snapshots(db)
+        _backfill_entitlement_state_tables(db)
         db.commit()
         legacy_user_count_after = db.query(User).count()
         v2_user_count_after = db.query(V2User).count()

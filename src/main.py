@@ -18,7 +18,9 @@ from core.logging_config import logger, reset_request_id, set_request_id
 from core.quota_service import commit_quota_allocation, is_new_quota_mode_enabled
 from core.rate_limiter import RateLimitExceeded, get_client_ip, rate_limiter
 from core.schema_upgrade import run_schema_upgrade
+from core.security_policy import normalize_cookie_samesite, validate_secret_strength
 from core.services import init_supported_languages, load_filter_config, update_filter_config
+from core.update_service import refresh_translation_capabilities_cache
 from core.v2_dependencies import fallback_expired_v2_user_to_free, resolve_authenticated_v2_user
 from db.base import SessionLocal, engine
 from db.models import RequestLog, User, V2RequestLog, V2User
@@ -147,9 +149,6 @@ def check_and_update_db():
             if "email_verified" not in user_columns:
                 db.execute(text("ALTER TABLE user ADD COLUMN email_verified BOOLEAN DEFAULT 0"))
                 logger.info("Added email_verified to user table")
-            if "display_name" not in user_columns:
-                db.execute(text("ALTER TABLE user ADD COLUMN display_name VARCHAR(100)"))
-                logger.info("Added display_name to user table")
             if "expiration_date" not in user_columns:
                 db.execute(text("ALTER TABLE user ADD COLUMN expiration_date DATETIME"))
                 logger.info("Added expiration_date to user table")
@@ -351,27 +350,48 @@ def _resolve_admin_access_ip(request: Request) -> str:
 
 def _is_admin_surface_path(path: str) -> bool:
     return (
-        path == "/manageapi"
-        or path.startswith("/manageapi/")
-        or path == "/v1/manageapi"
+        path == "/v1/manageapi"
         or path.startswith("/v1/manageapi/")
-        or path == "/adminapi"
-        or path.startswith("/adminapi/")
+        or path == "/v2/adminapi"
+        or path.startswith("/v2/adminapi/")
     )
+
+
+def _validate_runtime_security_settings() -> None:
+    settings.SESSION_COOKIE_SAME_SITE = normalize_cookie_samesite(settings.SESSION_COOKIE_SAME_SITE)
+    if int(settings.SESSION_COOKIE_MAX_AGE or 0) <= 0:
+        raise RuntimeError("SESSION_COOKIE_MAX_AGE must be greater than 0")
+    if int(settings.JWT_ACCESS_TOKEN_EXPIRES_MINUTES or 0) <= 0:
+        raise RuntimeError("JWT_ACCESS_TOKEN_EXPIRES_MINUTES must be greater than 0")
+    if int(settings.GUEST_SESSION_EXPIRES_MINUTES or 0) <= 0:
+        raise RuntimeError("GUEST_SESSION_EXPIRES_MINUTES must be greater than 0")
+
+    if not settings.SECURITY_ENFORCE_STRONG_SECRETS:
+        return
+
+    for field_name, value in (
+        ("JWT_SECRET_KEY", settings.JWT_SECRET_KEY),
+        ("SESSION_SECRET_KEY", settings.SESSION_SECRET_KEY),
+        ("AFDIAN_CUSTOM_ID_KEY", settings.AFDIAN_CUSTOM_ID_KEY),
+    ):
+        validate_secret_strength(value, field_name=field_name)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application startup")
+    _validate_runtime_security_settings()
     scheduler_lock_connection = None
     with _startup_db_init_lock():
         run_schema_upgrade()
     load_filter_config()
     init_supported_languages()
+    refresh_translation_capabilities_cache()
     run_scheduler, scheduler_lock_connection = _try_acquire_scheduler_lock()
     if run_scheduler:
         scheduler.add_job(check_user_expiration, "cron", hour=0, minute=0, second=0)
         scheduler.add_job(update_filter_config, "cron", day_of_week=0, hour=3, minute=0, second=0)
+        scheduler.add_job(refresh_translation_capabilities_cache, "cron", hour=4, minute=0, second=0)
         scheduler.start()
         logger.info("Background scheduler started")
     else:
@@ -384,7 +404,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="VoiceLinkVR Server", lifespan=lifespan)
-app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET_KEY)
 
 
 def _resolve_request_host(request: Request) -> str:
@@ -395,23 +414,7 @@ def _resolve_request_host(request: Request) -> str:
 
 
 def _rewrite_versioned_path(request: Request) -> None:
-    path = request.scope.get("path") or request.url.path
-    if path.startswith("/v1/") or path.startswith("/v2/") or path.startswith("/adminapi") or path.startswith("/status-probe"):
-        return
-
-    host = _resolve_request_host(request)
-    if host_matches(host, settings.api_v1_hosts):
-        if path == "/api" or path.startswith("/api/") or path == "/manageapi" or path.startswith("/manageapi/"):
-            request.scope["path"] = f"/v1{path}"
-            return
-
-    if host_matches(host, settings.api_v2_hosts):
-        if path == "/auth" or path.startswith("/auth/"):
-            request.scope["path"] = f"/v2{path}"
-            return
-        if path == "/api/account" or path.startswith("/api/account/") or path == "/api/billing" or path.startswith("/api/billing/"):
-            request.scope["path"] = f"/v2{path}"
-            return
+    return
 
 
 @app.middleware("http")
@@ -433,12 +436,10 @@ async def lan_only_admin_middleware(request: Request, call_next):
         if not _is_lan_client_ip(client_ip):
             logger.warning("[ADMIN-ACCESS] Denied non-LAN request. ip=%s path=%s", client_ip, request.url.path)
             if (
-                request.url.path == "/manageapi"
-                or request.url.path.startswith("/manageapi/")
-                or request.url.path == "/v1/manageapi"
+                request.url.path == "/v1/manageapi"
                 or request.url.path.startswith("/v1/manageapi/")
-                or request.url.path == "/adminapi"
-                or request.url.path.startswith("/adminapi/")
+                or request.url.path == "/v2/adminapi"
+                or request.url.path.startswith("/v2/adminapi/")
             ):
                 return JSONResponse(
                     status_code=403,
@@ -499,8 +500,7 @@ async def request_logging_middleware(request: Request, call_next):
                 )
                 if authenticated_v2_user is not None:
                     authenticated_user = authenticated_v2_user
-
-            if authenticated_user is None and not is_v2_request:
+            if authenticated_user is None:
                 authenticated_user = resolve_authenticated_user(
                     request,
                     db,
@@ -532,6 +532,7 @@ async def request_logging_middleware(request: Request, call_next):
             authenticated_user is None
             and request.method.upper() != "OPTIONS"
             and request.url.path != "/v2/auth/me"
+            and not _is_admin_surface_path(request.url.path)
         )
         if should_apply_default_limit:
             default_context = rate_limiter.create_default_context(request)
@@ -690,6 +691,15 @@ async def request_logging_middleware(request: Request, call_next):
     return response
 
 
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.SESSION_SECRET_KEY,
+    https_only=settings.SESSION_COOKIE_HTTPS_ONLY,
+    same_site=settings.SESSION_COOKIE_SAME_SITE,
+    max_age=settings.SESSION_COOKIE_MAX_AGE,
+)
+
+
 if settings.API_V1_ENABLED:
     app.include_router(api.router, prefix="/v1/api", tags=["V1 API"])
     app.include_router(user_center.router, prefix="/v1/api/user-center", tags=["V1 User Center"])
@@ -702,13 +712,7 @@ if settings.API_V2_ENABLED:
         app.include_router(portal_api.router, prefix="/v2/api", tags=["V2 Portal API"])
         app.include_router(api.router, prefix="/v2/api", tags=["V2 Compat API"])
 
-if settings.LEGACY_MODE:
-    app.include_router(api.router, prefix="/api", tags=["Legacy API"])
-    app.include_router(user_center.router, prefix="/api/user-center", tags=["Legacy User Center"])
-    app.include_router(manage_api.router, prefix="/manageapi", tags=["Legacy Management API"])
-    app.include_router(auth.router, prefix="/auth", tags=["Legacy Auth"])
-
-app.include_router(admin_api.router, prefix="/adminapi", tags=["Admin API"])
+app.include_router(admin_api.router, prefix="/v2/adminapi", tags=["V2 Admin API"])
 
 
 @app.get("/", include_in_schema=False)

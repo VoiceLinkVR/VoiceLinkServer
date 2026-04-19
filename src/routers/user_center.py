@@ -12,6 +12,14 @@ from sqlalchemy.orm import Session
 
 from core.afdian_service import afdian_service
 from core.config import settings
+from core.entitlement_service import (
+    credit_user_addon_wallet,
+    ensure_user_entitlement_state,
+    get_payment_order_snapshot,
+    reset_user_entitlements_to_free,
+    set_payment_order_snapshot,
+    update_user_subscription_state,
+)
 from core.plan_catalog import (
     SUBSCRIPTION_MODE_FIXED_TIERS,
     SUBSCRIPTION_MODE_LADDER,
@@ -34,7 +42,6 @@ from core.dependencies import (
     get_effective_user_limit_rule,
     is_user_expired,
 )
-from core.identity import build_default_display_name
 from core.logging_config import logger
 from db.base import SessionLocal
 from db.models import (
@@ -65,6 +72,8 @@ PRICE_EPSILON = 0.0001
 def _is_test_user(username: str) -> bool:
     configured = (settings.LIMIT_PUBLIC_TEST_USER or "").strip()
     if configured and username == configured:
+        return True
+    if username == (settings.DEFAULT_TEST_USER_USERNAME or "").strip():
         return True
     return username.lower() == "testuser"
 
@@ -452,6 +461,18 @@ def _extract_daily_limit(limit_rule: Optional[str]) -> Optional[int]:
     return None
 
 
+def _format_limit_rule_summary(limit_rule: Optional[str]) -> str:
+    if not limit_rule:
+        return ""
+
+    summary_parts: list[str] = []
+    for part in (segment.strip() for segment in str(limit_rule).split(";") if segment.strip()):
+        if part.startswith("plan_id="):
+            continue
+        summary_parts.append(part)
+    return " · ".join(summary_parts)
+
+
 def _normalize_action(raw_action: Optional[str]) -> str:
     action = (raw_action or "").strip().lower()
     normalized = ACTION_ALIASES.get(action)
@@ -463,22 +484,25 @@ def _normalize_action(raw_action: Optional[str]) -> str:
 def _get_user_price_and_limit_rule(user: Optional[User | V2User]) -> tuple[float, str]:
     if user is None:
         first_paid_tier = get_first_paid_tier()
-        rule = build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, first_paid_tier["id"], first_paid_tier["daily_quota"])
+        rule = build_limit_rule(first_paid_tier.get("rate_limit"), first_paid_tier["id"], first_paid_tier["daily_quota"])
         return round(float(first_paid_tier["monthly_price"]), 2), rule
 
     if isinstance(user, V2User):
         effective_rule = (getattr(user, "boost_limit_rule", None) or "").strip()
         boost_expiration = _normalize_naive_utc(getattr(user, "boost_expiration_date", None))
         if not effective_rule or boost_expiration is None or boost_expiration <= _utc_now_naive():
-            effective_rule = (getattr(user, "limit_rule", None) or "").strip() or settings.FREE_PLAN_LIMIT_RULE
+            effective_rule = (getattr(user, "limit_rule", None) or "").strip() or build_limit_rule(get_free_plan().get("rate_limit"), get_free_plan()["id"], get_free_plan()["daily_quota"])
     else:
         effective_rule = get_effective_user_limit_rule(user)
     plan = resolve_plan_from_rule(effective_rule, getattr(user, "expiration_date", None))
     price = round(float(plan["monthly_price"]), 2)
     return price, effective_rule
 
-def _is_first_purchase_like(user: Optional[User], is_expired: bool) -> bool:
-    return user is None or is_expired
+def _is_first_purchase_like(user: Optional[User | V2User], is_expired: bool) -> bool:
+    if user is None or is_expired:
+        return True
+    current_price, _ = _get_user_price_and_limit_rule(user)
+    return current_price <= PRICE_EPSILON
 
 def _get_subscription_pricing_mode() -> str:
     mode = get_subscription_mode()
@@ -607,11 +631,11 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
     if not is_registered:
         display_plan_name = "First purchase"
 
-    display_resource_summary = (
-        f"{display_resource_quota}/day"
-        if is_registered
-        else f"Free {display_resource_quota}/day"
-    )
+    limit_summary = _format_limit_rule_summary(effective_rule)
+    if is_registered:
+        display_resource_summary = limit_summary or f"{display_resource_quota}/day"
+    else:
+        display_resource_summary = f"Free · {limit_summary or f'{display_resource_quota}/day'}"
     anchor_reason = "unregistered" if not is_registered else ("expired" if is_expired else ("free" if is_free_plan else "current"))
 
     addon_option = {
@@ -748,11 +772,10 @@ def _build_new_afdian_user(username: str, password: str) -> User:
     return User(
         username=username,
         password=hash_password(password),
-        display_name=username or build_default_display_name(),
         is_admin=False,
         is_active=True,
         identity_version=1,
-        limit_rule=build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"]),
+        limit_rule=build_limit_rule(free_plan.get("rate_limit"), free_plan["id"], free_plan["daily_quota"]),
     )
 
 
@@ -1016,12 +1039,26 @@ async def activate_remote_afdian_order(
     username = user.username
     is_new_user = False
     _clear_expired_addon_balance(user)
+    db.flush()
+
+    order_snapshot = get_payment_order_snapshot(local_order)
+    snapshot_action = str(order_snapshot.get("action") or "").strip().lower()
+    if snapshot_action in {"renew", "upgrade", "addon"}:
+        action = snapshot_action
+    try:
+        snapshot_months = int(order_snapshot.get("months")) if order_snapshot.get("months") is not None else None
+    except (TypeError, ValueError):
+        snapshot_months = None
+    if snapshot_months is not None:
+        months = _normalize_months(snapshot_months)
 
     if amount is None:
         amount = _safe_parse_amount(getattr(local_order, "amount", None))
 
     addon_resource_amount = 0
-    plan_price_raw = custom_payload.get("plan_price")
+    plan_price_raw = order_snapshot.get("plan_price")
+    if plan_price_raw is None:
+        plan_price_raw = custom_payload.get("plan_price")
     if action == "addon":
         if plan_price_raw is None:
             plan_price_raw = amount
@@ -1039,12 +1076,12 @@ async def activate_remote_afdian_order(
                 {"custom_payload": custom_payload, "plan_price_raw": plan_price_raw},
             )
             raise
-        addon_resource_amount = _calculate_addon_resource_from_amount(plan_price)
+        addon_resource_amount = int(order_snapshot.get("addon_resource_amount") or 0) or _calculate_addon_resource_from_amount(plan_price)
     else:
         if plan_price_raw is None and amount is not None:
             plan_price_raw = round(amount / max(1, months), 2)
         if plan_price_raw is None:
-            base_rule = user.limit_rule if user is not None else settings.FREE_PLAN_LIMIT_RULE
+            base_rule = user.limit_rule if user is not None else build_limit_rule(get_free_plan().get("rate_limit"), get_free_plan()["id"], get_free_plan()["daily_quota"])
             plan_price_raw = _infer_plan_price_from_rule(base_rule)
         try:
             plan_price = _normalize_plan_price(float(plan_price_raw))
@@ -1064,7 +1101,9 @@ async def activate_remote_afdian_order(
     if amount is None:
         amount = round(plan_price if action == "addon" else plan_price * months, 2)
 
-    requested_amount_raw = custom_payload.get("requested_amount")
+    requested_amount_raw = order_snapshot.get("expected_amount")
+    if requested_amount_raw is None:
+        requested_amount_raw = custom_payload.get("requested_amount")
     requested_amount = _safe_parse_amount(requested_amount_raw)
     if requested_amount is None:
         requested_amount = round(plan_price if action == "addon" else plan_price * months, 2)
@@ -1089,6 +1128,8 @@ async def activate_remote_afdian_order(
     is_expired, _ = is_user_expired(user)
     first_purchase_like = _is_first_purchase_like(user, is_expired)
     converted_remaining_days: Optional[float] = None
+    new_expiration_date: Optional[datetime] = getattr(user, "expiration_date", None)
+    pricing_mode_to_apply = str(order_snapshot.get("pricing_mode_snapshot") or "").strip() or None
 
     if action == "renew":
         if not first_purchase_like and plan_price > current_price + PRICE_EPSILON:
@@ -1105,15 +1146,15 @@ async def activate_remote_afdian_order(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
         final_plan_price = plan_price if first_purchase_like else current_price
-        user.expiration_date = _extend_subscription_expiration(user.expiration_date, months)
-        user.limit_rule = _build_limit_rule_for_plan(
-            user.limit_rule or settings.FREE_PLAN_LIMIT_RULE,
-            final_plan_price,
+        new_expiration_date = _extend_subscription_expiration(user.expiration_date, months)
+        update_user_subscription_state(
+            db,
+            user,
+            plan_price=final_plan_price,
+            expires_at=new_expiration_date,
+            source_order_id=local_order.id,
+            pricing_mode=pricing_mode_to_apply,
         )
-        user.boost_expiration_date = None
-        user.boost_limit_rule = None
-        user.is_active = True
-        _sync_addon_expiration_with_subscription(user)
     elif action == "upgrade":
         if amount is None:
             detail = "订单金额解析失败，无法计算提升档位"
@@ -1153,15 +1194,15 @@ async def activate_remote_afdian_order(
         total_days_int = max(1, int(math.ceil(total_days)))
         converted_remaining_days = float(total_days_int)
 
-        user.expiration_date = now_utc + timedelta(days=total_days_int)
-        user.limit_rule = _build_limit_rule_for_plan(
-            user.limit_rule or settings.FREE_PLAN_LIMIT_RULE,
-            plan_price,
+        new_expiration_date = now_utc + timedelta(days=total_days_int)
+        update_user_subscription_state(
+            db,
+            user,
+            plan_price=plan_price,
+            expires_at=new_expiration_date,
+            source_order_id=local_order.id,
+            pricing_mode=pricing_mode_to_apply,
         )
-        user.boost_expiration_date = None
-        user.boost_limit_rule = None
-        user.is_active = True
-        _sync_addon_expiration_with_subscription(user)
     if action == "addon":
         if not _is_new_quota_purchase_enabled():
             detail = "资源包仅在新资源模式下可激活"
@@ -1200,10 +1241,13 @@ async def activate_remote_afdian_order(
             )
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
-        user.addon_resource_balance = int(user.addon_resource_balance or 0) + addon_resource_amount
-        user.addon_resource_total = int(user.addon_resource_total or 0) + addon_resource_amount
-        user.addon_expiration_date = user.expiration_date
-        user.is_active = True
+        credit_user_addon_wallet(
+            db,
+            user,
+            addon_resource_amount=addon_resource_amount,
+            expires_at=getattr(user, "expiration_date", None),
+            source_order_id=local_order.id,
+        )
 
     local_order.order_no = order_no
     local_order.out_trade_no = out_trade_no
@@ -1212,11 +1256,18 @@ async def activate_remote_afdian_order(
     local_order.username = username
     local_order.user_uuid = user.user_uuid
     local_order.email = user.email
-    local_order.plan_id = f"{action}:{plan_price:.2f}:{months}"
-    local_order.billing_version = 2
-    local_order.action = action
     local_order.amount = amount
     local_order.status = "activated"
+    set_payment_order_snapshot(
+        local_order,
+        action=action,
+        plan_price=plan_price,
+        months=months,
+        expected_amount=requested_amount,
+        paid_amount=amount,
+        addon_resource_amount=addon_resource_amount,
+        pricing_mode_snapshot=pricing_mode_to_apply,
+    )
     _set_order_activation_source(local_order, source)
     _clear_order_activation_failure(local_order)
     local_order.activated_at = _utc_now_naive()
@@ -1261,7 +1312,7 @@ async def activate_remote_afdian_order(
         "addon_resource_amount": addon_resource_amount,
         "addon_resource_balance": int(getattr(user, "addon_resource_balance", 0) or 0),
         "addon_expiration_utc": _to_utc_iso(getattr(user, "addon_expiration_date", None)),
-        "new_expiration_utc": _to_utc_iso(user.expiration_date),
+        "new_expiration_utc": _to_utc_iso(new_expiration_date),
         "boost_expiration_utc": _to_utc_iso(getattr(user, "boost_expiration_date", None)),
     }
 
@@ -1505,7 +1556,7 @@ async def activate_order(
         if plan_price_raw is None and amount is not None:
             plan_price_raw = round(amount / max(1, months), 2)
         if plan_price_raw is None:
-            base_rule = user.limit_rule if user is not None else settings.FREE_PLAN_LIMIT_RULE
+            base_rule = user.limit_rule if user is not None else build_limit_rule(get_free_plan().get("rate_limit"), get_free_plan()["id"], get_free_plan()["daily_quota"])
             plan_price_raw = _infer_plan_price_from_rule(base_rule)
         plan_price = _normalize_plan_price(float(plan_price_raw))
 
@@ -1536,7 +1587,7 @@ async def activate_order(
         final_plan_price = plan_price if first_purchase_like else current_price
         extend_days = int(settings.AFDIAN_RENEW_DAYS) * months
         user.expiration_date = _extend_date(user.expiration_date, extend_days)
-        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.FREE_PLAN_LIMIT_RULE, final_plan_price)
+        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or build_limit_rule(get_free_plan().get("rate_limit"), get_free_plan()["id"], get_free_plan()["daily_quota"]), final_plan_price)
         user.boost_expiration_date = None
         user.boost_limit_rule = None
         user.is_active = True
@@ -1569,7 +1620,7 @@ async def activate_order(
         converted_remaining_days = float(total_days_int)
 
         user.expiration_date = now_utc + timedelta(days=total_days_int)
-        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or settings.FREE_PLAN_LIMIT_RULE, plan_price)
+        user.limit_rule = _build_limit_rule_for_plan(user.limit_rule or build_limit_rule(get_free_plan().get("rate_limit"), get_free_plan()["id"], get_free_plan()["daily_quota"]), plan_price)
         user.boost_expiration_date = None
         user.boost_limit_rule = None
         user.is_active = True

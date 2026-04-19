@@ -11,10 +11,9 @@ from pydantic import BaseModel
 from typing import Optional
 
 from core.dependencies import (
-    build_access_token_payload,
     get_db,
-    create_access_token,
     fallback_expired_user_to_free,
+    issue_noninteractive_login_artifacts,
     verify_password,
     get_current_user_for_status,
     get_effective_user_limit_rule,
@@ -26,8 +25,9 @@ from core.quota_service import (
     build_quota_snapshot,
     is_new_quota_mode_enabled,
 )
-from core.rate_limiter import enforce_user_rate_limit, set_user_context_cost
+from core.rate_limiter import enforce_auth_attempt_rate_limit, enforce_user_rate_limit, set_user_context_cost
 from core.config import settings
+from core.identity import has_bound_email
 from db.models import User, RequestLog
 from core.services import (
     errorFilter, do_translate,
@@ -46,6 +46,17 @@ from schemas.user import UserLogin
 router = APIRouter()
 DAY_LIMIT_RULE_PATTERN = re.compile(r"^\s*(\d+)\s*/\s*day\s*$", re.IGNORECASE)
 DEFAULT_USAGE_DAYS = 7
+USAGE_EXCLUDED_PREFIXES = (
+    "/auth",
+    "/v2/auth",
+    "/api/account",
+    "/v2/api/account",
+    "/api/billing",
+    "/v2/api/billing",
+    "/api/content",
+    "/v2/api/content",
+    "/v2/adminapi",
+)
 
 
 def _extract_daily_limit(limit_rule: str) -> Optional[int]:
@@ -58,9 +69,17 @@ def _extract_daily_limit(limit_rule: str) -> Optional[int]:
     return None
 
 
+def _append_usage_excluded_filters(filters: list):
+    for prefix in USAGE_EXCLUDED_PREFIXES:
+        filters.append(RequestLog.endpoint.notlike(f"{prefix}%"))
+    return filters
+
+
 def _is_test_user(username: str) -> bool:
     configured = (settings.LIMIT_PUBLIC_TEST_USER or "").strip()
     if configured and username == configured:
+        return True
+    if username == (settings.DEFAULT_TEST_USER_USERNAME or "").strip():
         return True
     return username.lower() == "testuser"
 
@@ -154,40 +173,50 @@ def _addon_resource_cost_case():
 
 
 @router.post("/login")
-# 将函数签名修改为接收 UserLogin 模型作为请求体
-async def login(db: Session = Depends(get_db), user_credentials: UserLogin = Body(...)):
-    # 从 Pydantic 模型中获取数据
-    logger.info(f"[LOGIN] 尝试登录用户: {user_credentials.username}")
+async def login(
+    request: Request,
+    db: Session = Depends(get_db),
+    user_credentials: UserLogin = Body(...),
+):
+    if not settings.API_V1_LEGACY_LOGIN_ENABLED:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+    enforce_auth_attempt_rate_limit(
+        request,
+        scope_prefix="legacy_login",
+        ip_limit=settings.LEGACY_LOGIN_IP_LIMIT,
+        identity=user_credentials.username,
+        identity_limit=settings.LEGACY_LOGIN_IDENTITY_LIMIT,
+    )
+    logger.info("[LOGIN] Attempting legacy login for user=%s", user_credentials.username)
 
     user = db.query(User).filter(User.username == user_credentials.username).first()
 
     if not user:
-        logger.warning(f"[LOGIN] 用户不存在: {user_credentials.username}")
+        logger.warning("[LOGIN] Legacy user not found: %s", user_credentials.username)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-    logger.info(f"[LOGIN] 找到用户: {user.username}, is_active: {user.is_active}, is_admin: {user.is_admin}")
-    logger.info(f"[LOGIN] 数据库存储的密码哈希: {user.password[:20]}...")  # 只显示前20个字符用于调试
+    logger.info("[LOGIN] Found legacy user=%s active=%s admin=%s", user.username, user.is_active, user.is_admin)
 
     if not verify_password(user_credentials.password, user.password):
-        logger.warning(f"[LOGIN] 密码验证失败 for user: {user_credentials.username}")
+        logger.warning("[LOGIN] Legacy password verification failed for user=%s", user_credentials.username)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     if not user.is_active:
-        logger.warning(f"[LOGIN] 用户被禁用: {user_credentials.username}")
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户已被禁用")
-
-    downgraded_to_free, expiration_utc = fallback_expired_user_to_free(db, user)
-    if False and downgraded_to_free:
+        logger.warning("[LOGIN] Legacy user disabled: %s", user_credentials.username)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
+    if bool(getattr(user, "is_default_test_user", False)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Guest trial must use the guest auth endpoint")
+    if bool(getattr(user, "is_admin", False)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin accounts must use /v2/adminapi/auth/login")
+    if has_bound_email(getattr(user, "email", None)) or int(getattr(user, "identity_version", 1) or 1) >= 2:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "account_expired",
-                "message": "用户已过期",
-                "expiration_utc": expiration_utc.isoformat().replace("+00:00", "Z") if expiration_utc else None,
-            },
+            detail="Legacy login is only available for accounts that have not completed migration",
         )
 
-    logger.info(f"[LOGIN] 用户登录成功: {user_credentials.username}")
+    downgraded_to_free, expiration_utc = fallback_expired_user_to_free(db, user)
+    logger.info("[LOGIN] Legacy login succeeded for user=%s", user_credentials.username)
     if downgraded_to_free:
         logger.info(
             "[LOGIN] Expired account downgraded to free plan during legacy login: %s, expired_at=%s",
@@ -196,10 +225,8 @@ async def login(db: Session = Depends(get_db), user_credentials: UserLogin = Bod
         )
 
     user.last_login_at = utcnow_naive()
+    access_token, _, _ = issue_noninteractive_login_artifacts(db, user, request, session_type="legacy")
     db.commit()
-    access_token = create_access_token(
-        data=build_access_token_payload(user, session_type="legacy", token_type="access")
-    )
     return {"message": "Login successful", "access_token": access_token}
 
 @router.get("/latestVersionInfo")
@@ -267,7 +294,6 @@ async def account_status(
     return {
         "username": current_user.username,
         "user_uuid": (current_user.user_uuid or "").strip(),
-        "display_name": (getattr(current_user, "display_name", None) or current_user.username or "").strip(),
         "is_active": bool(current_user.is_active),
         "is_expired": is_expired,
         "expiration_utc": expiration_utc,
@@ -328,6 +354,14 @@ async def account_usage(
     range_start = datetime.combine(query_start_date, datetime.min.time())
     range_end_exclusive = datetime.combine(query_end_date + timedelta(days=1), datetime.min.time())
 
+    range_filters = _append_usage_excluded_filters(
+        [
+            RequestLog.username == current_user.username,
+            RequestLog.timestamp >= range_start,
+            RequestLog.timestamp < range_end_exclusive,
+        ]
+    )
+
     usage_row = (
         db.query(
             func.sum(case((RequestLog.status == "success", 1), else_=0)).label("success_count"),
@@ -339,11 +373,7 @@ async def account_usage(
             func.sum(case((RequestLog.resource_deducted == True, 1), else_=0)).label("deducted_request_count"),  # noqa: E712
             func.count().label("total_count"),
         )
-        .filter(
-            RequestLog.username == current_user.username,
-            RequestLog.timestamp >= range_start,
-            RequestLog.timestamp < range_end_exclusive,
-        )
+        .filter(*range_filters)
         .first()
     )
 
@@ -355,6 +385,26 @@ async def account_usage(
     addon_resource_cost_sum = int((usage_row.addon_resource_cost_sum if usage_row and usage_row.addon_resource_cost_sum is not None else 0) or 0)
     deducted_request_count = int((usage_row.deducted_request_count if usage_row and usage_row.deducted_request_count is not None else 0) or 0)
     total_count = int((usage_row.total_count if usage_row and usage_row.total_count is not None else 0) or 0)
+
+    today_range_start = datetime.combine(today_utc, datetime.min.time())
+    today_range_end_exclusive = datetime.combine(today_utc + timedelta(days=1), datetime.min.time())
+    today_filters = _append_usage_excluded_filters(
+        [
+            RequestLog.username == current_user.username,
+            RequestLog.timestamp >= today_range_start,
+            RequestLog.timestamp < today_range_end_exclusive,
+        ]
+    )
+    today_usage_row = (
+        db.query(
+            func.sum(case((RequestLog.status == "success", 1), else_=0)).label("success_count"),
+            func.count().label("total_count"),
+        )
+        .filter(*today_filters)
+        .first()
+    )
+    today_success_count = int((today_usage_row.success_count if today_usage_row and today_usage_row.success_count is not None else 0) or 0)
+    today_total_count = int((today_usage_row.total_count if today_usage_row and today_usage_row.total_count is not None else 0) or 0)
 
     limit_rule = get_effective_user_limit_rule(current_user) or ""
     daily_limit = _extract_daily_limit(limit_rule)
@@ -373,11 +423,7 @@ async def account_usage(
             func.sum(case((RequestLog.resource_deducted == True, 1), else_=0)).label("daily_deducted_request_count"),  # noqa: E712
             func.count().label("daily_total_count"),
         )
-        .filter(
-            RequestLog.username == current_user.username,
-            RequestLog.timestamp >= range_start,
-            RequestLog.timestamp < range_end_exclusive,
-        )
+        .filter(*range_filters)
         .group_by(date_expr)
         .order_by(date_expr.asc())
         .all()
@@ -454,7 +500,6 @@ async def account_usage(
     return {
         "username": current_user.username,
         "user_uuid": (current_user.user_uuid or "").strip(),
-        "display_name": (getattr(current_user, "display_name", None) or current_user.username or "").strip(),
         "is_test_user": bool(getattr(current_user, "is_default_test_user", False)),
         "is_active": bool(current_user.is_active),
         "is_expired": is_expired,
@@ -473,6 +518,8 @@ async def account_usage(
         "daily_failed_count": failed_count,
         "daily_rate_limited_count": rate_limited_count,
         "daily_total_count": total_count,
+        "today_success_count": today_success_count,
+        "today_total_count": today_total_count,
         "today_daily_resource_used": quota_snapshot.today_daily_used,
         "today_remaining_daily": quota_snapshot.remaining_daily,
         "addon_resource_balance": quota_snapshot.addon_resource_balance,

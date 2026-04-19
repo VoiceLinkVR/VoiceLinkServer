@@ -26,6 +26,7 @@ from core.config import (
 from core.identity import normalize_host, parse_csv_hosts
 from core.logging_config import logger
 from core.plan_catalog import load_plan_catalog, normalize_catalog, save_plan_catalog
+from core.security_policy import normalize_cookie_samesite, validate_secret_strength
 from db.models import SiteConfig, SiteConfigAuditLog, User
 
 
@@ -168,6 +169,10 @@ SECRET_KEYS = {
 RESTART_REQUIRED_KEYS = {
     "JWT_SECRET_KEY",
     "SESSION_SECRET_KEY",
+    "SESSION_COOKIE_HTTPS_ONLY",
+    "SESSION_COOKIE_SAME_SITE",
+    "SESSION_COOKIE_MAX_AGE",
+    "SECURITY_ENFORCE_STRONG_SECRETS",
     "SQL_PATH",
     "SQL_POOL_SIZE",
     "SQL_MAX_OVERFLOW",
@@ -180,7 +185,6 @@ RESTART_REQUIRED_KEYS = {
     "PLAN_CATALOG_PATH",
     "PORTAL_SESSION_KEY",
     "PORTAL_SESSION_USER_KEY",
-    "LEGACY_MODE",
     "API_V1_ENABLED",
     "API_V2_ENABLED",
     "API_V2_AUTH_ENABLED",
@@ -221,6 +225,7 @@ POSITIVE_INT_KEYS = {
     "JWT_ACCESS_TOKEN_EXPIRES_MINUTES",
     "REFRESH_TOKEN_EXPIRES_DAYS",
     "PORTAL_SESSION_EXPIRES_DAYS",
+    "SESSION_COOKIE_MAX_AGE",
     "SQL_POOL_SIZE",
     "SQL_MAX_OVERFLOW",
     "SQL_POOL_RECYCLE",
@@ -233,6 +238,7 @@ POSITIVE_INT_KEYS = {
     "AFDIAN_CUSTOM_ID_TTL_SECONDS",
     "DEFAULT_TEST_USER_IP_DAILY_QUOTA",
     "DEFAULT_TEST_USER_RESOURCE_QUOTA",
+    "GUEST_SESSION_EXPIRES_MINUTES",
     "TEXT_COMPRESSION_MIN_REPEAT",
     "GEMMA_TRANSLATE_MAX_TOKENS",
 }
@@ -255,7 +261,7 @@ SAFE_SIMPLE_TEXT_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX
 def _infer_group(key: str) -> str:
     if key.startswith(("WHISPER_", "SENSEVOICE_")):
         return "speech"
-    if key.startswith(("JWT_", "SESSION_")):
+    if key.startswith(("JWT_", "SESSION_", "AUTH_LOGIN_", "LEGACY_LOGIN_", "ADMIN_LOGIN_")):
         return "security"
     if key in {"PORTAL_PUBLIC_BASE_URL", "PORTAL_SESSION_KEY", "PORTAL_SESSION_USER_KEY"}:
         return "portal_email"
@@ -275,7 +281,7 @@ def _infer_group(key: str) -> str:
         return "billing"
     if key.startswith(("API_", "LEGACY_")):
         return "routing"
-    if key.startswith("DEFAULT_TEST_"):
+    if key.startswith(("DEFAULT_TEST_", "GUEST_")):
         return "test_user"
     if key.startswith("TTS_"):
         return "tts"
@@ -539,6 +545,8 @@ def _validate_token_string(value: str, key: str) -> str:
 def _post_validate_value(spec: ConfigSpec, value: Any) -> Any:
     if isinstance(value, str):
         value = _validate_common_string(value, spec.key)
+        if spec.key in {"JWT_SECRET_KEY", "SESSION_SECRET_KEY", "AFDIAN_CUSTOM_ID_KEY"}:
+            return validate_secret_strength(value, field_name=spec.key)
         if spec.key in HOST_KEYS:
             return _validate_host(value, spec.key)
         if spec.key in HOST_PORT_KEYS:
@@ -560,8 +568,17 @@ def _post_validate_value(spec: ConfigSpec, value: Any) -> Any:
             "AFDIAN_DEFAULT_LIMIT_RULE",
             "AFDIAN_BOOST_LIMIT_RULE",
             "DEFAULT_TEST_USER_IP_RATE_LIMIT",
+            "AUTH_LOGIN_IP_LIMIT",
+            "AUTH_LOGIN_IDENTITY_LIMIT",
+            "LEGACY_LOGIN_IP_LIMIT",
+            "LEGACY_LOGIN_IDENTITY_LIMIT",
+            "ADMIN_LOGIN_IP_LIMIT",
+            "ADMIN_LOGIN_IDENTITY_LIMIT",
+            "GUEST_LOGIN_IP_LIMIT",
         }:
             return _validate_limit_rule(value, spec.key)
+        if spec.key == "SESSION_COOKIE_SAME_SITE":
+            return normalize_cookie_samesite(value)
         if spec.key == "TRANSLATOR_SERVICES_LIST":
             return _validate_services_list(value, spec.key)
         if spec.key == "LOG_LEVEL":

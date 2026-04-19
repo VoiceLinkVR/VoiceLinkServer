@@ -4,6 +4,8 @@ from pydantic import BaseModel
 from typing import Dict
 
 from core.dependencies import get_db, get_current_user, get_current_admin_user, hash_password
+from core.entitlement_service import rebuild_user_entitlement_state_from_legacy_fields
+from core.security_policy import validate_password_strength
 from db.models import User
 from schemas.user import UserCreate, UserUpdate
 
@@ -31,9 +33,12 @@ async def register_admin(creds: UserCredentials, db: Session = Depends(get_db)):
     if db.query(User).filter_by(username=creds.username).first():
         raise HTTPException(status_code=400, detail="Username already exists")
 
+    validate_password_strength(creds.password, context="password")
     hashed_password = hash_password(creds.password)
     new_admin = User(username=creds.username, password=hashed_password, is_admin=True, is_active=True)
     db.add(new_admin)
+    db.flush()
+    rebuild_user_entitlement_state_from_legacy_fields(db, new_admin)
     db.commit()
     return {"message": "AdminUser created successfully"}
 
@@ -43,6 +48,7 @@ async def change_password(creds: UserCredentials, admin: User = Depends(get_curr
     if not user_to_change:
         raise HTTPException(status_code=404, detail="User not found")
 
+    validate_password_strength(creds.password, context="password")
     user_to_change.password = hash_password(creds.password)
     db.commit()
     return {"message": f"user:{creds.username}, Password changed successfully"}
@@ -52,9 +58,12 @@ async def register(creds: UserCredentials, admin: User = Depends(get_current_adm
     if db.query(User).filter_by(username=creds.username).first():
         raise HTTPException(status_code=400, detail="Username already exists")
 
+    validate_password_strength(creds.password, context="password")
     hashed_password = hash_password(creds.password)
     new_user = User(username=creds.username, password=hashed_password, is_admin=False, is_active=True)
     db.add(new_user)
+    db.flush()
+    rebuild_user_entitlement_state_from_legacy_fields(db, new_user)
     db.commit()
     return {"message": "User created successfully"}
 
@@ -76,6 +85,8 @@ async def add_user(user_data: UserCreate, admin: User = Depends(get_current_admi
         expiration_date=user_data.expiration_date
     )
     db.add(new_user)
+    db.flush()
+    rebuild_user_entitlement_state_from_legacy_fields(db, new_user)
     db.commit()
     return {"message": "User created successfully", "user": {"username": user_data.username}}
 
@@ -102,6 +113,7 @@ async def update_user(user_data: UserUpdate, admin: User = Depends(get_current_a
     if user_data.expiration_date is not None:
         user_to_update.expiration_date = user_data.expiration_date
 
+    rebuild_user_entitlement_state_from_legacy_fields(db, user_to_update)
     db.commit()
     return {"message": f"user:{user_data.username}, updated successfully"}
 

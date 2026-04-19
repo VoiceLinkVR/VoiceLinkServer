@@ -24,14 +24,6 @@ def is_v2_identity_ready(*, email: str | None, identity_version: int | None) -> 
     return has_bound_email(email) or int(identity_version or 1) >= 2
 
 
-def build_default_display_name(*, user_uuid: str | None = None, user_id: int | str | None = None) -> str:
-    if user_uuid:
-        return f"用户 {short_user_uuid(user_uuid)}"
-    if user_id is not None:
-        return f"用户 {user_id}"
-    return "VoiceLinkVR User"
-
-
 def short_user_uuid(user_uuid: str | None) -> str:
     normalized = (user_uuid or "").strip()
     if not normalized:

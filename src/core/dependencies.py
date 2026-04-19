@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from core.config import settings
+from core.entitlement_service import reset_user_entitlements_to_free
 from core.plan_catalog import build_limit_rule, get_free_plan
 from db.base import SessionLocal
 from db.models import RefreshToken, User, UserSession
@@ -67,21 +68,18 @@ def fallback_expired_user_to_free(db: Session, user: User) -> tuple[bool, Option
     if not expired:
         return False, expires_at_utc
 
-    free_plan = get_free_plan()
-    user.limit_rule = build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"])
-    user.expiration_date = None
-    user.boost_limit_rule = None
-    user.boost_expiration_date = None
-    user.addon_resource_balance = 0
-    user.addon_resource_total = 0
-    user.addon_expiration_date = None
-    user.is_active = True
+    reset_user_entitlements_to_free(db, user)
     db.flush()
     return True, expires_at_utc
 
 
 def get_effective_user_limit_rule(user: User) -> str:
-    default_rule = (settings.FREE_PLAN_LIMIT_RULE or "").strip() or "800/day;8/minute"
+    free_plan = get_free_plan()
+    default_rule = build_limit_rule(
+        free_plan.get("rate_limit"),
+        str(free_plan["id"]),
+        int(free_plan["daily_quota"]),
+    )
     now_utc = datetime.now(timezone.utc)
     boost_expiration = normalize_expiration_utc(getattr(user, "boost_expiration_date", None))
     boost_rule = (getattr(user, "boost_limit_rule", None) or "").strip()
@@ -170,8 +168,9 @@ def create_user_session(
     request: Request,
     *,
     session_type: str = "portal",
+    expires_delta: Optional[timedelta] = None,
 ) -> UserSession:
-    expires_at = utcnow_naive() + timedelta(days=settings.PORTAL_SESSION_EXPIRES_DAYS)
+    expires_at = utcnow_naive() + (expires_delta or timedelta(days=settings.PORTAL_SESSION_EXPIRES_DAYS))
     record = UserSession(
         session_id=secrets.token_urlsafe(48),
         user_id=user.id,
@@ -232,6 +231,49 @@ def get_active_portal_session(
     if expires_at is None or expires_at <= datetime.now(timezone.utc):
         record.revoked_at = utcnow_naive()
         clear_portal_session(request)
+        return None
+
+    if touch:
+        record.last_seen_at = utcnow_naive()
+    return record
+
+
+def get_active_user_session_by_id(
+    db: Session,
+    session_id: Optional[str],
+    *,
+    user_id: Optional[int] = None,
+    user_uuid: Optional[str] = None,
+    session_type: Optional[str] = None,
+    touch: bool = False,
+) -> Optional[UserSession]:
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        return None
+
+    record = (
+        db.query(UserSession)
+        .filter(
+            UserSession.session_id == normalized_session_id,
+            UserSession.revoked_at.is_(None),
+        )
+        .first()
+    )
+    if record is None:
+        return None
+
+    expires_at = normalize_expiration_utc(record.expires_at)
+    if expires_at is None or expires_at <= datetime.now(timezone.utc):
+        record.revoked_at = utcnow_naive()
+        return None
+
+    if user_id is not None and int(record.user_id) != int(user_id):
+        return None
+    normalized_user_uuid = str(user_uuid or "").strip()
+    if normalized_user_uuid and (record.user_uuid or "").strip() not in {"", normalized_user_uuid}:
+        return None
+    normalized_session_type = str(session_type or "").strip()
+    if normalized_session_type and (record.session_type or "").strip() != normalized_session_type:
         return None
 
     if touch:
@@ -347,14 +389,17 @@ def issue_noninteractive_login_artifacts(
     request: Request,
     *,
     session_type: str = "device",
+    expires_delta: Optional[timedelta] = None,
+    access_token_expires_delta: Optional[timedelta] = None,
 ) -> tuple[str, str, UserSession]:
-    session_record = create_user_session(db, user, request, session_type=session_type)
+    session_record = create_user_session(db, user, request, session_type=session_type, expires_delta=expires_delta)
     access_token = create_access_token(
         build_access_token_payload(
             user,
             session_id=session_record.session_id,
             session_type=session_type,
-        )
+        ),
+        expires_delta=access_token_expires_delta,
     )
     refresh_token, _ = create_refresh_token(db, user, session_id=session_record.session_id)
     return access_token, refresh_token, session_record
@@ -374,6 +419,15 @@ def rotate_refresh_token(
     if user is None:
         user = db.query(User).filter(User.id == record.user_id).first()
     if user is None:
+        record.revoked_at = utcnow_naive()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+
+    if record.session_id and get_active_user_session_by_id(
+        db,
+        record.session_id,
+        user_id=record.user_id,
+        user_uuid=record.user_uuid,
+    ) is None:
         record.revoked_at = utcnow_naive()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
@@ -402,8 +456,41 @@ def decode_access_token(token: str) -> Optional[dict[str, Any]]:
     return payload
 
 
-def _get_user_from_access_token(token: str, db: Session) -> Optional[User]:
+def validate_access_token_payload(token: str, db: Session) -> Optional[dict[str, Any]]:
     payload = decode_access_token(token)
+    if payload is None:
+        return None
+
+    token_type = str(payload.get("type") or "access").strip().lower()
+    if token_type != "access":
+        return None
+
+    session_id = str(payload.get("sid") or "").strip()
+    if not session_id:
+        return None
+
+    user_id = payload.get("uid")
+    if user_id is not None:
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return None
+    user_uuid = str(payload.get("user_uuid") or payload.get("sub") or "").strip()
+    session_type = str(payload.get("session_type") or "").strip()
+    session_record = get_active_user_session_by_id(
+        db,
+        session_id,
+        user_id=user_id,
+        user_uuid=user_uuid or None,
+        session_type=session_type or None,
+    )
+    if session_record is None:
+        return None
+    return payload
+
+
+def _get_user_from_access_token(token: str, db: Session) -> Optional[User]:
+    payload = validate_access_token_payload(token, db)
     if payload is None:
         return None
 

@@ -31,11 +31,15 @@ class Settings(BaseSettings):
     WHISPER_APIKEY: str = "something"
     JWT_SECRET_KEY: str = "aaargwgwqewe"
     SESSION_SECRET_KEY: str = "feefadfagagagwadsee"
-    JWT_ACCESS_TOKEN_EXPIRES_MINUTES: int = 10080
+    JWT_ACCESS_TOKEN_EXPIRES_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRES_DAYS: int = 30
     PORTAL_SESSION_EXPIRES_DAYS: int = 30
     PORTAL_SESSION_KEY: str = "portal_session_id"
     PORTAL_SESSION_USER_KEY: str = "portal_user_id"
+    SESSION_COOKIE_HTTPS_ONLY: bool = True
+    SESSION_COOKIE_SAME_SITE: str = "lax"
+    SESSION_COOKIE_MAX_AGE: int = 2592000
+    SECURITY_ENFORCE_STRONG_SECRETS: bool = True
     PORTAL_PUBLIC_BASE_URL: Optional[str] = None
     SMTP_HOST: Optional[str] = None
     SMTP_PORT: int = 465
@@ -107,7 +111,7 @@ class Settings(BaseSettings):
     AFDIAN_WEBHOOK_FORWARD_TIMEOUT: float = 10.0
     AFDIAN_WEBHOOK_FORWARD_AUTHORIZATION: Optional[str] = None
 
-    LEGACY_MODE: bool = True
+    LEGACY_MODE: bool = False
     API_V1_ENABLED: bool = True
     API_V1_LEGACY_LOGIN_ENABLED: bool = True
     API_V2_ENABLED: bool = True
@@ -118,17 +122,25 @@ class Settings(BaseSettings):
     API_V2_LEGACY_MIGRATION_ENABLED: bool = True
     API_V1_HOSTS: str = ""
     API_V2_HOSTS: str = ""
+    AUTH_LOGIN_IP_LIMIT: str = "20/10 minutes"
+    AUTH_LOGIN_IDENTITY_LIMIT: str = "8/10 minutes"
+    LEGACY_LOGIN_IP_LIMIT: str = "20/10 minutes"
+    LEGACY_LOGIN_IDENTITY_LIMIT: str = "8/10 minutes"
+    ADMIN_LOGIN_IP_LIMIT: str = "10/10 minutes"
+    ADMIN_LOGIN_IDENTITY_LIMIT: str = "5/10 minutes"
+    GUEST_AUTH_ENABLED: bool = True
+    GUEST_LOGIN_IP_LIMIT: str = "30/10 minutes"
+    GUEST_SESSION_EXPIRES_MINUTES: int = 60
 
     DEFAULT_TEST_USER_ENABLED: bool = True
     DEFAULT_TEST_USER_UUID: str = "00000000-0000-0000-0000-000000000001"
-    DEFAULT_TEST_USER_EMAIL: str = "test@voicelinkvr.top"
-    DEFAULT_TEST_USER_DISPLAY_NAME: str = "Public Test User"
+    DEFAULT_TEST_USER_EMAIL: str = "guest@internal.invalid"
     DEFAULT_TEST_USER_ACTIVE: bool = True
     DEFAULT_TEST_USER_IP_DAILY_QUOTA: int = 800
     DEFAULT_TEST_USER_IP_RATE_LIMIT: str = "8/minute"
     DEFAULT_TEST_USER_RESOURCE_QUOTA: int = 0
-    DEFAULT_TEST_USER_USERNAME: str = "testuser"
-    DEFAULT_TEST_USER_PASSWORD: Optional[str] = "abc123!"
+    DEFAULT_TEST_USER_USERNAME: str = "__guest_internal__"
+    DEFAULT_TEST_USER_PASSWORD: Optional[str] = None
 
     class Config:
         env_file = ".env"

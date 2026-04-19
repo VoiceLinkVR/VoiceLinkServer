@@ -7,8 +7,15 @@ from sqlalchemy.orm import Session
 
 from core.afdian_service import afdian_service
 from core.dependencies import hash_password, normalize_email, utcnow_naive
+from core.entitlement_service import (
+    ensure_user_entitlement_state,
+    rebuild_user_entitlement_state_from_legacy_fields,
+    reset_user_entitlements_to_free,
+    sync_user_cache_from_entitlements,
+)
 from core.logging_config import logger
-from db.models import PaymentOrder, RequestLog, User, normalize_payment_lookup_value, payment_lookup_digest
+from core.plan_catalog import get_free_plan
+from db.models import PaymentOrder, RequestLog, User, V2RequestLog, normalize_payment_lookup_value, payment_lookup_digest
 
 LOCAL_TIME_OFFSET_HOURS = 8
 MAX_HOUR_OPTIONS = 168
@@ -22,6 +29,17 @@ EXCLUDED_ENDPOINTS = [
     "/api/translations/profile",
     "/api/translators/runtime",
     "/api/translations/capabilities",
+]
+EXCLUDED_ENDPOINT_PREFIXES = [
+    "/auth",
+    "/v2/auth",
+    "/api/account",
+    "/v2/api/account",
+    "/api/billing",
+    "/v2/api/billing",
+    "/api/content",
+    "/v2/api/content",
+    "/v2/adminapi",
 ]
 
 AFDIAN_ACTION_LABELS = {
@@ -48,16 +66,11 @@ def _to_utc_iso(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat().replace("+00:00", "Z")
 
 
-def _display_name(user: User) -> str:
-    return (getattr(user, "display_name", None) or user.username or "").strip()
-
-
 def serialize_admin_user(user: User) -> dict[str, Any]:
     return {
         "id": str(user.id),
         "username": user.username,
         "email": (user.email or "").strip(),
-        "display_name": _display_name(user),
         "email_verified": bool(getattr(user, "email_verified", False)),
         "is_admin": bool(user.is_admin),
     }
@@ -194,22 +207,33 @@ def _build_user_afdian_summary_map(db: Session) -> dict[str, dict[str, Any]]:
     return summary_map
 
 
-def _serialize_user_record(user: User, afdian_summary: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def _serialize_user_record(db: Session, user: User, afdian_summary: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    subscription_state, addon_wallet = ensure_user_entitlement_state(db, user)
+    rate_limit_rule = (getattr(subscription_state, "rate_limit_rule", None) or "").strip()
+    current_quota_label = f"{int(subscription_state.daily_quota or 0)}/day"
+    should_show_rate_limit = bool(getattr(user, "is_default_test_user", False)) or float(subscription_state.plan_price or 0) <= 0
+    if rate_limit_rule and should_show_rate_limit:
+        current_quota_label = f"{current_quota_label};{rate_limit_rule}"
     return {
         "id": str(user.id),
         "username": user.username,
         "email": (user.email or "").strip(),
-        "display_name": _display_name(user),
         "email_verified": bool(getattr(user, "email_verified", False)),
         "is_admin": bool(user.is_admin),
         "is_active": bool(user.is_active),
         "limit_rule": user.limit_rule,
+        "current_quota_display": current_quota_label,
+        "plan_ref": subscription_state.plan_ref,
+        "pricing_mode": subscription_state.pricing_mode,
+        "plan_price": round(float(subscription_state.plan_price or 0), 2),
+        "daily_quota": int(subscription_state.daily_quota or 0),
+        "rate_limit_rule": rate_limit_rule,
         "expiration_date": _to_utc_iso(user.expiration_date),
         "boost_expiration_date": _to_utc_iso(getattr(user, "boost_expiration_date", None)),
         "boost_limit_rule": getattr(user, "boost_limit_rule", None),
-        "addon_resource_balance": int(getattr(user, "addon_resource_balance", 0) or 0),
-        "addon_resource_total": int(getattr(user, "addon_resource_total", 0) or 0),
-        "addon_expiration_date": _to_utc_iso(getattr(user, "addon_expiration_date", None)),
+        "addon_resource_balance": int(getattr(addon_wallet, "balance", 0) or 0),
+        "addon_resource_total": int(getattr(addon_wallet, "total_purchased", 0) or 0),
+        "addon_expiration_date": _to_utc_iso(getattr(addon_wallet, "expires_at", None)),
         "created_at": _to_utc_iso(getattr(user, "created_at", None)),
         "last_login_at": _to_utc_iso(getattr(user, "last_login_at", None)),
         "afdian_summary": afdian_summary
@@ -250,7 +274,7 @@ def list_users_payload(db: Session) -> dict[str, Any]:
         ),
     }
     return {
-        "items": [_serialize_user_record(user, afdian_summary_map.get(user.username)) for user in users],
+        "items": [_serialize_user_record(db, user, afdian_summary_map.get(user.username)) for user in users],
         "summary": summary,
     }
 
@@ -268,7 +292,7 @@ def get_user_detail_payload(db: Session, user_id: int) -> dict[str, Any]:
         .all()
     )
     afdian_summary_map = _build_user_afdian_summary_map(db)
-    afdian_summary = afdian_summary_map.get(user.username, _serialize_user_record(user)["afdian_summary"])
+    afdian_summary = afdian_summary_map.get(user.username, _serialize_user_record(db, user)["afdian_summary"])
 
     latest_parsed_custom_id = None
     for order in orders:
@@ -281,7 +305,7 @@ def get_user_detail_payload(db: Session, user_id: int) -> dict[str, Any]:
             continue
 
     return {
-        "user": _serialize_user_record(user, afdian_summary),
+        "user": _serialize_user_record(db, user, afdian_summary),
         "afdian_summary": {
             **afdian_summary,
             "has_orders": bool(orders),
@@ -303,7 +327,6 @@ def create_user(db: Session, payload: Any) -> dict[str, Any]:
         username=username,
         password=hash_password(payload.password),
         email=email,
-        display_name=(payload.display_name or username).strip(),
         email_verified=False,
         is_admin=bool(payload.is_admin),
         is_active=bool(payload.is_active),
@@ -312,9 +335,11 @@ def create_user(db: Session, payload: Any) -> dict[str, Any]:
         created_at=utcnow_naive(),
     )
     db.add(user)
+    db.flush()
+    rebuild_user_entitlement_state_from_legacy_fields(db, user)
     db.commit()
     db.refresh(user)
-    return _serialize_user_record(user)
+    return _serialize_user_record(db, user)
 
 
 def update_user(db: Session, user_id: int, payload: Any) -> dict[str, Any]:
@@ -337,8 +362,6 @@ def update_user(db: Session, user_id: int, payload: Any) -> dict[str, Any]:
                 raise ValueError("Email already exists")
         user.email = email
 
-    if payload.display_name is not None:
-        user.display_name = payload.display_name.strip() or user.username
     if payload.password:
         user.password = hash_password(payload.password)
     if payload.is_admin is not None:
@@ -350,9 +373,97 @@ def update_user(db: Session, user_id: int, payload: Any) -> dict[str, Any]:
     if payload.expiration_date is not None:
         user.expiration_date = payload.expiration_date
 
+    rebuild_user_entitlement_state_from_legacy_fields(db, user)
     db.commit()
     db.refresh(user)
-    return _serialize_user_record(user)
+    return _serialize_user_record(db, user)
+
+
+def update_user_manual_entitlement(db: Session, user_id: int, payload: Any) -> dict[str, Any]:
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise ValueError("User not found")
+
+    subscription_state, addon_wallet = ensure_user_entitlement_state(db, user)
+
+    if bool(getattr(payload, "reset_to_free", False)):
+        subscription_state, addon_wallet = reset_user_entitlements_to_free(
+            db,
+            user,
+            clear_addon=bool(getattr(payload, "clear_addon", False)),
+        )
+    else:
+        if payload.plan_price is not None:
+            subscription_state.plan_price = round(float(payload.plan_price or 0), 2)
+        if payload.daily_quota is not None:
+            subscription_state.daily_quota = int(payload.daily_quota or 0)
+        if payload.pricing_mode is not None:
+            subscription_state.pricing_mode = payload.pricing_mode
+        if payload.plan_ref is not None:
+            subscription_state.plan_ref = (payload.plan_ref or "").strip() or subscription_state.plan_ref
+        if payload.subscription_status is not None:
+            subscription_state.status = payload.subscription_status
+        if payload.subscription_expires_at is not None or payload.subscription_status == "free":
+            subscription_state.expires_at = None if payload.subscription_status == "free" else payload.subscription_expires_at
+        if payload.rate_limit_rule is not None:
+            subscription_state.rate_limit_rule = (payload.rate_limit_rule or "").strip()
+
+        if bool(getattr(payload, "clear_addon", False)):
+            addon_wallet.balance = 0
+            addon_wallet.expires_at = None
+
+        if payload.addon_balance is not None:
+            addon_wallet.balance = int(payload.addon_balance or 0)
+        if payload.addon_total_purchased is not None:
+            addon_wallet.total_purchased = max(int(payload.addon_total_purchased or 0), int(addon_wallet.balance or 0))
+        else:
+            addon_wallet.total_purchased = max(int(addon_wallet.total_purchased or 0), int(addon_wallet.balance or 0))
+        if payload.addon_expires_at is not None or bool(getattr(payload, "clear_addon", False)):
+            addon_wallet.expires_at = None if bool(getattr(payload, "clear_addon", False)) else payload.addon_expires_at
+
+        if float(subscription_state.plan_price or 0) <= 0 or subscription_state.status == "free":
+            free_plan = get_free_plan()
+            subscription_state.plan_price = 0
+            subscription_state.plan_ref = str(free_plan["id"])
+            subscription_state.pricing_mode = "free"
+            subscription_state.daily_quota = int(free_plan["daily_quota"])
+            subscription_state.status = "free"
+            subscription_state.expires_at = None
+
+        subscription_state.snapshot_json = json.dumps(
+            {
+                "source": "admin_manual_correction",
+                "plan_ref": subscription_state.plan_ref,
+                "pricing_mode": subscription_state.pricing_mode,
+                "plan_price": round(float(subscription_state.plan_price or 0), 2),
+                "daily_quota": int(subscription_state.daily_quota or 0),
+                "rate_limit_rule": subscription_state.rate_limit_rule,
+                "status": subscription_state.status,
+                "expires_at": subscription_state.expires_at,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        addon_wallet.snapshot_json = json.dumps(
+            {
+                "source": "admin_manual_correction",
+                "balance": int(addon_wallet.balance or 0),
+                "total_purchased": int(addon_wallet.total_purchased or 0),
+                "expires_at": addon_wallet.expires_at,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        now = utcnow_naive()
+        subscription_state.updated_at = now
+        addon_wallet.updated_at = now
+
+    sync_user_cache_from_entitlements(user, subscription_state, addon_wallet)
+    db.commit()
+    db.refresh(user)
+    return _serialize_user_record(db, user)
 
 
 def delete_user(db: Session, user_id: int) -> dict[str, Any]:
@@ -383,6 +494,12 @@ def _build_afdian_order_payload(order: PaymentOrder) -> dict[str, Any]:
         "remark": order.remark,
         "username": order.username,
         "action": order.action,
+        "order_kind": getattr(order, "order_kind", None),
+        "plan_ref": getattr(order, "plan_ref", None),
+        "plan_price_snapshot": round(float(order.plan_price_snapshot), 2) if getattr(order, "plan_price_snapshot", None) is not None else None,
+        "months_snapshot": getattr(order, "months_snapshot", None),
+        "daily_quota_snapshot": getattr(order, "daily_quota_snapshot", None),
+        "addon_resource_snapshot": getattr(order, "addon_resource_snapshot", None),
         "amount": round(float(order.amount), 2) if order.amount is not None else None,
         "status": status,
         "status_label": {
@@ -569,30 +686,43 @@ def parse_afdian_token_payload(token: str) -> dict[str, Any]:
     return _build_afdian_token_result(token)
 
 
-def _get_local_hour_expr(db: Session):
+def _stats_log_model(db: Session):
+    if db.query(func.count(V2RequestLog.id)).scalar():
+        return V2RequestLog
+    return RequestLog
+
+
+def _endpoint_filters(log_model):
+    filters = [log_model.endpoint.notin_(EXCLUDED_ENDPOINTS)]
+    for prefix in EXCLUDED_ENDPOINT_PREFIXES:
+        filters.append(log_model.endpoint.notlike(f"{prefix}%"))
+    return filters
+
+
+def _get_local_hour_expr(db: Session, log_model):
     if db.bind.dialect.name == "sqlite":
-        return func.strftime("%Y-%m-%d %H:00", func.datetime(RequestLog.timestamp, f"+{LOCAL_TIME_OFFSET_HOURS} hours"))
+        return func.strftime("%Y-%m-%d %H:00", func.datetime(log_model.timestamp, f"+{LOCAL_TIME_OFFSET_HOURS} hours"))
     return func.date_format(
-        func.date_add(RequestLog.timestamp, text(f"INTERVAL {LOCAL_TIME_OFFSET_HOURS} HOUR")),
+        func.date_add(log_model.timestamp, text(f"INTERVAL {LOCAL_TIME_OFFSET_HOURS} HOUR")),
         "%Y-%m-%d %H:00",
     )
 
 
-def _get_local_date_expr(db: Session):
+def _get_local_date_expr(db: Session, log_model):
     if db.bind.dialect.name == "sqlite":
-        return func.date(func.datetime(RequestLog.timestamp, f"+{LOCAL_TIME_OFFSET_HOURS} hours"))
-    return func.date(func.date_add(RequestLog.timestamp, text(f"INTERVAL {LOCAL_TIME_OFFSET_HOURS} HOUR")))
+        return func.date(func.datetime(log_model.timestamp, f"+{LOCAL_TIME_OFFSET_HOURS} hours"))
+    return func.date(func.date_add(log_model.timestamp, text(f"INTERVAL {LOCAL_TIME_OFFSET_HOURS} HOUR")))
 
 
-def _get_recent_hours(db: Session, hour_expr) -> list[str]:
-    latest_timestamp = db.query(func.max(RequestLog.timestamp)).scalar()
+def _get_recent_hours(db: Session, hour_expr, log_model) -> list[str]:
+    latest_timestamp = db.query(func.max(log_model.timestamp)).filter(*_endpoint_filters(log_model)).scalar()
     if not latest_timestamp:
         return []
 
     recent_start = latest_timestamp - timedelta(days=14)
     rows = (
         db.query(hour_expr.label("hour"))
-        .filter(RequestLog.timestamp >= recent_start)
+        .filter(log_model.timestamp >= recent_start, *_endpoint_filters(log_model))
         .group_by(hour_expr)
         .order_by(desc(hour_expr))
         .limit(MAX_HOUR_OPTIONS)
@@ -622,9 +752,10 @@ def _get_utc_hour_range(selected_hour: str):
 
 
 def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict[str, Any]:
-    hour_expr = _get_local_hour_expr(db)
-    date_expr = _get_local_date_expr(db)
-    hours = _get_recent_hours(db, hour_expr)
+    log_model = _stats_log_model(db)
+    hour_expr = _get_local_hour_expr(db, log_model)
+    date_expr = _get_local_date_expr(db, log_model)
+    hours = _get_recent_hours(db, hour_expr, log_model)
     selected_hour = _normalize_hour(selected_hour_param, hours)
 
     if selected_hour and selected_hour not in hours:
@@ -642,17 +773,17 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
     if selected_hour:
         hour_start_utc, hour_end_utc = _get_utc_hour_range(selected_hour)
         base_filters = [
-            RequestLog.timestamp >= hour_start_utc,
-            RequestLog.timestamp < hour_end_utc,
-            RequestLog.endpoint.notin_(EXCLUDED_ENDPOINTS),
+            log_model.timestamp >= hour_start_utc,
+            log_model.timestamp < hour_end_utc,
+            *_endpoint_filters(log_model),
         ]
 
         summary_row = (
             db.query(
-                func.sum(case((RequestLog.status == "success", 1), else_=0)).label("total_success"),
-                func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("total_fail"),
-                func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("total_rate_limited"),
-                func.sum(RequestLog.resource_cost).label("total_resource_cost"),
+                func.sum(case((log_model.status == "success", 1), else_=0)).label("total_success"),
+                func.sum(case((log_model.status == "failed", 1), else_=0)).label("total_fail"),
+                func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("total_rate_limited"),
+                func.sum(log_model.resource_cost).label("total_resource_cost"),
                 func.count().label("total_count"),
             )
             .filter(*base_filters)
@@ -668,17 +799,17 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
         total_count_col = func.count().label("total_count")
         hourly_stats = (
             db.query(
-                RequestLog.username,
-                RequestLog.ip,
-                RequestLog.endpoint,
-                func.sum(case((RequestLog.status == "success", 1), else_=0)).label("success_count"),
-                func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("fail_count"),
-                func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
-                func.sum(RequestLog.resource_cost).label("resource_cost"),
+                log_model.username,
+                log_model.ip,
+                log_model.endpoint,
+                func.sum(case((log_model.status == "success", 1), else_=0)).label("success_count"),
+                func.sum(case((log_model.status == "failed", 1), else_=0)).label("fail_count"),
+                func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+                func.sum(log_model.resource_cost).label("resource_cost"),
                 total_count_col,
             )
             .filter(*base_filters)
-            .group_by(RequestLog.username, RequestLog.ip, RequestLog.endpoint)
+            .group_by(log_model.username, log_model.ip, log_model.endpoint)
             .order_by(desc(total_count_col))
             .limit(MAX_DETAIL_ROWS)
             .all()
@@ -687,44 +818,44 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
         endpoint_total_col = func.count().label("endpoint_total")
         top_endpoints = (
             db.query(
-                RequestLog.endpoint,
-                func.sum(case((RequestLog.status == "success", 1), else_=0)).label("success_count"),
-                func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("fail_count"),
-                func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
-                func.sum(RequestLog.resource_cost).label("resource_cost"),
+                log_model.endpoint,
+                func.sum(case((log_model.status == "success", 1), else_=0)).label("success_count"),
+                func.sum(case((log_model.status == "failed", 1), else_=0)).label("fail_count"),
+                func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+                func.sum(log_model.resource_cost).label("resource_cost"),
                 endpoint_total_col,
             )
             .filter(*base_filters)
-            .group_by(RequestLog.endpoint)
+            .group_by(log_model.endpoint)
             .order_by(desc(endpoint_total_col))
             .limit(8)
             .all()
         )
 
         duration_range = case(
-            (RequestLog.duration < 0.5, "0-0.5s"),
-            (RequestLog.duration < 1, "0.5-1s"),
-            (RequestLog.duration < 2, "1-2s"),
-            (RequestLog.duration < 3, "2-3s"),
-            (RequestLog.duration < 4, "3-4s"),
-            (RequestLog.duration < 6, "4-6s"),
-            (RequestLog.duration < 10, "5-10s"),
-            (RequestLog.duration < 20, "10-20s"),
-            (RequestLog.duration < 30, "20-30s"),
-            (RequestLog.duration < 50, "30-50s"),
+            (log_model.duration < 0.5, "0-0.5s"),
+            (log_model.duration < 1, "0.5-1s"),
+            (log_model.duration < 2, "1-2s"),
+            (log_model.duration < 3, "2-3s"),
+            (log_model.duration < 4, "3-4s"),
+            (log_model.duration < 6, "4-6s"),
+            (log_model.duration < 10, "5-10s"),
+            (log_model.duration < 20, "10-20s"),
+            (log_model.duration < 30, "20-30s"),
+            (log_model.duration < 50, "30-50s"),
             else_="50+s",
         ).label("duration_range")
         bucket_order = case(
-            (RequestLog.duration < 0.5, 1),
-            (RequestLog.duration < 1, 2),
-            (RequestLog.duration < 2, 3),
-            (RequestLog.duration < 3, 4),
-            (RequestLog.duration < 4, 5),
-            (RequestLog.duration < 6, 6),
-            (RequestLog.duration < 10, 7),
-            (RequestLog.duration < 20, 8),
-            (RequestLog.duration < 30, 9),
-            (RequestLog.duration < 50, 10),
+            (log_model.duration < 0.5, 1),
+            (log_model.duration < 1, 2),
+            (log_model.duration < 2, 3),
+            (log_model.duration < 3, 4),
+            (log_model.duration < 4, 5),
+            (log_model.duration < 6, 6),
+            (log_model.duration < 10, 7),
+            (log_model.duration < 20, 8),
+            (log_model.duration < 30, 9),
+            (log_model.duration < 50, 10),
             else_=11,
         ).label("bucket_order")
 
@@ -750,13 +881,13 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
     daily_rows = (
         db.query(
             date_expr.label("day"),
-            func.sum(case((RequestLog.status == "success", 1), else_=0)).label("daily_success"),
-            func.sum(case((RequestLog.status == "failed", 1), else_=0)).label("daily_fail"),
-            func.sum(case((RequestLog.status == "rate_limited", 1), else_=0)).label("daily_rate_limited"),
-            func.sum(RequestLog.resource_cost).label("daily_resource_cost"),
+            func.sum(case((log_model.status == "success", 1), else_=0)).label("daily_success"),
+            func.sum(case((log_model.status == "failed", 1), else_=0)).label("daily_fail"),
+            func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("daily_rate_limited"),
+            func.sum(log_model.resource_cost).label("daily_resource_cost"),
             func.count().label("daily_total"),
         )
-        .filter(RequestLog.timestamp >= utc_start_dt, RequestLog.timestamp < utc_end_dt)
+        .filter(log_model.timestamp >= utc_start_dt, log_model.timestamp < utc_end_dt, *_endpoint_filters(log_model))
         .group_by(date_expr)
         .order_by(desc(date_expr))
         .all()

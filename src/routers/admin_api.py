@@ -2,7 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from core import admin_service
+import core.content_service as content_service
 import core.site_config_service as site_config_service
+from core.config import settings
 from core.dependencies import (
     authenticate_user,
     get_current_admin_user,
@@ -14,9 +16,13 @@ from core.dependencies import (
     revoke_user_session,
     utcnow_naive,
 )
+from core.rate_limiter import enforce_auth_attempt_rate_limit
 from db.models import User
 from routers.user_center import activate_afdian_order_by_lookup
 from schemas.admin import (
+    AdminAnnouncementCreateRequest,
+    AdminAnnouncementListResponse,
+    AdminAnnouncementUpdateRequest,
     AdminAuthBootstrapRequest,
     AdminAuthLoginRequest,
     AdminAuthStateResponse,
@@ -27,7 +33,11 @@ from schemas.admin import (
     AdminAuthTokenResponse,
     AdminOrderActivateRequest,
     AdminOrderLookupRequest,
+    AdminFaqCreateRequest,
+    AdminFaqListResponse,
+    AdminFaqUpdateRequest,
     AdminUserCreateRequest,
+    AdminUserEntitlementCorrectionRequest,
     AdminUserResponse,
     AdminUserUpdateRequest,
 )
@@ -89,7 +99,6 @@ async def bootstrap_admin(
         username=username,
         password=hash_password(payload.password),
         email=email,
-        display_name=(payload.display_name or username).strip(),
         email_verified=False,
         is_admin=True,
         is_active=True,
@@ -116,6 +125,13 @@ async def login_admin(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    enforce_auth_attempt_rate_limit(
+        request,
+        scope_prefix="admin_login",
+        ip_limit=settings.ADMIN_LOGIN_IP_LIMIT,
+        identity=payload.login,
+        identity_limit=settings.ADMIN_LOGIN_IDENTITY_LIMIT,
+    )
     user = authenticate_user(db, payload.login.strip(), payload.password)
     if user is None or not user.is_admin:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
@@ -194,6 +210,20 @@ async def update_user(
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
+@router.patch("/users/{user_id}/entitlements")
+async def update_user_entitlements(
+    user_id: int,
+    payload: AdminUserEntitlementCorrectionRequest,
+    _: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return admin_service.update_user_manual_entitlement(db, user_id, payload)
+    except ValueError as exc:
+        status_code = status.HTTP_404_NOT_FOUND if str(exc) == "User not found" else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+
 @router.delete("/users/{user_id}")
 async def delete_user(
     user_id: int,
@@ -254,6 +284,84 @@ async def get_order(order_id: int, _: User = Depends(get_current_admin_user), db
 @router.get("/stats")
 async def stats(hour: str | None = None, _: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
     return admin_service.build_stats_payload(db, hour)
+
+
+@router.get("/content/announcements", response_model=AdminAnnouncementListResponse)
+async def list_announcements(_: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    return content_service.list_admin_announcements_payload(db)
+
+
+@router.post("/content/announcements")
+async def create_announcement(
+    payload: AdminAnnouncementCreateRequest,
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    return content_service.create_announcement(db, current_user, payload)
+
+
+@router.patch("/content/announcements/{item_id}")
+async def update_announcement(
+    item_id: int,
+    payload: AdminAnnouncementUpdateRequest,
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return content_service.update_announcement(db, item_id, current_user, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.delete("/content/announcements/{item_id}")
+async def delete_announcement(
+    item_id: int,
+    _: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return content_service.delete_announcement(db, item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get("/content/faqs", response_model=AdminFaqListResponse)
+async def list_faqs(_: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    return content_service.list_admin_faqs_payload(db)
+
+
+@router.post("/content/faqs")
+async def create_faq(
+    payload: AdminFaqCreateRequest,
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    return content_service.create_faq(db, current_user, payload)
+
+
+@router.patch("/content/faqs/{item_id}")
+async def update_faq(
+    item_id: int,
+    payload: AdminFaqUpdateRequest,
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return content_service.update_faq(db, item_id, current_user, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.delete("/content/faqs/{item_id}")
+async def delete_faq(
+    item_id: int,
+    _: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return content_service.delete_faq(db, item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
 
 @router.get("/configs", response_model=AdminSiteConfigListResponse)

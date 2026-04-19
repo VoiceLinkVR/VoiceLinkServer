@@ -42,7 +42,6 @@ class User(Base):
     password = Column(String(255), nullable=False)
     email = Column(String(255), nullable=True, index=True)
     email_verified = Column(Boolean, default=False, nullable=False)
-    display_name = Column(String(100), nullable=True)
     is_default_test_user = Column(Boolean, default=False, nullable=False, index=True)
     identity_version = Column(Integer, default=1, nullable=False)
     is_admin = Column(Boolean, default=False)
@@ -68,7 +67,6 @@ class V2User(Base):
     password = Column(String(255), nullable=False)
     email = Column(String(255), nullable=False, index=True)
     email_verified = Column(Boolean, default=False, nullable=False)
-    display_name = Column(String(100), nullable=True)
     identity_version = Column(Integer, default=2, nullable=False)
     is_admin = Column(Boolean, default=False)
     limit_rule = Column(String(100), nullable=True)
@@ -222,6 +220,18 @@ class PaymentOrder(Base):
     plan_id = Column(String(64), nullable=True, index=True)
     billing_version = Column(Integer, nullable=False, default=1)
     action = Column(String(32), nullable=True)
+    order_kind = Column(String(32), nullable=True, index=True)
+    pricing_mode_snapshot = Column(String(32), nullable=True)
+    plan_ref = Column(String(100), nullable=True, index=True)
+    plan_price_snapshot = Column(Float, nullable=True)
+    months_snapshot = Column(Integer, nullable=True)
+    expected_amount_snapshot = Column(Float, nullable=True)
+    paid_amount_snapshot = Column(Float, nullable=True)
+    daily_quota_snapshot = Column(Integer, nullable=True)
+    rate_limit_rule_snapshot = Column(String(255), nullable=True)
+    addon_resource_snapshot = Column(Integer, nullable=True)
+    catalog_version_snapshot = Column(String(64), nullable=True)
+    entitlement_snapshot_json = Column(Text, nullable=True)
     amount = Column(Float, nullable=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
     activated_at = Column(DateTime, nullable=True)
@@ -231,6 +241,74 @@ class PaymentOrder(Base):
     raw_payload = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.now, nullable=False)
     updated_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
+class UserSubscriptionState(Base):
+    __tablename__ = "user_subscription_state"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_uuid = Column(String(36), nullable=False, unique=True, index=True)
+    username = Column(String(50), nullable=True, index=True)
+    identity_version = Column(Integer, nullable=True)
+    plan_ref = Column(String(100), nullable=False, index=True)
+    pricing_mode = Column(String(32), nullable=False, default="free")
+    plan_price = Column(Float, nullable=False, default=0)
+    daily_quota = Column(Integer, nullable=False, default=0)
+    rate_limit_rule = Column(String(255), nullable=True)
+    status = Column(String(32), nullable=False, default="free", index=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    source_order_id = Column(Integer, nullable=True, index=True)
+    snapshot_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
+class UserAddonWallet(Base):
+    __tablename__ = "user_addon_wallet"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_uuid = Column(String(36), nullable=False, unique=True, index=True)
+    username = Column(String(50), nullable=True, index=True)
+    identity_version = Column(Integer, nullable=True)
+    balance = Column(Integer, nullable=False, default=0)
+    total_purchased = Column(Integer, nullable=False, default=0)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    last_order_id = Column(Integer, nullable=True, index=True)
+    snapshot_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
+class AnnouncementEntry(Base):
+    __tablename__ = "announcement_entry"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False)
+    content = Column(Text, nullable=False)
+    display_mode = Column(String(16), nullable=False, default="banner", index=True)
+    show_in_overview = Column(Boolean, nullable=False, default=False, index=True)
+    sort_order = Column(Integer, nullable=False, default=100, index=True)
+    is_published = Column(Boolean, nullable=False, default=False, index=True)
+    published_at = Column(DateTime, nullable=True, index=True)
+    updated_by_user_id = Column(Integer, nullable=True, index=True)
+    updated_by_username = Column(String(50), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+
+class FaqEntry(Base):
+    __tablename__ = "faq_entry"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False)
+    content = Column(Text, nullable=False)
+    sort_order = Column(Integer, nullable=False, default=100, index=True)
+    is_published = Column(Boolean, nullable=False, default=False, index=True)
+    published_at = Column(DateTime, nullable=True, index=True)
+    updated_by_user_id = Column(Integer, nullable=True, index=True)
+    updated_by_username = Column(String(50), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
 
 
 class SiteConfig(Base):

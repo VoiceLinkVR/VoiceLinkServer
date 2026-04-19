@@ -14,16 +14,18 @@ from core.dependencies import (
     _request_user_agent,
     clear_portal_session,
     create_access_token,
-    decode_access_token,
     fallback_expired_user_to_free,
     get_db,
+    get_active_user_session_by_id,
     normalize_email,
     normalize_expiration_utc,
     oauth2_scheme,
     revoke_refresh_tokens_for_session,
     utcnow_naive,
+    validate_access_token_payload,
     verify_password,
 )
+from core.entitlement_service import reset_user_entitlements_to_free
 from core.plan_catalog import build_limit_rule, get_free_plan
 from db.models import DeviceAuthorization, RefreshToken, UserSession, V2User
 
@@ -33,15 +35,7 @@ def fallback_expired_v2_user_to_free(db: Session, user: V2User) -> tuple[bool, O
     if expires_at_utc is None or expires_at_utc > datetime.now(timezone.utc):
         return False, expires_at_utc
 
-    free_plan = get_free_plan()
-    user.limit_rule = build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"])
-    user.expiration_date = None
-    user.boost_limit_rule = None
-    user.boost_expiration_date = None
-    user.addon_resource_balance = 0
-    user.addon_resource_total = 0
-    user.addon_expiration_date = None
-    user.is_active = True
+    reset_user_entitlements_to_free(db, user)
     db.flush()
     return True, expires_at_utc
 
@@ -82,8 +76,9 @@ def _create_v2_user_session(
     request: Request,
     *,
     session_type: str = "portal",
+    expires_delta: Optional[timedelta] = None,
 ) -> UserSession:
-    expires_at = utcnow_naive() + timedelta(days=settings.PORTAL_SESSION_EXPIRES_DAYS)
+    expires_at = utcnow_naive() + (expires_delta or timedelta(days=settings.PORTAL_SESSION_EXPIRES_DAYS))
     record = UserSession(
         session_id=secrets.token_urlsafe(48),
         user_id=user.id,
@@ -186,14 +181,17 @@ def issue_noninteractive_v2_login_artifacts(
     request: Request,
     *,
     session_type: str = "device",
+    expires_delta: Optional[timedelta] = None,
+    access_token_expires_delta: Optional[timedelta] = None,
 ) -> tuple[str, str, UserSession]:
-    session_record = _create_v2_user_session(db, user, request, session_type=session_type)
+    session_record = _create_v2_user_session(db, user, request, session_type=session_type, expires_delta=expires_delta)
     access_token = create_access_token(
         build_v2_access_token_payload(
             user,
             session_id=session_record.session_id,
             session_type=session_type,
-        )
+        ),
+        expires_delta=access_token_expires_delta,
     )
     refresh_token, _ = _create_v2_refresh_token(db, user, session_id=session_record.session_id)
     return access_token, refresh_token, session_record
@@ -245,6 +243,14 @@ def rotate_v2_refresh_token(db: Session, refresh_token: str) -> tuple[V2User, st
     if user is None:
         record.revoked_at = utcnow_naive()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    if record.session_id and get_active_user_session_by_id(
+        db,
+        record.session_id,
+        user_id=record.user_id,
+        user_uuid=record.user_uuid,
+    ) is None:
+        record.revoked_at = utcnow_naive()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
 
@@ -258,7 +264,7 @@ def rotate_v2_refresh_token(db: Session, refresh_token: str) -> tuple[V2User, st
 
 
 def _get_v2_user_from_access_token(token: str, db: Session) -> Optional[V2User]:
-    payload = decode_access_token(token)
+    payload = validate_access_token_payload(token, db)
     if payload is None:
         return None
     if str(payload.get("account_version") or "").strip().lower() != "v2":

@@ -8,6 +8,7 @@ from core.config import settings
 
 DAY_LIMIT_RULE_PATTERN = re.compile(r"^\s*(\d+)\s*/\s*day\s*$", re.IGNORECASE)
 PLAN_ID_RULE_PATTERN = re.compile(r"^\s*plan_id\s*=\s*([A-Za-z0-9._-]+)\s*$", re.IGNORECASE)
+LEGACY_PLAN_ID_PATTERN = re.compile(r"^legacy-m(?P<cents>\d+)-q(?P<quota>\d+)$", re.IGNORECASE)
 SUBSCRIPTION_MODE_FIXED_TIERS = "fixed_tiers"
 SUBSCRIPTION_MODE_LADDER = "ladder"
 SAFE_PLAN_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
@@ -89,9 +90,26 @@ def _normalize_limit_rule(value: Any, *, key: str) -> str:
     return normalized
 
 
+def _default_unified_free_daily_quota() -> int:
+    return max(1, int(settings.DEFAULT_TEST_USER_IP_DAILY_QUOTA or _extract_daily_limit(settings.FREE_PLAN_LIMIT_RULE) or 800))
+
+
+def _default_unified_free_resource_quota() -> int:
+    return max(0, int(settings.DEFAULT_TEST_USER_RESOURCE_QUOTA or 0))
+
+
+def _default_unified_free_rate_limit() -> str:
+    return _normalize_limit_rule(
+        settings.DEFAULT_TEST_USER_IP_RATE_LIMIT or settings.FREE_PLAN_LIMIT_RULE,
+        key="default_unified_free.rate_limit",
+    )
+
+
 def _build_default_catalog() -> dict[str, Any]:
-    free_quota = _extract_daily_limit(settings.FREE_PLAN_LIMIT_RULE) or 800
-    default_test_quota = int(settings.DEFAULT_TEST_USER_IP_DAILY_QUOTA or free_quota)
+    free_quota = _default_unified_free_daily_quota()
+    default_test_quota = _default_unified_free_daily_quota()
+    default_test_resource_quota = _default_unified_free_resource_quota()
+    default_test_rate_limit = _default_unified_free_rate_limit()
     base_increment = max(1, int(settings.AFDIAN_BOOST_DAILY_INCREMENT or 1500))
     addon_increment = max(1, int(settings.AFDIAN_ADDON_RESOURCE_INCREMENT or 5000))
     addon_price = round(float(settings.AFDIAN_ADDON_PRICE_STEP or 5.0), 2)
@@ -128,15 +146,15 @@ def _build_default_catalog() -> dict[str, Any]:
             "id": "free",
             "monthly_price": 0.0,
             "daily_quota": int(free_quota),
-            "resource_quota": 0,
-            "rate_limit": settings.FREE_PLAN_LIMIT_RULE,
+            "resource_quota": default_test_resource_quota,
+            "rate_limit": default_test_rate_limit,
         },
         "default_test_plan": {
             "id": "default_test",
             "monthly_price": 0.0,
             "daily_quota": default_test_quota,
-            "resource_quota": int(settings.DEFAULT_TEST_USER_RESOURCE_QUOTA or 0),
-            "rate_limit": settings.DEFAULT_TEST_USER_IP_RATE_LIMIT,
+            "resource_quota": default_test_resource_quota,
+            "rate_limit": default_test_rate_limit,
         },
         "tiers": tiers,
         "addons": [
@@ -237,32 +255,19 @@ def normalize_catalog(raw: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
     free_raw = _ensure_mapping(raw.get("free_plan"), "free_plan")
-    free_quota = int(free_raw.get("daily_quota") or merged["free_plan"]["daily_quota"])
-    free_resource_quota = int(free_raw.get("resource_quota") or merged["free_plan"].get("resource_quota") or 0)
-    if free_quota <= 0:
-        raise ValueError("free_plan.daily_quota must be greater than 0")
-    if free_resource_quota < 0:
-        raise ValueError("free_plan.resource_quota must be greater than or equal to 0")
+    free_quota = _default_unified_free_daily_quota()
+    free_resource_quota = _default_unified_free_resource_quota()
     merged["free_plan"] = {
         "id": _normalize_id(free_raw.get("id"), fallback=merged["free_plan"]["id"], key="free_plan.id"),
         "monthly_price": 0.0,
         "daily_quota": free_quota,
         "resource_quota": free_resource_quota,
-        "rate_limit": _normalize_limit_rule(
-            free_raw.get("rate_limit") or merged["free_plan"].get("rate_limit"),
-            key="free_plan.rate_limit",
-        ),
+        "rate_limit": _default_unified_free_rate_limit(),
     }
 
     default_test_raw = _ensure_mapping(raw.get("default_test_plan"), "default_test_plan")
-    default_test_daily_quota = int(default_test_raw.get("daily_quota") or merged["default_test_plan"]["daily_quota"])
-    default_test_resource_quota = int(
-        default_test_raw.get("resource_quota") or merged["default_test_plan"].get("resource_quota") or 0
-    )
-    if default_test_daily_quota <= 0:
-        raise ValueError("default_test_plan.daily_quota must be greater than 0")
-    if default_test_resource_quota < 0:
-        raise ValueError("default_test_plan.resource_quota must be greater than or equal to 0")
+    default_test_daily_quota = _default_unified_free_daily_quota()
+    default_test_resource_quota = _default_unified_free_resource_quota()
     merged["default_test_plan"] = {
         "id": _normalize_id(
             default_test_raw.get("id"),
@@ -272,10 +277,7 @@ def normalize_catalog(raw: dict[str, Any] | None = None) -> dict[str, Any]:
         "monthly_price": 0.0,
         "daily_quota": default_test_daily_quota,
         "resource_quota": default_test_resource_quota,
-        "rate_limit": _normalize_limit_rule(
-            default_test_raw.get("rate_limit") or merged["default_test_plan"].get("rate_limit"),
-            key="default_test_plan.rate_limit",
-        ),
+        "rate_limit": _default_unified_free_rate_limit(),
     }
 
     normalized_tiers = [_normalize_tier(_ensure_mapping(item, "tiers[]")) for item in (_ensure_list(raw.get("tiers"), "tiers") or merged["tiers"])]
@@ -464,6 +466,29 @@ def resolve_plan_from_rule(limit_rule: str | None, expiration_date: Any = None) 
     for tier in paid_tiers:
         if plan_id and tier["id"] == plan_id:
             return dict(tier)
+
+    legacy_match = LEGACY_PLAN_ID_PATTERN.match(plan_id or "")
+    if legacy_match:
+        cents = int(legacy_match.group("cents"))
+        quota = int(legacy_match.group("quota"))
+        return {
+            "id": plan_id,
+            "monthly_price": round(cents / 100.0, 2),
+            "daily_quota": max(1, quota),
+            "resource_quota": 0,
+            "rate_limit": _normalize_limit_rule(
+                ";".join(
+                    [
+                        segment.strip()
+                        for segment in (limit_rule or "").split(";")
+                        if segment.strip() and not segment.strip().lower().startswith("plan_id=") and "/day" not in segment.lower()
+                    ]
+                ),
+                key="legacy_plan.rate_limit",
+            )
+            if limit_rule
+            else "",
+        }
 
     if expiration_date is None and daily_quota == free_plan["daily_quota"]:
         return dict(free_plan)

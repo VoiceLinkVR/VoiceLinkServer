@@ -1,6 +1,7 @@
 ﻿import json
 import os
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
@@ -54,6 +55,7 @@ _capabilities_cache: Dict[str, Any] = {
     "timestamp": 0.0,
     "data": None,
 }
+_capabilities_cache_lock = threading.Lock()
 
 
 def ensure_update_assets() -> str:
@@ -179,25 +181,46 @@ def get_translator_runtime_info(request: Request, current_version: Optional[str]
 
 
 def get_translation_capabilities() -> Dict[str, Any]:
-    now = time.time()
     cached = _capabilities_cache.get("data")
-    cached_ts = _capabilities_cache.get("timestamp", 0.0)
-
-    if cached and now - cached_ts < settings.TRANSLATION_CAPABILITIES_CACHE_SECONDS:
+    if cached:
         return cached
 
+    logger.warning("Translation capabilities cache is empty; using fallback capabilities until refresh runs")
+    payload = _build_translation_capabilities_payload([])
+    with _capabilities_cache_lock:
+        if not _capabilities_cache.get("data"):
+            _capabilities_cache["timestamp"] = time.time()
+            _capabilities_cache["data"] = payload
+    return _capabilities_cache.get("data") or payload
+
+
+
+def refresh_translation_capabilities_cache() -> Dict[str, Any]:
+    logger.info("Refreshing translation capabilities cache")
     engines = _load_translators_capabilities()
-    if settings.GEMMA_TRANSLATE_ENABLED:
-        engines.append(get_gemma_capability_entry())
+    payload = _build_translation_capabilities_payload(engines)
 
-    payload = {
-        "version": time.strftime("%Y%m%d"),
-        "engines": engines,
-    }
+    with _capabilities_cache_lock:
+        _capabilities_cache["timestamp"] = time.time()
+        _capabilities_cache["data"] = payload
 
-    _capabilities_cache["timestamp"] = now
-    _capabilities_cache["data"] = payload
+    logger.info(
+        "Translation capabilities cache refreshed, engine_count=%s",
+        len(payload.get("engines", [])),
+    )
     return payload
+
+
+
+def _build_translation_capabilities_payload(engines: List[Dict[str, Any]]) -> Dict[str, Any]:
+    payload_engines = list(engines)
+    if settings.GEMMA_TRANSLATE_ENABLED:
+        payload_engines.append(get_gemma_capability_entry())
+
+    return {
+        "version": time.strftime("%Y%m%d"),
+        "engines": payload_engines,
+    }
 
 
 def _load_translators_capabilities() -> List[Dict[str, Any]]:

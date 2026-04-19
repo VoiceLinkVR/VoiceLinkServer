@@ -1,9 +1,13 @@
+import json
+import math
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import or_
+from datetime import date
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from core.account_email_service import (
@@ -17,6 +21,7 @@ from core.account_email_service import (
 )
 from core.afdian_service import afdian_service
 from core.config import settings
+from core.content_service import list_published_announcements_payload, list_published_faqs_payload
 from core.dependencies import (
     authenticate_user,
     build_access_token_payload,
@@ -27,12 +32,20 @@ from core.dependencies import (
     normalize_email,
     utcnow_naive,
 )
-from core.identity import build_default_display_name, has_bound_email, is_v2_identity_ready
+from core.entitlement_service import (
+    build_subscription_snapshot_for_existing_values,
+    ensure_user_entitlement_state,
+    rebuild_user_entitlement_state_from_legacy_fields,
+    set_payment_order_snapshot,
+    update_user_subscription_state,
+)
+from core.identity import has_bound_email, is_v2_identity_ready
 from core.plan_catalog import get_paid_tiers
-from core.quota_service import build_quota_snapshot
+from core.quota_service import QUOTA_SOURCE_ADDON, QUOTA_SOURCE_DAILY, build_quota_snapshot, get_daily_subscription_limit, is_new_quota_mode_enabled
+from core.rate_limiter import enforce_auth_attempt_rate_limit
 from core.v2_dependencies import get_current_v2_user
 from core.v2_dependencies import revoke_v2_user_session
-from db.models import PaymentOrder, RefreshToken, User, UserIdentityLink, UserSession, V2User, set_payment_order_remark
+from db.models import PaymentOrder, RefreshToken, User, UserIdentityLink, UserSession, V2RequestLog, V2User, set_payment_order_remark
 from routers.user_center import (
     PRICE_EPSILON,
     _calculate_addon_resource_from_amount,
@@ -59,10 +72,12 @@ from schemas.portal import (
     PortalBillingGuideOptionResponse,
     PortalBillingGuideResponse,
     PortalBillingPlanResponse,
+    PortalAnnouncementResponse,
     PortalBindEmailRequest,
     PortalChangePasswordRequest,
     PortalCreateOrderIntentRequest,
     PortalEntitlementResponse,
+    PortalFaqItemResponse,
     PortalForgotPasswordRequest,
     PortalLegacyLinkRequest,
     PortalLegacyLinkResponse,
@@ -80,6 +95,17 @@ from schemas.portal import (
 router = APIRouter()
 
 PLACEHOLDER_PORTAL_PASSWORD = "__portal_authenticated_user__"
+PORTAL_USAGE_EXCLUDED_PREFIXES = (
+    "/v2/auth",
+    "/v2/api/account",
+    "/v2/api/billing",
+    "/v2/api/content",
+    "/auth",
+    "/api/account",
+    "/api/billing",
+    "/api/content",
+    "/v2/adminapi",
+)
 
 
 def _ensure_v2_billing_enabled() -> None:
@@ -110,6 +136,179 @@ def _to_utc(value: Optional[datetime]) -> Optional[datetime]:
     return value.astimezone(timezone.utc)
 
 
+def _to_naive_utc(value: Optional[datetime]) -> Optional[datetime]:
+    resolved = _to_utc(value)
+    if resolved is None:
+        return None
+    return resolved.replace(tzinfo=None)
+
+
+def _extract_daily_limit_from_rule(limit_rule: Optional[str]) -> Optional[int]:
+    for part in (segment.strip() for segment in str(limit_rule or "").split(";") if segment.strip()):
+        lowered = part.lower()
+        if lowered.endswith("/day"):
+            try:
+                return max(0, int(part.split("/", 1)[0].strip()))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _legacy_daily_quota_to_price(daily_quota: Optional[int]) -> Optional[float]:
+    if daily_quota is None or daily_quota <= 0:
+        return None
+    normalized_quota = max(0, int(daily_quota))
+    return round((normalized_quota / 1500.0) * 5.0, 2)
+
+
+def _extract_legacy_order_payload(order: PaymentOrder) -> dict[str, object]:
+    raw_payload = getattr(order, "raw_payload", None)
+    if not raw_payload:
+        return {}
+    try:
+        parsed = json.loads(raw_payload)
+    except Exception:
+        return {}
+
+    if not isinstance(parsed, dict):
+        return {}
+
+    custom_payload = parsed.get("custom_payload")
+    if isinstance(custom_payload, dict):
+        merged = dict(parsed)
+        merged.update(custom_payload)
+        return merged
+    return parsed
+
+
+def _resolve_legacy_subscription_basis(db: Session, legacy_user: User) -> tuple[Optional[float], Optional[int], Optional[int]]:
+    orders = (
+        db.query(PaymentOrder)
+        .filter(
+            or_(PaymentOrder.user_uuid == legacy_user.user_uuid, PaymentOrder.username == legacy_user.username),
+            PaymentOrder.status == "activated",
+            PaymentOrder.action != "addon",
+        )
+        .order_by(PaymentOrder.activated_at.desc(), PaymentOrder.updated_at.desc(), PaymentOrder.id.desc())
+        .all()
+    )
+
+    for order in orders:
+        payload = _extract_legacy_order_payload(order)
+        raw_plan_price = payload.get("plan_price")
+        raw_limit_rule = payload.get("limit_rule")
+        daily_quota = _extract_daily_limit_from_rule(str(raw_limit_rule or "").strip() or None)
+        plan_price = None
+        try:
+            if raw_plan_price is not None:
+                plan_price = round(float(raw_plan_price), 2)
+        except (TypeError, ValueError):
+            plan_price = None
+        if plan_price is None:
+            plan_price = _legacy_daily_quota_to_price(daily_quota)
+        if plan_price is not None and plan_price > 0:
+            return plan_price, daily_quota, order.id
+
+    fallback_daily_quota = _extract_daily_limit_from_rule(getattr(legacy_user, "limit_rule", None))
+    fallback_plan_price = _legacy_daily_quota_to_price(fallback_daily_quota)
+    return fallback_plan_price, fallback_daily_quota, None
+
+
+def _calculate_remaining_subscription_value(
+    *,
+    legacy_expiration: Optional[datetime],
+    legacy_plan_price: Optional[float],
+    bind_time_utc: datetime,
+) -> tuple[float, float]:
+    if legacy_expiration is None or legacy_plan_price is None or legacy_plan_price <= 0:
+        return 0.0, 0.0
+
+    remaining_seconds = max(0.0, (legacy_expiration - bind_time_utc).total_seconds())
+    if remaining_seconds <= 0:
+        return 0.0, 0.0
+
+    remaining_days = remaining_seconds / 86400.0
+    remaining_value = (remaining_days / float(settings.AFDIAN_RENEW_DAYS)) * float(legacy_plan_price)
+    return remaining_value, remaining_days
+
+
+def _convert_value_to_days(remaining_value: float, target_plan_price: float) -> int:
+    if remaining_value <= 0 or target_plan_price <= 0:
+        return 0
+    converted_days = (float(remaining_value) / float(target_plan_price)) * float(settings.AFDIAN_RENEW_DAYS)
+    return max(1, int(math.ceil(converted_days)))
+
+
+def _merge_legacy_subscription_value(db: Session, target_user: V2User, legacy_user: User) -> None:
+    bind_time_utc = datetime.now(timezone.utc)
+    legacy_expiration_utc = _to_utc(getattr(legacy_user, "expiration_date", None))
+    if legacy_expiration_utc is None or legacy_expiration_utc <= bind_time_utc or not bool(getattr(legacy_user, "is_active", True)):
+        return
+
+    legacy_plan_price, legacy_daily_quota, source_order_id = _resolve_legacy_subscription_basis(db, legacy_user)
+    remaining_value, _ = _calculate_remaining_subscription_value(
+        legacy_expiration=legacy_expiration_utc,
+        legacy_plan_price=legacy_plan_price,
+        bind_time_utc=bind_time_utc,
+    )
+    if remaining_value <= PRICE_EPSILON:
+        return
+
+    target_state, _ = ensure_user_entitlement_state(db, target_user)
+    target_expiration_utc = _to_utc(getattr(target_user, "expiration_date", None))
+    target_has_active_paid = (
+        bool(getattr(target_user, "is_active", True))
+        and target_expiration_utc is not None
+        and target_expiration_utc > bind_time_utc
+        and float(getattr(target_state, "plan_price", 0) or 0) > PRICE_EPSILON
+    )
+
+    if target_has_active_paid:
+        current_price = round(float(target_state.plan_price or 0), 2)
+        converted_days = _convert_value_to_days(remaining_value, current_price)
+        if converted_days <= 0:
+            return
+        base_expiration_utc = max(target_expiration_utc, bind_time_utc)
+        next_expiration = base_expiration_utc + timedelta(days=converted_days)
+        update_user_subscription_state(
+            db,
+            target_user,
+            plan_price=current_price,
+            expires_at=_to_naive_utc(next_expiration),
+            source_order_id=source_order_id,
+            pricing_mode=str(target_state.pricing_mode or "").strip() or None,
+            status="active",
+            plan_ref=str(target_state.plan_ref or "").strip() or None,
+            daily_quota=int(target_state.daily_quota or 0) or None,
+            rate_limit_rule=str(target_state.rate_limit_rule or "").strip() or None,
+        )
+        return
+
+    normalized = build_subscription_snapshot_for_existing_values(
+        legacy_plan_price or 0,
+        daily_quota=legacy_daily_quota,
+    )
+    target_plan_price = round(float(normalized["plan_price"]), 2)
+    converted_days = _convert_value_to_days(remaining_value, target_plan_price)
+    if converted_days <= 0:
+        return
+
+    next_expiration = bind_time_utc + timedelta(days=converted_days)
+    update_user_subscription_state(
+        db,
+        target_user,
+        plan_price=target_plan_price,
+        expires_at=_to_naive_utc(next_expiration),
+        source_order_id=source_order_id,
+        pricing_mode=str(normalized["pricing_mode"]),
+        status="active",
+        plan_ref=str(normalized["plan_ref"]),
+        daily_quota=int(normalized["daily_quota"]),
+        rate_limit_rule=str(normalized["rate_limit_rule"]),
+        catalog_version=str(normalized["catalog_version"]),
+    )
+
+
 def _account_status(user: V2User) -> str:
     expired, _ = is_user_expired(user)
     if expired:
@@ -119,9 +318,9 @@ def _account_status(user: V2User) -> str:
     return "active"
 
 
-def _plan_price(user: V2User) -> float:
-    price, _ = _get_user_price_and_limit_rule(user)
-    return round(float(price), 2)
+def _plan_price(db: Session, user: V2User) -> float:
+    subscription_state, _ = ensure_user_entitlement_state(db, user)
+    return round(float(subscription_state.plan_price or 0), 2)
 
 
 def _plan_name(price: float) -> str:
@@ -163,17 +362,12 @@ def _resolve_legacy_username(db: Session, user: V2User) -> str:
 
 
 def _serialize_user(user: V2User, db: Session) -> PortalUserResponse:
-    display_name = (getattr(user, "display_name", None) or "").strip() or build_default_display_name(
-        user_uuid=user.user_uuid,
-        user_id=user.id,
-    )
-    price = _plan_price(user)
+    price = _plan_price(db, user)
     return PortalUserResponse(
         id=str(user.id),
         userUuid=(user.user_uuid or "").strip(),
         username=user.username,
         legacyUsername=_resolve_legacy_username(db, user),
-        displayName=display_name,
         email=(user.email or "").strip(),
         emailVerified=bool(getattr(user, "email_verified", False)),
         identityVersion=int(getattr(user, "identity_version", 2) or 2),
@@ -186,17 +380,9 @@ def _serialize_user(user: V2User, db: Session) -> PortalUserResponse:
         lastLoginAt=_format_datetime(getattr(user, "last_login_at", None)),
     )
 
-
-def _normalize_display_name(value: Optional[str], user: V2User) -> str:
-    normalized = (value or "").strip()
-    if normalized:
-        return normalized
-    return build_default_display_name(user_uuid=user.user_uuid, user_id=user.id)
-
-
 def _serialize_entitlements(user: V2User, db: Session) -> PortalEntitlementResponse:
     quota = build_quota_snapshot(db, user)
-    plan_price = _plan_price(user)
+    plan_price = _plan_price(db, user)
     features = [
         f"Daily quota: {quota.daily_limit or _calculate_daily_limit_from_price(plan_price)}",
         f"Quota step-up per tier: +{_get_resource_increment_per_step()}",
@@ -213,6 +399,34 @@ def _serialize_entitlements(user: V2User, db: Session) -> PortalEntitlementRespo
         renewsAt=_to_utc_iso(user.expiration_date),
         features=features,
     )
+
+
+def _v2_daily_resource_cost_case():
+    if is_new_quota_mode_enabled():
+        return case((V2RequestLog.quota_source == QUOTA_SOURCE_DAILY, V2RequestLog.resource_cost), else_=0)
+    return V2RequestLog.resource_cost
+
+
+def _v2_addon_resource_cost_case():
+    if is_new_quota_mode_enabled():
+        return case((V2RequestLog.quota_source == QUOTA_SOURCE_ADDON, V2RequestLog.resource_cost), else_=0)
+    return 0
+
+
+def _build_v2_usage_filters(
+    current_user: V2User,
+    *,
+    range_start: datetime,
+    range_end_exclusive: datetime,
+):
+    filters = [
+        or_(V2RequestLog.user_uuid == current_user.user_uuid, V2RequestLog.username == current_user.username),
+        V2RequestLog.timestamp >= range_start,
+        V2RequestLog.timestamp < range_end_exclusive,
+    ]
+    for prefix in PORTAL_USAGE_EXCLUDED_PREFIXES:
+        filters.append(V2RequestLog.endpoint.notlike(f"{prefix}%"))
+    return filters
 
 
 def _payment_status(raw_status: Optional[str]) -> str:
@@ -389,7 +603,7 @@ def _serialize_addon_guide(payload: dict) -> PortalBillingAddonGuideResponse:
     )
 
 
-def _serialize_billing_guide(user: V2User) -> PortalBillingGuideResponse:
+def _serialize_billing_guide(db: Session, user: V2User) -> PortalBillingGuideResponse:
     raw = _build_payment_guide_response(user, user.username)
     if _migration_required(user):
         raw = {
@@ -410,9 +624,9 @@ def _serialize_billing_guide(user: V2User) -> PortalBillingGuideResponse:
         subscriptionMode=str(raw.get("subscription_mode") or "fixed_tiers"),
         priceStep=round(float(raw.get("price_step") or 5), 2),
         resourceIncrementPerStep=int(raw.get("resource_increment_per_step") or 0),
-        displayPlanName=str(raw.get("display_plan_name") or _plan_name(_plan_price(user))),
-        displayMonthlyPrice=round(float(raw.get("display_monthly_price") or _plan_price(user)), 2),
-        displayResourceQuota=int(raw.get("display_resource_quota") or _calculate_daily_limit_from_price(_plan_price(user))),
+        displayPlanName=str(raw.get("display_plan_name") or _plan_name(_plan_price(db, user))),
+        displayMonthlyPrice=round(float(raw.get("display_monthly_price") or _plan_price(db, user)), 2),
+        displayResourceQuota=int(raw.get("display_resource_quota") or _calculate_daily_limit_from_price(_plan_price(db, user))),
         displayResourceSummary=str(raw.get("display_resource_summary") or ""),
         anchorReason=str(raw.get("anchor_reason") or "current"),
         allowedActions=[str(item) for item in raw.get("allowed_actions", []) if str(item).strip()],
@@ -427,8 +641,8 @@ def _serialize_billing_guide(user: V2User) -> PortalBillingGuideResponse:
     )
 
 
-def _build_plan_catalog(user: V2User) -> list[PortalBillingPlanResponse]:
-    current_price = _plan_price(user)
+def _build_plan_catalog(db: Session, user: V2User) -> list[PortalBillingPlanResponse]:
+    current_price = _plan_price(db, user)
     plans: list[PortalBillingPlanResponse] = []
 
     paid_tiers = get_paid_tiers()
@@ -558,12 +772,18 @@ def _create_order_intent(
     order.username = user.username
     order.user_uuid = user.user_uuid
     order.email = user.email
-    order.plan_id = f"{action}:{plan_price:.2f}:{months}"
-    order.billing_version = 2
-    order.action = action
     order.amount = donation_amount
     order.status = "pending"
     order.updated_at = _utc_now_naive()
+    set_payment_order_snapshot(
+        order,
+        action=action,
+        plan_price=plan_price,
+        months=months,
+        expected_amount=donation_amount,
+        paid_amount=donation_amount,
+        addon_resource_amount=addon_resource_amount,
+    )
     db.commit()
     db.refresh(order)
     return order
@@ -646,6 +866,8 @@ def _merge_legacy_assets(db: Session, target_user: V2User, legacy_user: User) ->
     merged_orders = 0
     merged_addons = 0
 
+    _merge_legacy_subscription_value(db, target_user, legacy_user)
+
     orders = (
         db.query(PaymentOrder)
         .filter(
@@ -673,14 +895,8 @@ def _merge_legacy_assets(db: Session, target_user: V2User, legacy_user: User) ->
             target_user.addon_expiration_date = legacy_user.addon_expiration_date
         merged_addons = legacy_balance
 
-    target_expiration = _to_utc(target_user.expiration_date)
-    legacy_expiration = _to_utc(legacy_user.expiration_date)
-    if legacy_expiration and (target_expiration is None or legacy_expiration > target_expiration):
-        target_user.expiration_date = legacy_user.expiration_date
-        if legacy_user.limit_rule:
-            target_user.limit_rule = legacy_user.limit_rule
-        target_user.is_active = bool(legacy_user.is_active)
-
+    target_user.legacy_user_id = legacy_user.id
+    rebuild_user_entitlement_state_from_legacy_fields(db, target_user)
     return merged_orders, merged_addons
 
 
@@ -695,17 +911,252 @@ async def portal_update_profile(
     db: Session = Depends(get_db),
     current_user: V2User = Depends(get_current_v2_user),
 ):
-    if payload.displayName is not None:
-        current_user.display_name = _normalize_display_name(payload.displayName, current_user)
+    if payload.username is not None:
+        next_username = payload.username.strip()
+        if not next_username:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username must not be empty")
+        duplicate = (
+            db.query(V2User)
+            .filter(V2User.username == next_username, V2User.user_uuid != current_user.user_uuid)
+            .first()
+        )
+        if duplicate is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already exists")
+        current_user.username = next_username
 
     db.commit()
     db.refresh(current_user)
     return _serialize_user(current_user, db)
 
 
+@router.get("/content/announcements", response_model=list[PortalAnnouncementResponse])
+async def portal_announcements(
+    db: Session = Depends(get_db),
+    _: V2User = Depends(get_current_v2_user),
+):
+    return list_published_announcements_payload(db)
+
+
+@router.get("/content/faqs", response_model=list[PortalFaqItemResponse])
+async def portal_faqs(
+    db: Session = Depends(get_db),
+    _: V2User = Depends(get_current_v2_user),
+):
+    return list_published_faqs_payload(db)
+
+
 @router.get("/account/entitlements", response_model=PortalEntitlementResponse)
 async def portal_entitlements(db: Session = Depends(get_db), current_user: V2User = Depends(get_current_v2_user)):
     return _serialize_entitlements(current_user, db)
+
+
+@router.get("/account/usage")
+async def portal_usage(
+    db: Session = Depends(get_db),
+    current_user: V2User = Depends(get_current_v2_user),
+    start_date: Optional[date] = Query(default=None, description="Start date in YYYY-MM-DD format"),
+    end_date: Optional[date] = Query(default=None, description="End date in YYYY-MM-DD format"),
+):
+    now = datetime.now(timezone.utc)
+    today_utc = now.date()
+
+    if start_date is None and end_date is None:
+        query_end_date = today_utc
+        query_start_date = today_utc - timedelta(days=6)
+    elif start_date is None:
+        query_end_date = end_date
+        query_start_date = end_date
+    elif end_date is None:
+        query_start_date = start_date
+        query_end_date = start_date
+    else:
+        query_start_date = start_date
+        query_end_date = end_date
+
+    if query_start_date > query_end_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_date_range", "message": "start_date cannot be later than end_date"},
+        )
+
+    if (query_end_date - query_start_date).days > 365:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "date_range_too_large", "message": "date range cannot exceed 366 days"},
+        )
+
+    range_start = datetime.combine(query_start_date, datetime.min.time())
+    range_end_exclusive = datetime.combine(query_end_date + timedelta(days=1), datetime.min.time())
+    base_filters = _build_v2_usage_filters(
+        current_user,
+        range_start=range_start,
+        range_end_exclusive=range_end_exclusive,
+    )
+
+    usage_row = (
+        db.query(
+            func.sum(case((V2RequestLog.status == "success", 1), else_=0)).label("success_count"),
+            func.sum(case((V2RequestLog.status == "failed", 1), else_=0)).label("failed_count"),
+            func.sum(case((V2RequestLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+            func.sum(V2RequestLog.resource_cost).label("resource_cost_sum"),
+            func.sum(_v2_daily_resource_cost_case()).label("daily_resource_cost_sum"),
+            func.sum(_v2_addon_resource_cost_case()).label("addon_resource_cost_sum"),
+            func.sum(case((V2RequestLog.resource_deducted == True, 1), else_=0)).label("deducted_request_count"),  # noqa: E712
+            func.count().label("total_count"),
+        )
+        .filter(*base_filters)
+        .first()
+    )
+
+    success_count = int((usage_row.success_count if usage_row and usage_row.success_count is not None else 0) or 0)
+    failed_count = int((usage_row.failed_count if usage_row and usage_row.failed_count is not None else 0) or 0)
+    rate_limited_count = int((usage_row.rate_limited_count if usage_row and usage_row.rate_limited_count is not None else 0) or 0)
+    resource_cost_sum = int((usage_row.resource_cost_sum if usage_row and usage_row.resource_cost_sum is not None else 0) or 0)
+    daily_resource_cost_sum = int((usage_row.daily_resource_cost_sum if usage_row and usage_row.daily_resource_cost_sum is not None else 0) or 0)
+    addon_resource_cost_sum = int((usage_row.addon_resource_cost_sum if usage_row and usage_row.addon_resource_cost_sum is not None else 0) or 0)
+    deducted_request_count = int((usage_row.deducted_request_count if usage_row and usage_row.deducted_request_count is not None else 0) or 0)
+    total_count = int((usage_row.total_count if usage_row and usage_row.total_count is not None else 0) or 0)
+
+    today_range_start = datetime.combine(today_utc, datetime.min.time())
+    today_range_end_exclusive = datetime.combine(today_utc + timedelta(days=1), datetime.min.time())
+    today_usage_row = (
+        db.query(
+            func.sum(case((V2RequestLog.status == "success", 1), else_=0)).label("success_count"),
+            func.count().label("total_count"),
+        )
+        .filter(
+            *_build_v2_usage_filters(
+                current_user,
+                range_start=today_range_start,
+                range_end_exclusive=today_range_end_exclusive,
+            )
+        )
+        .first()
+    )
+    today_success_count = int((today_usage_row.success_count if today_usage_row and today_usage_row.success_count is not None else 0) or 0)
+    today_total_count = int((today_usage_row.total_count if today_usage_row and today_usage_row.total_count is not None else 0) or 0)
+
+    daily_limit = get_daily_subscription_limit(current_user)
+    quota_snapshot = build_quota_snapshot(db, current_user)
+
+    date_expr = func.date(V2RequestLog.timestamp)
+    daily_rows = (
+        db.query(
+            date_expr.label("day"),
+            func.sum(case((V2RequestLog.status == "success", 1), else_=0)).label("daily_success_count"),
+            func.sum(case((V2RequestLog.status == "failed", 1), else_=0)).label("daily_failed_count"),
+            func.sum(case((V2RequestLog.status == "rate_limited", 1), else_=0)).label("daily_rate_limited_count"),
+            func.sum(V2RequestLog.resource_cost).label("daily_resource_cost"),
+            func.sum(_v2_daily_resource_cost_case()).label("daily_subscription_resource_cost"),
+            func.sum(_v2_addon_resource_cost_case()).label("daily_addon_resource_cost"),
+            func.sum(case((V2RequestLog.resource_deducted == True, 1), else_=0)).label("daily_deducted_request_count"),  # noqa: E712
+            func.count().label("daily_total_count"),
+        )
+        .filter(*base_filters)
+        .group_by(date_expr)
+        .order_by(date_expr.asc())
+        .all()
+    )
+
+    daily_map = {}
+    for row in daily_rows:
+        day_text = row.day.strftime("%Y-%m-%d") if hasattr(row.day, "strftime") else str(row.day)
+        day_subscription_resource_cost = int((row.daily_subscription_resource_cost or 0) or 0)
+        daily_map[day_text] = {
+            "date": day_text,
+            "day": day_text,
+            "daily_success_count": int((row.daily_success_count or 0) or 0),
+            "daily_failed_count": int((row.daily_failed_count or 0) or 0),
+            "daily_rate_limited_count": int((row.daily_rate_limited_count or 0) or 0),
+            "daily_resource_cost": int((row.daily_resource_cost or 0) or 0),
+            "daily_subscription_resource_cost": day_subscription_resource_cost,
+            "daily_addon_resource_cost": int((row.daily_addon_resource_cost or 0) or 0),
+            "daily_deducted_request_count": int((row.daily_deducted_request_count or 0) or 0),
+            "daily_total_count": int((row.daily_total_count or 0) or 0),
+            "daily_limit": daily_limit,
+            "remaining_daily": None if daily_limit is None else max(0, daily_limit - day_subscription_resource_cost),
+        }
+
+    daily_stats = []
+    cursor = query_start_date
+    while cursor <= query_end_date:
+        cursor_text = cursor.strftime("%Y-%m-%d")
+        daily_stats.append(
+            daily_map.get(
+                cursor_text,
+                {
+                    "date": cursor_text,
+                    "day": cursor_text,
+                    "daily_success_count": 0,
+                    "daily_failed_count": 0,
+                    "daily_rate_limited_count": 0,
+                    "daily_resource_cost": 0,
+                    "daily_subscription_resource_cost": 0,
+                    "daily_addon_resource_cost": 0,
+                    "daily_deducted_request_count": 0,
+                    "daily_total_count": 0,
+                    "daily_limit": daily_limit,
+                    "remaining_daily": daily_limit,
+                },
+            )
+        )
+        cursor += timedelta(days=1)
+
+    end_date_text = query_end_date.strftime("%Y-%m-%d")
+    end_day_subscription_resource_cost = int(daily_map.get(end_date_text, {}).get("daily_subscription_resource_cost", 0) or 0)
+    remaining_daily = None if daily_limit is None else max(0, daily_limit - end_day_subscription_resource_cost)
+    current_plan_price = _plan_price(db, current_user)
+    subscription_state, _ = ensure_user_entitlement_state(db, current_user)
+
+    expires_at = current_user.expiration_date
+    expiration_utc = None
+    remaining_seconds = None
+    is_expired = False
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at.astimezone(timezone.utc)
+        expiration_utc = expires_at.isoformat().replace("+00:00", "Z")
+        remaining_seconds = int((expires_at - now).total_seconds())
+        is_expired = remaining_seconds <= 0
+
+    return {
+        "username": current_user.username,
+        "user_uuid": (current_user.user_uuid or "").strip(),
+        "is_test_user": bool(getattr(current_user, "is_default_test_user", False)),
+        "is_active": bool(current_user.is_active),
+        "is_expired": is_expired,
+        "plan_name": _plan_name(current_plan_price),
+        "plan_price": current_plan_price,
+        "plan_ref": subscription_state.plan_ref,
+        "pricing_mode": subscription_state.pricing_mode,
+        "expiration_utc": expiration_utc,
+        "remaining_seconds": remaining_seconds,
+        "limit_rule": current_user.limit_rule or "",
+        "daily_limit": daily_limit,
+        "remaining_daily": remaining_daily,
+        "daily_resource_limit": daily_limit,
+        "remaining_resource": remaining_daily,
+        "resource_used": resource_cost_sum,
+        "subscription_resource_used": daily_resource_cost_sum,
+        "addon_resource_used": addon_resource_cost_sum,
+        "resource_deducted_request_count": deducted_request_count,
+        "daily_success_count": success_count,
+        "daily_failed_count": failed_count,
+        "daily_rate_limited_count": rate_limited_count,
+        "daily_total_count": total_count,
+        "today_success_count": today_success_count,
+        "today_total_count": today_total_count,
+        "today_daily_resource_used": quota_snapshot.today_daily_used,
+        "today_remaining_daily": quota_snapshot.remaining_daily,
+        "addon_resource_balance": quota_snapshot.addon_resource_balance,
+        "addon_resource_total": quota_snapshot.addon_resource_total,
+        "addon_expiration_utc": quota_snapshot.addon_expiration_utc,
+        "query_start_date": query_start_date.strftime("%Y-%m-%d"),
+        "query_end_date": query_end_date.strftime("%Y-%m-%d"),
+        "daily_stats": daily_stats,
+    }
 
 
 @router.get("/account/orders", response_model=list[PortalOrderResponse])
@@ -741,6 +1192,13 @@ async def portal_legacy_login(
     _: None = Depends(_ensure_v2_legacy_migration_enabled),
     db: Session = Depends(get_db),
 ):
+    enforce_auth_attempt_rate_limit(
+        request,
+        scope_prefix="portal_legacy_login",
+        ip_limit=settings.LEGACY_LOGIN_IP_LIMIT,
+        identity=payload.legacyUsername,
+        identity_limit=settings.LEGACY_LOGIN_IDENTITY_LIMIT,
+    )
     legacy_username = payload.legacyUsername.strip()
     user = db.query(User).filter(User.username == legacy_username).first()
     if user is None or authenticate_user(db, legacy_username, payload.legacyPassword, allow_legacy_username=True) is None:
@@ -768,6 +1226,13 @@ async def portal_legacy_link(
     db: Session = Depends(get_db),
     current_user: V2User = Depends(get_current_v2_user),
 ):
+    enforce_auth_attempt_rate_limit(
+        request,
+        scope_prefix="portal_legacy_link",
+        ip_limit=settings.LEGACY_LOGIN_IP_LIMIT,
+        identity=payload.legacyUsername,
+        identity_limit=settings.LEGACY_LOGIN_IDENTITY_LIMIT,
+    )
     legacy_username = payload.legacyUsername.strip()
     legacy_user = db.query(User).filter(User.username == legacy_username).first()
     if legacy_user is None or authenticate_user(db, legacy_username, payload.legacyPassword, allow_legacy_username=True) is None:
@@ -903,8 +1368,6 @@ async def portal_verify_email(
     user.email_verified = True
     if int(getattr(user, "identity_version", 2) or 2) < 2:
         user.identity_version = 2
-    if not (getattr(user, "display_name", None) or "").strip():
-        user.display_name = build_default_display_name(user_uuid=user.user_uuid, user_id=user.id)
     consume_email_challenge(db, record)
     db.commit()
     return PortalActionResponse(message="Email verified")
@@ -955,17 +1418,19 @@ async def portal_reset_password(payload: PortalResetPasswordRequest, db: Session
 @router.get("/billing/plans", response_model=list[PortalBillingPlanResponse])
 async def portal_billing_plans(
     _: None = Depends(_ensure_v2_billing_enabled),
+    db: Session = Depends(get_db),
     current_user: V2User = Depends(get_current_v2_user),
 ):
-    return _build_plan_catalog(current_user)
+    return _build_plan_catalog(db, current_user)
 
 
 @router.get("/billing/guide", response_model=PortalBillingGuideResponse)
 async def portal_billing_guide(
     _: None = Depends(_ensure_v2_billing_enabled),
+    db: Session = Depends(get_db),
     current_user: V2User = Depends(get_current_v2_user),
 ):
-    return _serialize_billing_guide(current_user)
+    return _serialize_billing_guide(db, current_user)
 
 
 @router.post("/billing/order-intents", response_model=PortalOrderIntentResponse)

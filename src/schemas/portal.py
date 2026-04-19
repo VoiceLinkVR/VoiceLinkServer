@@ -1,12 +1,19 @@
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from core.security_policy import validate_password_strength
 
 
 class PortalChangePasswordRequest(BaseModel):
     verificationToken: str = Field(..., min_length=8, max_length=255)
     verificationCode: str = Field(..., min_length=4, max_length=16)
-    newPassword: str = Field(..., min_length=6, max_length=255)
+    newPassword: str = Field(..., min_length=10, max_length=255)
+
+    @field_validator("newPassword")
+    @classmethod
+    def validate_new_password(cls, value: str) -> str:
+        return validate_password_strength(value, context="newPassword")
 
 
 class PortalCreateOrderIntentRequest(BaseModel):
@@ -24,7 +31,7 @@ class PortalBindEmailRequest(BaseModel):
 
 
 class PortalUpdateProfileRequest(BaseModel):
-    displayName: Optional[str] = Field(default=None, max_length=100)
+    username: Optional[str] = Field(default=None, min_length=3, max_length=50)
 
 
 class PortalSendEmailCodeRequest(BaseModel):
@@ -38,7 +45,12 @@ class PortalForgotPasswordRequest(BaseModel):
 class PortalResetPasswordRequest(BaseModel):
     token: str = Field(..., min_length=1, max_length=255)
     code: str = Field(..., min_length=4, max_length=16)
-    password: str = Field(..., min_length=6, max_length=255)
+    password: str = Field(..., min_length=10, max_length=255)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        return validate_password_strength(value, context="password")
 
 
 class PortalVerifyEmailRequest(BaseModel):
@@ -92,7 +104,6 @@ class PortalUserResponse(BaseModel):
     userUuid: str
     username: str
     legacyUsername: str = ""
-    displayName: str
     email: str = ""
     emailVerified: bool = False
     identityVersion: int = 1
@@ -192,3 +203,23 @@ class PortalOrderIntentResponse(BaseModel):
     id: str
     status: str
     payUrl: str = ""
+
+
+class PortalAnnouncementResponse(BaseModel):
+    id: str
+    title: str
+    content: str
+    displayMode: str
+    showInOverview: bool = False
+    sortOrder: int = 0
+    publishedAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+
+class PortalFaqItemResponse(BaseModel):
+    id: str
+    title: str
+    content: str
+    sortOrder: int = 0
+    publishedAt: Optional[str] = None
+    updatedAt: Optional[str] = None

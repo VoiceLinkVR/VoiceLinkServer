@@ -18,12 +18,15 @@ from core.config import settings
 from core.dependencies import (
     get_db,
     hash_password,
+    issue_noninteractive_login_artifacts,
     normalize_email,
     revoke_refresh_token,
     utcnow_naive,
 )
-from core.identity import build_default_display_name, generate_user_uuid, is_v2_identity_ready
+from core.entitlement_service import rebuild_user_entitlement_state_from_legacy_fields
+from core.identity import generate_user_uuid, is_v2_identity_ready
 from core.plan_catalog import build_limit_rule, get_free_plan
+from core.rate_limiter import enforce_auth_attempt_rate_limit
 from core.v2_dependencies import (
     authenticate_v2_user,
     fallback_expired_v2_user_to_free,
@@ -34,7 +37,7 @@ from core.v2_dependencies import (
     revoke_v2_user_session,
     rotate_v2_refresh_token,
 )
-from db.models import DeviceAuthorization, V2User
+from db.models import DeviceAuthorization, User, V2User
 from schemas.auth import (
     AuthDeviceActionResponse,
     AuthDeviceAuthorizeRequest,
@@ -84,21 +87,39 @@ def _build_username(db: Session, email: str) -> str:
 def _serialize_user(user: V2User) -> AuthUserResponse:
     identity_version = int(getattr(user, "identity_version", 2) or 2)
     migration_required = _migration_required(user)
-    display_name = (getattr(user, "display_name", None) or "").strip() or build_default_display_name(
-        user_uuid=user.user_uuid,
-        user_id=user.id,
-    )
     return AuthUserResponse(
         id=str(user.id),
         user_uuid=(user.user_uuid or "").strip(),
         username=user.username,
         legacy_username="",
         email=(user.email or "").strip(),
-        display_name=display_name,
         email_verified=bool(getattr(user, "email_verified", False)),
         is_admin=bool(user.is_admin),
         identity_version=identity_version,
         migration_required=migration_required,
+    )
+
+
+def _serialize_guest_user(user: User) -> AuthUserResponse:
+    return AuthUserResponse(
+        id=str(user.id),
+        user_uuid=(user.user_uuid or "").strip(),
+        username="guest",
+        legacy_username="",
+        email="",
+        email_verified=False,
+        is_admin=False,
+        identity_version=1,
+        migration_required=False,
+    )
+
+
+def _get_guest_trial_user(db: Session) -> User | None:
+    return (
+        db.query(User)
+        .filter(User.is_default_test_user == True)  # noqa: E712
+        .order_by(User.id.asc())
+        .first()
     )
 
 
@@ -154,7 +175,6 @@ def _serialize_device_request(record: DeviceAuthorization, user: V2User | None =
         expires_at=record.expires_at.isoformat() + "Z",
         username=user.username if user is not None else "",
         user_uuid=(user.user_uuid or "").strip() if user is not None else "",
-        display_name=((getattr(user, "display_name", None) or user.username).strip() if user is not None else ""),
     )
 
 
@@ -212,16 +232,16 @@ async def register(
         password=hash_password(payload.password),
         email=email,
         email_verified=True,
-        display_name=build_default_display_name(user_uuid=user_uuid),
         is_admin=False,
         is_active=True,
         identity_version=2,
-        limit_rule=build_limit_rule(settings.FREE_PLAN_LIMIT_RULE, free_plan["id"], free_plan["daily_quota"]),
+        limit_rule=build_limit_rule(free_plan.get("rate_limit"), free_plan["id"], free_plan["daily_quota"]),
         created_at=utcnow_naive(),
         last_login_at=utcnow_naive(),
     )
     db.add(user)
     db.flush()
+    rebuild_user_entitlement_state_from_legacy_fields(db, user)
     consume_email_challenge(db, register_challenge)
 
     access_token, refresh_token, _ = issue_v2_login_artifacts(db, user, request)
@@ -242,6 +262,13 @@ async def login(
     db: Session = Depends(get_db),
 ):
     login_value = (payload.email or payload.login or "").strip()
+    enforce_auth_attempt_rate_limit(
+        request,
+        scope_prefix="auth_login",
+        ip_limit=settings.AUTH_LOGIN_IP_LIMIT,
+        identity=login_value,
+        identity_limit=settings.AUTH_LOGIN_IDENTITY_LIMIT,
+    )
     user = authenticate_v2_user(db, login_value, payload.password)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
@@ -260,6 +287,43 @@ async def login(
         access_token=access_token,
         refresh_token=refresh_token,
         user=_serialize_user(user),
+    )
+
+
+@router.post("/guest", response_model=AuthTokenResponse)
+async def guest_login(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    if not settings.GUEST_AUTH_ENABLED:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+    enforce_auth_attempt_rate_limit(
+        request,
+        scope_prefix="guest_login",
+        ip_limit=settings.GUEST_LOGIN_IP_LIMIT,
+    )
+    user = _get_guest_trial_user(db)
+    if user is None or not bool(getattr(user, "is_active", False)):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Guest trial is unavailable")
+
+    access_token, refresh_token, _ = issue_noninteractive_login_artifacts(
+        db,
+        user,
+        request,
+        session_type="guest",
+        expires_delta=timedelta(minutes=settings.GUEST_SESSION_EXPIRES_MINUTES),
+        access_token_expires_delta=timedelta(minutes=settings.GUEST_SESSION_EXPIRES_MINUTES),
+    )
+    revoke_refresh_token(db, refresh_token)
+    user.last_login_at = utcnow_naive()
+    db.commit()
+    db.refresh(user)
+
+    return AuthTokenResponse(
+        access_token=access_token,
+        refresh_token="",
+        user=_serialize_guest_user(user),
     )
 
 

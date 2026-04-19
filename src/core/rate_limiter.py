@@ -21,6 +21,7 @@ FALLBACK_USER_LIMIT = "800/day;8/minute"
 SHARED_LIMIT_SCOPE = "shared_limit_scope"
 USER_CENTER_LIMIT = "8/minute"
 USER_CENTER_SCOPE = "user_center"
+AUTH_LIMIT_STATUS_MAX = 499
 
 
 def _utc_day_bucket() -> str:
@@ -248,6 +249,53 @@ def set_user_context_cost(request: Request, cost: int) -> None:
         return
 
     request.state.pending_quota_allocation = prepare_quota_allocation(db, current_user, desired_cost, client_ip=client_ip)
+
+
+def enforce_auth_attempt_rate_limit(
+    request: Request,
+    *,
+    scope_prefix: str,
+    ip_limit: str,
+    identity: Optional[str] = None,
+    identity_limit: Optional[str] = None,
+) -> None:
+    if not rate_limiter.enabled:
+        return
+
+    contexts: list[RateLimitContext] = []
+    client_ip = get_client_ip(request)
+    ip_context = rate_limiter.create_context(
+        limit_string=ip_limit,
+        key=client_ip,
+        scope=f"{scope_prefix}:ip",
+        context_type="auth",
+        deduct_when=lambda status: 100 <= int(status or 0) <= AUTH_LIMIT_STATUS_MAX,
+    )
+    if ip_context is not None:
+        ip_context.check()
+        contexts.append(ip_context)
+
+    normalized_identity = str(identity or "").strip().lower()
+    normalized_identity_limit = str(identity_limit or "").strip()
+    if normalized_identity and normalized_identity_limit:
+        identity_context = rate_limiter.create_context(
+            limit_string=normalized_identity_limit,
+            key=normalized_identity,
+            scope=f"{scope_prefix}:identity",
+            context_type="auth",
+            deduct_when=lambda status: 100 <= int(status or 0) <= AUTH_LIMIT_STATUS_MAX,
+        )
+        if identity_context is not None:
+            identity_context.check()
+            contexts.append(identity_context)
+
+    if not contexts:
+        return
+    pending = getattr(request.state, "rate_limit_contexts", None)
+    if pending is None:
+        pending = []
+        request.state.rate_limit_contexts = pending
+    pending.extend(contexts)
 
 
 async def enforce_user_center_rate_limit(request: Request) -> None:

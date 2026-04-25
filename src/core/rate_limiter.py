@@ -47,6 +47,8 @@ class RateLimitExceeded(Exception):
 def parse_limit_string(limit_string: str) -> List:
     limits: List = []
     for raw in [part.strip() for part in limit_string.split(";") if part.strip()]:
+        if "=" in raw and "/" not in raw:
+            continue
         try:
             limits.append(parse(raw))
         except Exception as exc:  # pylint: disable=broad-except
@@ -58,6 +60,15 @@ def _strip_day_limits(limit_string: str) -> str:
     kept_parts: List[str] = []
     for part in [segment.strip() for segment in limit_string.split(";") if segment.strip()]:
         if "/day" in part.lower():
+            continue
+        kept_parts.append(part)
+    return ";".join(kept_parts)
+
+
+def _strip_limit_metadata(limit_string: str) -> str:
+    kept_parts: List[str] = []
+    for part in [segment.strip() for segment in limit_string.split(";") if segment.strip()]:
+        if "=" in part and "/" not in part:
             continue
         kept_parts.append(part)
     return ";".join(kept_parts)
@@ -228,7 +239,7 @@ async def enforce_user_rate_limit(
     if not rate_limiter.enabled:
         return current_user
 
-    limit_rule = get_effective_user_limit_rule(current_user) or FALLBACK_USER_LIMIT
+    limit_rule = _strip_limit_metadata(get_effective_user_limit_rule(current_user) or "") or FALLBACK_USER_LIMIT
     is_default_test_user = bool(getattr(current_user, "is_default_test_user", False))
 
     if is_default_test_user:
@@ -242,7 +253,7 @@ async def enforce_user_rate_limit(
         )
     else:
         if not settings.LEGACY_CLIENT_COMPAT:
-            limit_rule = _strip_day_limits(limit_rule)
+            limit_rule = _strip_day_limits(limit_rule) or _strip_day_limits(FALLBACK_USER_LIMIT) or FALLBACK_USER_LIMIT
         context = rate_limiter.create_context(
             limit_string=limit_rule,
             key=f"{current_user.user_uuid or current_user.username}:{_utc_day_bucket()}",

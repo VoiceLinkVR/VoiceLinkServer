@@ -293,8 +293,6 @@ def enforce_auth_attempt_rate_limit(
 ) -> None:
     if not rate_limiter.enabled:
         return
-    if is_website_rate_limit_exempt_path(request.url.path):
-        return
 
     contexts: list[RateLimitContext] = []
     client_ip = get_client_ip(request)

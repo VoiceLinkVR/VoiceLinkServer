@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     QWEN_TTS_BASE_URL: str = "http://127.0.0.1:8010"
     QWEN_TTS_TOKEN: Optional[str] = None
     QWEN_TTS_TIMEOUT: float = 300.0
+    QWEN_TTS_MAX_INPUT_CHARS: int = 500
     LATEST_VERSION: Optional[str] = None
     PACKAGE_BASE_URL: Optional[str] = None
     PACKAGE_TYPE: Optional[str] = None

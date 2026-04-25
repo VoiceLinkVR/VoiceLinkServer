@@ -22,10 +22,10 @@ SUPPORTED_RESPONSE_FORMATS = {"wav", "pcm", "mp3"}
 
 class V2TTSRequest(BaseModel):
     input: str = Field(..., min_length=1)
-    voice: str = "alloy"
+    voice: str = Field("alloy", min_length=1, max_length=64)
     response_format: str = "wav"
-    speed: float = 1.0
-    chunk_size: Optional[int] = 8
+    speed: float = Field(1.0, ge=0.25, le=4.0)
+    chunk_size: Optional[int] = Field(8, ge=1, le=128)
 
 
 def _tts_base_url() -> str:
@@ -63,7 +63,31 @@ def _validate_chunk_size(chunk_size: Optional[int]) -> Optional[int]:
     normalized = int(chunk_size)
     if normalized < 1:
         raise HTTPException(status_code=400, detail="chunk_size must be >= 1")
+    if normalized > 128:
+        raise HTTPException(status_code=400, detail="chunk_size must be <= 128")
     return normalized
+
+
+def _validate_tts_input(text: str) -> str:
+    normalized = (text or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="input text is empty")
+    max_chars = max(1, int(settings.QWEN_TTS_MAX_INPUT_CHARS or 500))
+    if len(normalized) > max_chars:
+        raise HTTPException(status_code=400, detail=f"input text exceeds {max_chars} characters")
+    return normalized
+
+
+def _get_compat_resource_cost(cost: int) -> int:
+    if settings.LEGACY_CLIENT_COMPAT:
+        return 1
+    return max(1, int(cost or 1))
+
+
+def _apply_effective_resource_cost(request: Request, cost: int) -> int:
+    effective_cost = _get_compat_resource_cost(cost)
+    set_user_context_cost(request, effective_cost)
+    return effective_cost
 
 
 def _upstream_error_detail(body: bytes) -> Any:
@@ -142,16 +166,14 @@ async def v2_tts(
     current_user: User | V2User = Depends(enforce_user_rate_limit),
 ):
     del current_user
-    text = payload.input.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="input text is empty")
+    text = _validate_tts_input(payload.input)
     response_format = _normalize_response_format(payload.response_format)
     chunk_size = _validate_chunk_size(payload.chunk_size)
 
-    set_user_context_cost(request, TTS_RESOURCE_COST)
+    effective_cost = _apply_effective_resource_cost(request, TTS_RESOURCE_COST)
     request.state.audit_payload = {
         "feature": "tts",
-        "resource_cost": TTS_RESOURCE_COST,
+        "resource_cost": effective_cost,
         "response_format": response_format,
         "voice": payload.voice,
     }
@@ -194,19 +216,19 @@ async def v2_clone(
     current_user: User | V2User = Depends(enforce_user_rate_limit),
 ):
     del current_user
-    text = (input or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="input text is empty")
+    text = _validate_tts_input(input)
     if not (ref_text or "").strip() and not xvec_only:
         raise HTTPException(status_code=400, detail="ref_text is required unless xvec_only=true")
+    if ref_text and len(ref_text.strip()) > max(1, int(settings.QWEN_TTS_MAX_INPUT_CHARS or 500)):
+        raise HTTPException(status_code=400, detail="ref_text is too long")
 
     response_format = _normalize_response_format(response_format)
     normalized_chunk_size = _validate_chunk_size(chunk_size) or 8
 
-    set_user_context_cost(request, CLONE_RESOURCE_COST)
+    effective_cost = _apply_effective_resource_cost(request, CLONE_RESOURCE_COST)
     request.state.audit_payload = {
         "feature": "tts_clone",
-        "resource_cost": CLONE_RESOURCE_COST,
+        "resource_cost": effective_cost,
         "response_format": response_format,
         "language": language,
         "xvec_only": xvec_only,

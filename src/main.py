@@ -12,19 +12,20 @@ from sqlalchemy import text
 from starlette.middleware.sessions import SessionMiddleware
 
 from core.config import refresh_settings_from_override_file_if_changed, settings
-from core.dependencies import fallback_expired_user_to_free, get_db, oauth2_scheme, resolve_authenticated_user
+from core.dependencies import get_db, oauth2_scheme, resolve_authenticated_user
 from core.identity import host_matches, normalize_host
 from core.logging_config import logger, reset_request_id, set_request_id
 from core.quota_service import commit_quota_allocation, is_new_quota_mode_enabled
-from core.rate_limiter import RateLimitExceeded, get_client_ip, rate_limiter
+from core.rate_limiter import RateLimitExceeded, get_client_ip, is_website_rate_limit_exempt_path, rate_limiter
 from core.schema_upgrade import run_schema_upgrade
 from core.security_policy import normalize_cookie_samesite, validate_secret_strength
 from core.services import init_supported_languages, load_filter_config, update_filter_config
 from core.update_service import refresh_translation_capabilities_cache
+from core.v2_request_metrics import V2RequestMetricRecord, record_v2_request_metrics, utcnow_naive
 from core.v2_dependencies import fallback_expired_v2_user_to_free, resolve_authenticated_v2_user
 from db.base import SessionLocal, engine
-from db.models import RequestLog, User, V2RequestLog, V2User
-from routers import admin_api, api, auth, manage_api, portal_api, user_center
+from db.models import RequestLog, V2User
+from routers import admin_api, api, auth, manage_api, portal_api, user_center, v2_tts
 
 
 def _ensure_password_column_capacity(db, inspector) -> None:
@@ -305,15 +306,9 @@ def check_user_expiration():
     db = SessionLocal()
     logger.info("Starting user expiration check")
     now_dt = datetime.now(pytz.utc)
-    expired_users = db.query(User).filter(User.expiration_date <= now_dt).all()
     expired_v2_users = db.query(V2User).filter(V2User.expiration_date <= now_dt).all()
 
     downgraded_count = 0
-    for user in expired_users:
-        downgraded, _ = fallback_expired_user_to_free(db, user)
-        if downgraded:
-            downgraded_count += 1
-            logger.info("Downgraded expired legacy user to free plan: %s", user.username)
     for user in expired_v2_users:
         downgraded, _ = fallback_expired_v2_user_to_free(db, user)
         if downgraded:
@@ -431,7 +426,7 @@ async def version_host_routing_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def lan_only_admin_middleware(request: Request, call_next):
-    if _is_admin_surface_path(request.url.path):
+    if settings.ADMIN_SURFACE_LAN_ONLY and _is_admin_surface_path(request.url.path):
         client_ip = _resolve_admin_access_ip(request)
         if not _is_lan_client_ip(client_ip):
             logger.warning("[ADMIN-ACCESS] Denied non-LAN request. ip=%s path=%s", client_ip, request.url.path)
@@ -472,13 +467,13 @@ async def request_logging_middleware(request: Request, call_next):
     quota_scope = None
     request_host = _resolve_request_host(request)
     is_v2_request = request.scope.get("path", "").startswith("/v2/") or host_matches(request_host, settings.api_v2_hosts)
-    log_model = V2RequestLog if is_v2_request else RequestLog
 
     db_gen = None
     db = None
     response = None
     response_status_code = 500
     rate_limit_triggered = False
+    authenticated_user = None
 
     try:
         db_gen = get_db()
@@ -488,7 +483,6 @@ async def request_logging_middleware(request: Request, call_next):
 
     try:
         token = await oauth2_scheme(request)
-        authenticated_user = None
         if db:
             if is_v2_request:
                 authenticated_v2_user = resolve_authenticated_v2_user(
@@ -532,6 +526,7 @@ async def request_logging_middleware(request: Request, call_next):
             authenticated_user is None
             and request.method.upper() != "OPTIONS"
             and request.url.path != "/v2/auth/me"
+            and not is_website_rate_limit_exempt_path(request.url.path)
             and not _is_admin_surface_path(request.url.path)
         )
         if should_apply_default_limit:
@@ -639,26 +634,33 @@ async def request_logging_middleware(request: Request, call_next):
                         context.commit()
 
             try:
-                if log_model is V2RequestLog:
-                    log = V2RequestLog(
-                        request_id=request_id,
-                        username=current_user if current_user != "anonymous" else None,
-                        user_uuid=current_user_uuid,
-                        actor_type=actor_type,
-                        rate_limit_scope=rate_limit_scope,
-                        quota_scope=quota_scope,
-                        ip=client_ip,
-                        host=request_host,
-                        method=request.method,
-                        endpoint=request.url.path,
-                        duration=log_data.get("duration", 0),
-                        status=log_data.get("status", "failed"),
-                        status_code=response_status_code,
-                        resource_cost=log_data.get("resource_cost", 0),
-                        resource_deducted=log_data.get("resource_deducted", False),
-                        quota_source=log_data.get("quota_source", "none"),
+                record_time = utcnow_naive()
+                if is_v2_request:
+                    record_v2_request_metrics(
+                        session_for_log,
+                        V2RequestMetricRecord(
+                            request_id=request_id,
+                            created_at=record_time,
+                            username=current_user if current_user != "anonymous" else None,
+                            user_uuid=current_user_uuid,
+                            actor_type=actor_type,
+                            rate_limit_scope=rate_limit_scope,
+                            quota_scope=quota_scope,
+                            ip=client_ip,
+                            host=request_host,
+                            method=request.method,
+                            endpoint=request.url.path,
+                            duration_ms=max(0, int(round(float(log_data.get("duration", 0) or 0) * 1000))),
+                            status=log_data.get("status", "failed"),
+                            status_code=response_status_code,
+                            resource_cost=int(log_data.get("resource_cost", 0) or 0),
+                            resource_deducted=bool(log_data.get("resource_deducted", False)),
+                            quota_source=log_data.get("quota_source", "none"),
+                            is_default_test_user=bool(getattr(authenticated_user, "is_default_test_user", False)),
+                            extra_payload=getattr(request.state, "audit_payload", None),
+                        ),
                     )
-                else:
+                if not is_v2_request or (authenticated_user is not None and not isinstance(authenticated_user, V2User)):
                     log = RequestLog(
                         username=current_user if current_user != "anonymous" else None,
                         user_uuid=current_user_uuid,
@@ -673,7 +675,7 @@ async def request_logging_middleware(request: Request, call_next):
                         resource_deducted=log_data.get("resource_deducted", False),
                         quota_source=log_data.get("quota_source", "none"),
                     )
-                session_for_log.add(log)
+                    session_for_log.add(log)
                 session_for_log.commit()
             except Exception as db_e:  # pylint: disable=broad-except
                 if session_for_log is not None:
@@ -708,6 +710,7 @@ if settings.API_V1_ENABLED:
 if settings.API_V2_ENABLED:
     if settings.API_V2_AUTH_ENABLED:
         app.include_router(auth.router, prefix="/v2/auth", tags=["V2 Auth"])
+    app.include_router(v2_tts.router, prefix="/v2/api", tags=["V2 TTS API"])
     if settings.API_V2_PORTAL_ENABLED:
         app.include_router(portal_api.router, prefix="/v2/api", tags=["V2 Portal API"])
         app.include_router(api.router, prefix="/v2/api", tags=["V2 Compat API"])

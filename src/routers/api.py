@@ -12,10 +12,10 @@ from typing import Optional
 
 from core.dependencies import (
     get_db,
-    fallback_expired_user_to_free,
     issue_noninteractive_login_artifacts,
+    oauth2_scheme,
+    resolve_authenticated_user,
     verify_password,
-    get_current_user_for_status,
     get_effective_user_limit_rule,
     utcnow_naive,
 )
@@ -28,7 +28,8 @@ from core.quota_service import (
 from core.rate_limiter import enforce_auth_attempt_rate_limit, enforce_user_rate_limit, set_user_context_cost
 from core.config import settings
 from core.identity import has_bound_email
-from db.models import User, RequestLog
+from core.v2_dependencies import resolve_authenticated_v2_user
+from db.models import User, RequestLog, V2User
 from core.services import (
     errorFilter, do_translate,
     supportedLanguagesList, whisperSupportedLanguageList, SENSEVOICE_URL, packaged_opus_stream_to_wav_bytes,
@@ -57,6 +58,25 @@ USAGE_EXCLUDED_PREFIXES = (
     "/v2/api/content",
     "/v2/adminapi",
 )
+
+
+async def get_current_api_user_for_status(
+    request: Request,
+    token: Optional[str] = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> User | V2User:
+    user: User | V2User | None = None
+    if request.scope.get("path", "").startswith("/v2/"):
+        user = resolve_authenticated_v2_user(request, db, token=token, allow_inactive=True, allow_expired=True)
+    if user is None:
+        user = resolve_authenticated_user(request, db, token=token, allow_inactive=True, allow_expired=True)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
 
 
 def _extract_daily_limit(limit_rule: str) -> Optional[int]:
@@ -215,16 +235,8 @@ async def login(
             detail="Legacy login is only available for accounts that have not completed migration",
         )
 
-    downgraded_to_free, expiration_utc = fallback_expired_user_to_free(db, user)
     logger.info("[LOGIN] Legacy login succeeded for user=%s", user_credentials.username)
-    if downgraded_to_free:
-        logger.info(
-            "[LOGIN] Expired account downgraded to free plan during legacy login: %s, expired_at=%s",
-            user_credentials.username,
-            expiration_utc.isoformat().replace("+00:00", "Z") if expiration_utc else None,
-        )
 
-    user.last_login_at = utcnow_naive()
     access_token, _, _ = issue_noninteractive_login_artifacts(db, user, request, session_type="legacy")
     db.commit()
     return {"message": "Login successful", "access_token": access_token}
@@ -254,7 +266,7 @@ async def latest_version_info():
 @router.get("/account/status")
 async def account_status(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_for_status),
+    current_user: User | V2User = Depends(get_current_api_user_for_status),
 ):
     if _is_test_user(current_user.username):
         raise HTTPException(
@@ -262,38 +274,17 @@ async def account_status(
             detail={"code": "test_user_unsupported", "message": "测试账户不支持查询账户到期信息"},
         )
 
-    expires_at = current_user.expiration_date
-    boost_expires_at = current_user.boost_expiration_date
-    now = datetime.now(timezone.utc)
     expiration_utc = None
     remaining_seconds = None
-    is_expired = False
     boost_expiration_utc = None
     boost_remaining_seconds = None
-
-    if expires_at is not None:
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        else:
-            expires_at = expires_at.astimezone(timezone.utc)
-
-        expiration_utc = expires_at.isoformat().replace("+00:00", "Z")
-        remaining_seconds = int((expires_at - now).total_seconds())
-        is_expired = remaining_seconds <= 0
-
-    if boost_expires_at is not None:
-        if boost_expires_at.tzinfo is None:
-            boost_expires_at = boost_expires_at.replace(tzinfo=timezone.utc)
-        else:
-            boost_expires_at = boost_expires_at.astimezone(timezone.utc)
-        boost_expiration_utc = boost_expires_at.isoformat().replace("+00:00", "Z")
-        boost_remaining_seconds = int((boost_expires_at - now).total_seconds())
+    is_expired = not bool(current_user.is_active)
 
     quota_snapshot = build_quota_snapshot(db, current_user)
 
     return {
         "username": current_user.username,
-        "user_uuid": (current_user.user_uuid or "").strip(),
+        "user_uuid": str(getattr(current_user, "user_uuid", None) or current_user.username or "").strip(),
         "is_active": bool(current_user.is_active),
         "is_expired": is_expired,
         "expiration_utc": expiration_utc,
@@ -313,7 +304,7 @@ async def account_status(
 @router.get("/account/usage")
 async def account_usage(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_for_status),
+    current_user: User | V2User = Depends(get_current_api_user_for_status),
     start_date: Optional[date] = Query(default=None, description="Start date in YYYY-MM-DD format"),
     end_date: Optional[date] = Query(default=None, description="End date in YYYY-MM-DD format"),
 ):
@@ -484,22 +475,13 @@ async def account_usage(
     end_day_subscription_resource_cost = int(daily_map.get(end_date_text, {}).get("daily_subscription_resource_cost", 0) or 0)
     remaining_daily = None if daily_limit is None else max(0, daily_limit - end_day_subscription_resource_cost)
 
-    expires_at = current_user.expiration_date
     expiration_utc = None
     remaining_seconds = None
-    is_expired = False
-    if expires_at is not None:
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        else:
-            expires_at = expires_at.astimezone(timezone.utc)
-        expiration_utc = expires_at.isoformat().replace("+00:00", "Z")
-        remaining_seconds = int((expires_at - now).total_seconds())
-        is_expired = remaining_seconds <= 0
+    is_expired = not bool(current_user.is_active)
 
     return {
         "username": current_user.username,
-        "user_uuid": (current_user.user_uuid or "").strip(),
+        "user_uuid": str(getattr(current_user, "user_uuid", None) or current_user.username or "").strip(),
         "is_test_user": bool(getattr(current_user, "is_default_test_user", False)),
         "is_active": bool(current_user.is_active),
         "is_expired": is_expired,

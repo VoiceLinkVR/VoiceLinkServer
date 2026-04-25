@@ -24,13 +24,11 @@ from db.models import (
     DeviceAuthorization,
     PaymentOrder,
     RefreshToken,
-    RequestLog,
     User,
     UserAddonWallet,
     UserIdentityLink,
     UserSubscriptionState,
     UserSession,
-    V2RequestLog,
     V2User,
 )
 
@@ -320,17 +318,6 @@ def _backfill_related_tables(db: Session) -> None:
         if not record.user_uuid and record.user_id in users_by_id:
             record.user_uuid = users_by_id[record.user_id].user_uuid
 
-    for record in db.query(RequestLog).all():
-        if not record.user_uuid and record.username in users_by_username:
-            user = users_by_username[record.username]
-            record.user_uuid = user.user_uuid
-        if not record.actor_type:
-            record.actor_type = "authenticated"
-        if not record.rate_limit_scope:
-            record.rate_limit_scope = "user"
-        if not record.quota_scope:
-            record.quota_scope = "user"
-
     for record in db.query(PaymentOrder).all():
         user = users_by_username.get(record.username or "")
         if user is not None and not record.user_uuid:
@@ -339,20 +326,6 @@ def _backfill_related_tables(db: Session) -> None:
             record.email = user.email
         if not record.billing_version:
             record.billing_version = 1
-
-    v2_users_by_uuid = {user.user_uuid: user for user in db.query(V2User).all()}
-
-    for record in db.query(V2RequestLog).all():
-        if not record.user_uuid and record.username:
-            user = next((item for item in v2_users_by_uuid.values() if item.username == record.username), None)
-            if user is not None:
-                record.user_uuid = user.user_uuid
-        if not record.actor_type:
-            record.actor_type = "authenticated"
-        if not record.rate_limit_scope:
-            record.rate_limit_scope = "user"
-        if not record.quota_scope:
-            record.quota_scope = "user"
 
 
 def _safe_float(value) -> float | None:
@@ -565,32 +538,33 @@ def _backfill_payment_order_snapshots(db: Session) -> None:
             logger.exception("Failed to backfill payment order snapshot. order_id=%s", order.id)
 
 
-def _ensure_default_test_user(db: Session) -> None:
+def _ensure_default_test_v2_user(db: Session) -> None:
     if not settings.DEFAULT_TEST_USER_ENABLED:
         return
 
     plan = get_default_test_plan()
     generated_password = generate_user_uuid()
-    user = db.query(User).filter(User.user_uuid == settings.DEFAULT_TEST_USER_UUID).first()
+    user = db.query(V2User).filter(V2User.user_uuid == settings.DEFAULT_TEST_USER_UUID).first()
     if user is None and settings.DEFAULT_TEST_USER_USERNAME:
-        user = db.query(User).filter(User.username == settings.DEFAULT_TEST_USER_USERNAME).first()
+        user = db.query(V2User).filter(V2User.username == settings.DEFAULT_TEST_USER_USERNAME).first()
 
     if user is None:
-        user = User(
+        user = V2User(
             user_uuid=settings.DEFAULT_TEST_USER_UUID,
             username=settings.DEFAULT_TEST_USER_USERNAME,
             password=hash_password(generated_password),
             email=settings.DEFAULT_TEST_USER_EMAIL,
             email_verified=False,
             is_default_test_user=True,
-            identity_version=1,
+            identity_version=2,
+            is_admin=False,
             is_active=bool(settings.DEFAULT_TEST_USER_ACTIVE),
             limit_rule=build_limit_rule(plan.get("rate_limit"), plan["id"], plan["daily_quota"]),
             created_at=utcnow_naive(),
         )
         db.add(user)
         db.flush()
-        logger.info("Created internal guest principal %s", user.user_uuid)
+        logger.info("Created v2 internal guest principal %s", user.user_uuid)
     else:
         user.user_uuid = settings.DEFAULT_TEST_USER_UUID
         user.username = settings.DEFAULT_TEST_USER_USERNAME or user.username
@@ -598,35 +572,24 @@ def _ensure_default_test_user(db: Session) -> None:
         user.email = settings.DEFAULT_TEST_USER_EMAIL
         user.email_verified = False
         user.is_default_test_user = True
-        user.identity_version = 1
+        user.identity_version = 2
+        user.is_admin = False
         user.is_active = bool(settings.DEFAULT_TEST_USER_ACTIVE)
         user.limit_rule = build_limit_rule(plan.get("rate_limit"), plan["id"], plan["daily_quota"])
+
+    rebuild_user_entitlement_state_from_legacy_fields(db, user)
 
 
 def run_schema_upgrade() -> None:
     Base.metadata.create_all(bind=engine)
     db = Session(bind=engine)
     try:
-        _ensure_table_columns(db)
-        db.flush()
-        legacy_user_count_before = db.query(User).count()
-        v2_user_count_before = db.query(V2User).count()
-        _backfill_users(db)
-        _backfill_v2_users(db)
-        _ensure_upgraded_user_identity_links(db)
-        _backfill_related_tables(db)
-        _ensure_default_test_user(db)
-        _backfill_payment_order_snapshots(db)
-        _backfill_entitlement_state_tables(db)
+        _ensure_default_test_v2_user(db)
         db.commit()
-        legacy_user_count_after = db.query(User).count()
-        v2_user_count_after = db.query(V2User).count()
         logger.info(
-            "Schema upgrade completed. legacy_users=%s->%s v2_users=%s->%s",
-            legacy_user_count_before,
-            legacy_user_count_after,
-            v2_user_count_before,
-            v2_user_count_after,
+            "Schema upgrade completed. v2_users=%s v2_orders=%s",
+            db.query(V2User).count(),
+            db.query(PaymentOrder).count(),
         )
     except Exception:
         db.rollback()

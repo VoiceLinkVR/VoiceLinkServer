@@ -18,7 +18,6 @@ from core.config import settings
 from core.dependencies import (
     get_db,
     hash_password,
-    issue_noninteractive_login_artifacts,
     normalize_email,
     revoke_refresh_token,
     utcnow_naive,
@@ -37,7 +36,7 @@ from core.v2_dependencies import (
     revoke_v2_user_session,
     rotate_v2_refresh_token,
 )
-from db.models import DeviceAuthorization, User, V2User
+from db.models import DeviceAuthorization, V2User
 from schemas.auth import (
     AuthDeviceActionResponse,
     AuthDeviceAuthorizeRequest,
@@ -100,7 +99,7 @@ def _serialize_user(user: V2User) -> AuthUserResponse:
     )
 
 
-def _serialize_guest_user(user: User) -> AuthUserResponse:
+def _serialize_guest_user(user: V2User) -> AuthUserResponse:
     return AuthUserResponse(
         id=str(user.id),
         user_uuid=(user.user_uuid or "").strip(),
@@ -109,16 +108,16 @@ def _serialize_guest_user(user: User) -> AuthUserResponse:
         email="",
         email_verified=False,
         is_admin=False,
-        identity_version=1,
+        identity_version=int(getattr(user, "identity_version", 2) or 2),
         migration_required=False,
     )
 
 
-def _get_guest_trial_user(db: Session) -> User | None:
+def _get_guest_trial_user(db: Session) -> V2User | None:
     return (
-        db.query(User)
-        .filter(User.is_default_test_user == True)  # noqa: E712
-        .order_by(User.id.asc())
+        db.query(V2User)
+        .filter(V2User.is_default_test_user == True)  # noqa: E712
+        .order_by(V2User.id.asc())
         .first()
     )
 
@@ -307,7 +306,7 @@ async def guest_login(
     if user is None or not bool(getattr(user, "is_active", False)):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Guest trial is unavailable")
 
-    access_token, refresh_token, _ = issue_noninteractive_login_artifacts(
+    access_token, refresh_token, _ = issue_noninteractive_v2_login_artifacts(
         db,
         user,
         request,

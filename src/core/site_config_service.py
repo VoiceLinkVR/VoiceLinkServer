@@ -27,7 +27,7 @@ from core.identity import normalize_host, parse_csv_hosts
 from core.logging_config import logger
 from core.plan_catalog import load_plan_catalog, normalize_catalog, save_plan_catalog
 from core.security_policy import normalize_cookie_samesite, validate_secret_strength
-from db.models import SiteConfig, SiteConfigAuditLog, User
+from db.models import SiteConfig, SiteConfigAuditLog, V2User
 
 
 @dataclass(frozen=True)
@@ -806,7 +806,7 @@ def list_site_config_audit_logs(
 def update_site_configs(
     db: Session,
     *,
-    actor: User,
+    actor: V2User,
     request_ip: str,
     updates: list[dict[str, Any]],
     change_note: Optional[str] = None,

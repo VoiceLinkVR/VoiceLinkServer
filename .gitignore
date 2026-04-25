@@ -4,6 +4,11 @@ data/db/test.db
 *.log
 redisFiles/data
 redisFiles/logs
+tmp/
+sqlback/
+*.tar
+*.tgz
+*.tar.gz
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

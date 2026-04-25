@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     LIMITER_REDIS_URL: Optional[str] = "redis://localhost:6379/0"
     TTS_URL: Optional[str] = None
     TTS_TOKEN: Optional[str] = None
+    QWEN_TTS_BASE_URL: str = "http://127.0.0.1:8010"
+    QWEN_TTS_TOKEN: Optional[str] = None
+    QWEN_TTS_TIMEOUT: float = 300.0
     LATEST_VERSION: Optional[str] = None
     PACKAGE_BASE_URL: Optional[str] = None
     PACKAGE_TYPE: Optional[str] = None
@@ -128,6 +131,7 @@ class Settings(BaseSettings):
     LEGACY_LOGIN_IDENTITY_LIMIT: str = "8/10 minutes"
     ADMIN_LOGIN_IP_LIMIT: str = "10/10 minutes"
     ADMIN_LOGIN_IDENTITY_LIMIT: str = "5/10 minutes"
+    ADMIN_SURFACE_LAN_ONLY: bool = True
     GUEST_AUTH_ENABLED: bool = True
     GUEST_LOGIN_IP_LIMIT: str = "30/10 minutes"
     GUEST_SESSION_EXPIRES_MINUTES: int = 60

@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from core.config import settings
-from core.entitlement_service import reset_user_entitlements_to_free
 from core.plan_catalog import build_limit_rule, get_free_plan
 from db.base import SessionLocal
 from db.models import RefreshToken, User, UserSession
@@ -64,13 +63,9 @@ def is_user_expired(user: User) -> tuple[bool, Optional[datetime]]:
 
 
 def fallback_expired_user_to_free(db: Session, user: User) -> tuple[bool, Optional[datetime]]:
-    expired, expires_at_utc = is_user_expired(user)
-    if not expired:
-        return False, expires_at_utc
-
-    reset_user_entitlements_to_free(db, user)
-    db.flush()
-    return True, expires_at_utc
+    # Legacy v1 accounts no longer auto-downgrade on time-based expiration.
+    # Whether a legacy account is usable is now controlled solely by is_active.
+    return False, normalize_expiration_utc(getattr(user, "expiration_date", None))
 
 
 def get_effective_user_limit_rule(user: User) -> str:
@@ -104,12 +99,7 @@ def authenticate_user(
     allow_legacy_username: bool = True,
 ) -> Optional[User]:
     raw_login = _normalize_login(login)
-    normalized_email = normalize_email(raw_login)
-    filters = [User.email == normalized_email]
-    if allow_legacy_username:
-        filters.append(User.username == raw_login)
-
-    user = db.query(User).filter(or_(*filters)).first()
+    user = db.query(User).filter(User.username == raw_login).first()
     if user is None or not verify_password(password, user.password):
         return None
     return user
@@ -144,7 +134,8 @@ def build_access_token_payload(
     session_type: str = "portal",
     token_type: str = "access",
 ) -> dict[str, Any]:
-    user_uuid = (user.user_uuid or "").strip() or user.username
+    user_lookup_key = str(getattr(user, "user_uuid", None) or getattr(user, "username", "") or "").strip()
+    user_uuid = user_lookup_key or str(getattr(user, "id", ""))
     identity_version = int(getattr(user, "identity_version", 1) or 1)
     payload: dict[str, Any] = {
         "sub": user_uuid,
@@ -153,7 +144,7 @@ def build_access_token_payload(
         "type": token_type,
         "user_uuid": user_uuid,
         "username": user.username,
-        "email": (user.email or "").strip(),
+        "email": (getattr(user, "email", None) or "").strip(),
         "session_type": session_type,
         "identity_version": identity_version,
     }
@@ -174,7 +165,7 @@ def create_user_session(
     record = UserSession(
         session_id=secrets.token_urlsafe(48),
         user_id=user.id,
-        user_uuid=user.user_uuid,
+        user_uuid=str(getattr(user, "user_uuid", None) or getattr(user, "username", "") or "").strip() or None,
         session_type=session_type,
         ip=_request_ip(request),
         user_agent=_request_user_agent(request),
@@ -292,7 +283,7 @@ def create_refresh_token(
     record = RefreshToken(
         token=token_value,
         user_id=user.id,
-        user_uuid=user.user_uuid,
+        user_uuid=str(getattr(user, "user_uuid", None) or getattr(user, "username", "") or "").strip() or None,
         session_id=session_id,
         expires_at=expires_at,
     )
@@ -415,7 +406,7 @@ def rotate_refresh_token(
 
     user = None
     if record.user_uuid:
-        user = db.query(User).filter(User.user_uuid == record.user_uuid).first()
+        user = db.query(User).filter(User.username == record.user_uuid).first()
     if user is None:
         user = db.query(User).filter(User.id == record.user_id).first()
     if user is None:
@@ -433,8 +424,6 @@ def rotate_refresh_token(
 
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
-
-    fallback_expired_user_to_free(db, user)
 
     record.revoked_at = utcnow_naive()
     new_refresh_token, _ = create_refresh_token(db, user, session_id=record.session_id)
@@ -501,10 +490,6 @@ def _get_user_from_access_token(token: str, db: Session) -> Optional[User]:
         username = str(payload.get("sub") or "").strip()
 
     query = db.query(User)
-    if user_uuid:
-        user = query.filter(User.user_uuid == user_uuid).first()
-        if user is not None:
-            return user
     if user_id is not None:
         user = query.filter(User.id == user_id).first()
         if user is not None:
@@ -527,7 +512,7 @@ def resolve_authenticated_user(
         session_record = get_active_portal_session(request, db)
         if session_record is not None:
             if session_record.user_uuid:
-                user = db.query(User).filter(User.user_uuid == session_record.user_uuid).first()
+                user = db.query(User).filter(User.username == session_record.user_uuid).first()
             if user is None:
                 user = db.query(User).filter(User.id == session_record.user_id).first()
 
@@ -539,11 +524,6 @@ def resolve_authenticated_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "user_inactive", "message": "User is inactive"},
         )
-
-    if not allow_expired:
-        downgraded, _ = fallback_expired_user_to_free(db, user)
-        if downgraded:
-            db.commit()
 
     return user
 

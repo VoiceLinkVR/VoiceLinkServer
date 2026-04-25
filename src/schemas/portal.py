@@ -136,6 +136,8 @@ class PortalOrderResponse(BaseModel):
     createdAt: Optional[str] = None
     payUrl: str = ""
     cancellable: bool = False
+    activationError: str = ""
+    activationErrorAt: Optional[str] = None
 
 
 class PortalBillingPlanResponse(BaseModel):
@@ -189,6 +191,7 @@ class PortalBillingGuideResponse(BaseModel):
     displayResourceSummary: str
     anchorReason: str
     allowedActions: List[str]
+    upgradeChargeMonths: int = 1
     renewOption: PortalBillingGuideOptionResponse
     upgradeOption: PortalBillingGuideOptionResponse
     addonOption: PortalBillingAddonGuideResponse

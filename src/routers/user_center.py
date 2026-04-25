@@ -147,12 +147,15 @@ def _calculate_addon_resource_from_amount(amount: float) -> int:
     return max(0, units) * increment
 
 
-def _build_payment_guide_token(username: str, payload: Dict[str, Any]) -> str:
+def _build_payment_guide_token(username: str, payload: Dict[str, Any], *, user_uuid: Optional[str] = None) -> str:
+    token_payload = dict(payload)
+    if user_uuid:
+        token_payload["user_uuid"] = user_uuid
     return afdian_service.build_custom_id(
         username=username,
         password="guide",
         action="payment_guide",
-        extra_payload=payload,
+        extra_payload=token_payload,
     )
 
 
@@ -504,6 +507,21 @@ def _is_first_purchase_like(user: Optional[User | V2User], is_expired: bool) -> 
     current_price, _ = _get_user_price_and_limit_rule(user)
     return current_price <= PRICE_EPSILON
 
+
+def _resolve_upgrade_charge_months(user: Optional[User | V2User]) -> int:
+    if user is None:
+        return 1
+
+    expiration_utc = _normalize_naive_utc(getattr(user, "expiration_date", None))
+    now_utc = _utc_now_naive()
+    if expiration_utc is None or expiration_utc <= now_utc:
+        return 1
+
+    renew_day_unit = max(1, int(settings.AFDIAN_RENEW_DAYS))
+    remaining_days = max(0.0, (expiration_utc - now_utc).total_seconds()) / 86400.0
+    charge_months = math.ceil(remaining_days / float(renew_day_unit))
+    return _normalize_months(charge_months or 1)
+
 def _get_subscription_pricing_mode() -> str:
     mode = get_subscription_mode()
     if mode in {SUBSCRIPTION_MODE_FIXED_TIERS, SUBSCRIPTION_MODE_LADDER}:
@@ -575,6 +593,7 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
     is_free_plan = current_price <= PRICE_EPSILON
     current_price_rounded = round(float(current_price), 2)
     all_paid_prices = list(_list_paid_tier_prices())
+    upgrade_charge_months = _resolve_upgrade_charge_months(user)
     renew_prices = (
         all_paid_prices
         if (not is_registered) or is_free_plan or is_expired
@@ -606,7 +625,11 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
         "effective_rule": effective_rule,
         "is_expired": is_expired,
     }
-    guide_token = _build_payment_guide_token(username, guide_payload)
+    guide_token = _build_payment_guide_token(
+        username,
+        guide_payload,
+        user_uuid=(getattr(user, "user_uuid", None) or "").strip() or None if user is not None else None,
+    )
 
     renew_default_price = renew_prices[0] if renew_prices else current_price_rounded
     if is_registered and current_price_rounded in renew_prices:
@@ -665,6 +688,7 @@ def _build_payment_guide_response(user: Optional[User], username: str) -> Dict[s
         "display_resource_summary": display_resource_summary,
         "anchor_reason": anchor_reason,
         "allowed_actions": allowed_actions,
+        "upgrade_charge_months": upgrade_charge_months,
         "renew_option": renew_option,
         "upgrade_option": upgrade_option,
         "addon_option": addon_option,
@@ -862,6 +886,83 @@ def _record_order_activation_failure(
         }
     )
     db.commit()
+
+
+def _validate_remote_order_snapshot_consistency(
+    db: Session,
+    local_order: PaymentOrder,
+    *,
+    source: str,
+    remote_order: dict,
+    source_payload: Optional[dict],
+    months: int,
+    requested_amount: float,
+    actual_amount: Optional[float],
+) -> None:
+    remote_month_raw = remote_order.get("month")
+    remote_month: Optional[int] = None
+    if remote_month_raw not in (None, ""):
+        try:
+            remote_month = _normalize_months(remote_month_raw)
+        except HTTPException:
+            remote_month = None
+
+    if remote_month is not None and remote_month != months:
+        detail = f"订单月份与系统订单不一致（系统 {months} 个月，支付 {remote_month} 个月）"
+        _record_order_activation_failure(
+            db,
+            local_order,
+            detail,
+            source,
+            remote_order,
+            source_payload,
+            {
+                "expected_months": months,
+                "remote_month": remote_month,
+                "expected_amount": requested_amount,
+                "actual_amount": actual_amount,
+            },
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+    if actual_amount is None:
+        detail = "订单支付金额缺失，无法完成激活"
+        _record_order_activation_failure(
+            db,
+            local_order,
+            detail,
+            source,
+            remote_order,
+            source_payload,
+            {
+                "expected_months": months,
+                "remote_month": remote_month,
+                "expected_amount": requested_amount,
+                "actual_amount": actual_amount,
+            },
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+    if abs(float(actual_amount) - float(requested_amount)) > PRICE_EPSILON:
+        detail = (
+            "订单支付金额与系统订单不一致"
+            f"（系统 {requested_amount:.2f} 元，支付 {float(actual_amount):.2f} 元）"
+        )
+        _record_order_activation_failure(
+            db,
+            local_order,
+            detail,
+            source,
+            remote_order,
+            source_payload,
+            {
+                "expected_months": months,
+                "remote_month": remote_month,
+                "expected_amount": requested_amount,
+                "actual_amount": actual_amount,
+            },
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
 
 def _clear_order_activation_failure(order: PaymentOrder) -> None:
@@ -1107,22 +1208,16 @@ async def activate_remote_afdian_order(
     requested_amount = _safe_parse_amount(requested_amount_raw)
     if requested_amount is None:
         requested_amount = round(plan_price if action == "addon" else plan_price * months, 2)
-    if amount + PRICE_EPSILON < requested_amount:
-        detail = "订单支付金额不足，无法完成激活"
-        _record_order_activation_failure(
-            db,
-            local_order,
-            detail,
-            source,
-            remote_order,
-            source_payload,
-            {
-                "custom_payload": custom_payload,
-                "requested_amount": requested_amount,
-                "actual_amount": amount,
-            },
-        )
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    _validate_remote_order_snapshot_consistency(
+        db,
+        local_order,
+        source=source,
+        remote_order=remote_order,
+        source_payload=source_payload,
+        months=months,
+        requested_amount=requested_amount,
+        actual_amount=amount,
+    )
 
     current_price, _ = _get_user_price_and_limit_rule(user)
     is_expired, _ = is_user_expired(user)
@@ -1254,8 +1349,8 @@ async def activate_remote_afdian_order(
     set_payment_order_custom_id(local_order, custom_id)
     set_payment_order_remark(local_order, custom_id)
     local_order.username = username
-    local_order.user_uuid = user.user_uuid
-    local_order.email = user.email
+    local_order.user_uuid = str(getattr(user, "user_uuid", None) or user.username or "").strip() or None
+    local_order.email = getattr(user, "email", None)
     local_order.amount = amount
     local_order.status = "activated"
     set_payment_order_snapshot(
@@ -1405,6 +1500,8 @@ async def create_payment_link(
             plan_price = _normalize_addon_amount(_get_addon_price_step() * months)
         addon_resource_amount = _calculate_addon_resource_from_amount(plan_price)
     else:
+        if action == "upgrade":
+            months = _resolve_upgrade_charge_months(user)
         if payload.target_monthly_price is not None:
             plan_price = _normalize_plan_price(payload.target_monthly_price)
         elif payload.plan_price is not None:
@@ -1452,8 +1549,8 @@ async def create_payment_link(
     set_payment_order_remark(pending, custom_id)
     pending.username = username
     if user is not None:
-        pending.user_uuid = user.user_uuid
-        pending.email = user.email
+        pending.user_uuid = str(getattr(user, "user_uuid", None) or user.username or "").strip() or None
+        pending.email = getattr(user, "email", None)
     pending.plan_id = f"{action}:{plan_price:.2f}:{months}"
     pending.billing_version = 1
     pending.action = action
@@ -1644,8 +1741,8 @@ async def activate_order(
     set_payment_order_custom_id(local_order, custom_id)
     set_payment_order_remark(local_order, custom_id)
     local_order.username = username
-    local_order.user_uuid = user.user_uuid
-    local_order.email = user.email
+    local_order.user_uuid = str(getattr(user, "user_uuid", None) or user.username or "").strip() or None
+    local_order.email = getattr(user, "email", None)
     local_order.plan_id = f"{action}:{plan_price:.2f}:{months}"
     local_order.billing_version = 1
     local_order.action = action
@@ -1725,6 +1822,7 @@ async def activate_order_v2(
 
 @router.post("/afdian/webhook")
 async def afdian_webhook(request: Request, background_tasks: BackgroundTasks):
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     try:
         payload = await request.json()
     except Exception as exc:

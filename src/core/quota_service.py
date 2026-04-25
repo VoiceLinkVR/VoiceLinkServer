@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 
 from core.config import settings
 from core.dependencies import get_effective_user_limit_rule, normalize_expiration_utc
-from db.models import RequestLog, User, V2RequestLog, V2User
+from core.v2_request_metrics import get_subject_daily_usage_row, resolve_usage_subject_for_user
+from db.models import RequestLog, User, V2User
 
 DAY_LIMIT_RULE_PATTERN = re.compile(r"^\s*(\d+)\s*/\s*day\s*$", re.IGNORECASE)
 
@@ -91,10 +92,6 @@ def get_available_addon_balance(user: User | V2User, now_utc: Optional[datetime]
     return balance
 
 
-def _request_log_model_for_user(user: User | V2User):
-    return V2RequestLog if isinstance(user, V2User) else RequestLog
-
-
 def get_today_daily_resource_used(
     db: Session,
     user: User | V2User,
@@ -102,33 +99,50 @@ def get_today_daily_resource_used(
     *,
     client_ip: str | None = None,
 ) -> int:
+    if isinstance(user, V2User):
+        subject = resolve_usage_subject_for_user(user, client_ip=client_ip)
+        if subject is None:
+            return 0
+        subject_type, subject_key = subject
+        usage_row = get_subject_daily_usage_row(
+            db,
+            subject_type=subject_type,
+            subject_key=subject_key,
+            usage_date=(now_utc or datetime.now(timezone.utc)).date(),
+        )
+        if usage_row is None:
+            return 0
+        return int(getattr(usage_row, "daily_resource_used", 0) or 0)
+
     day_start, day_end = _utc_day_range(now_utc)
-    request_log_model = _request_log_model_for_user(user)
     query = (
-        db.query(func.sum(request_log_model.resource_cost))
+        db.query(func.sum(RequestLog.resource_cost))
         .filter(
-            request_log_model.timestamp >= day_start,
-            request_log_model.timestamp < day_end,
-            request_log_model.status == "success",
-            request_log_model.resource_deducted == True,  # noqa: E712
+            RequestLog.timestamp >= day_start,
+            RequestLog.timestamp < day_end,
+            RequestLog.status == "success",
+            RequestLog.resource_deducted == True,  # noqa: E712
             or_(
-                request_log_model.quota_source == QUOTA_SOURCE_DAILY,
-                request_log_model.quota_source == QUOTA_SOURCE_NONE,
-                request_log_model.quota_source.is_(None),
+                RequestLog.quota_source == QUOTA_SOURCE_DAILY,
+                RequestLog.quota_source == QUOTA_SOURCE_NONE,
+                RequestLog.quota_source.is_(None),
             ),
         )
     )
 
     if bool(getattr(user, "is_default_test_user", False)) and client_ip:
         query = query.filter(
-            request_log_model.user_uuid == user.user_uuid,
-            request_log_model.ip == client_ip,
-            request_log_model.quota_scope == "ip",
+            RequestLog.user_uuid == str(getattr(user, "user_uuid", None) or user.username or "").strip(),
+            RequestLog.ip == client_ip,
+            RequestLog.quota_scope == "ip",
         )
     else:
         query = query.filter(
-            or_(request_log_model.user_uuid == user.user_uuid, request_log_model.username == user.username),
-            or_(request_log_model.quota_scope == "user", request_log_model.quota_scope.is_(None)),
+            or_(
+                RequestLog.user_uuid == str(getattr(user, "user_uuid", None) or user.username or "").strip(),
+                RequestLog.username == user.username,
+            ),
+            or_(RequestLog.quota_scope == "user", RequestLog.quota_scope.is_(None)),
         )
 
     total = query.scalar()
@@ -226,9 +240,7 @@ def commit_quota_allocation(db: Session, allocation: Optional[QuotaAllocation]) 
     if allocation is None or not is_new_quota_mode_enabled():
         return allocation
 
-    user = db.query(User).filter(User.user_uuid == allocation.user_uuid).with_for_update().first()
-    if user is None:
-        user = db.query(User).filter(User.username == allocation.username).with_for_update().first()
+    user = db.query(User).filter(User.username == allocation.username).with_for_update().first()
     if user is None:
         user = db.query(V2User).filter(V2User.user_uuid == allocation.user_uuid).with_for_update().first()
     if user is None:

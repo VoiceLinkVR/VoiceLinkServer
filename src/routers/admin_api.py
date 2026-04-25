@@ -6,18 +6,20 @@ import core.content_service as content_service
 import core.site_config_service as site_config_service
 from core.config import settings
 from core.dependencies import (
-    authenticate_user,
-    get_current_admin_user,
     get_db,
     hash_password,
-    issue_login_artifacts,
     normalize_email,
-    resolve_authenticated_user,
-    revoke_user_session,
     utcnow_naive,
 )
 from core.rate_limiter import enforce_auth_attempt_rate_limit
-from db.models import User
+from core.v2_dependencies import (
+    authenticate_v2_user,
+    get_current_admin_v2_user,
+    issue_v2_login_artifacts,
+    resolve_authenticated_v2_user,
+    revoke_v2_user_session,
+)
+from db.models import V2User
 from routers.user_center import activate_afdian_order_by_lookup
 from schemas.admin import (
     AdminAnnouncementCreateRequest,
@@ -45,13 +47,13 @@ from schemas.admin import (
 router = APIRouter()
 
 
-def _serialize_admin_user(user: User) -> AdminUserResponse:
+def _serialize_admin_user(user: V2User) -> AdminUserResponse:
     return AdminUserResponse(**admin_service.serialize_admin_user(user))
 
 
-def _current_admin_if_any(request: Request, db: Session) -> User | None:
+def _current_admin_if_any(request: Request, db: Session) -> V2User | None:
     try:
-        session_user = resolve_authenticated_user(request, db)
+        session_user = resolve_authenticated_v2_user(request, db)
     except HTTPException:
         return None
     if session_user is None or not session_user.is_admin:
@@ -74,7 +76,7 @@ def _resolve_request_ip(request: Request) -> str:
 async def auth_state(request: Request, db: Session = Depends(get_db)):
     current_admin = _current_admin_if_any(request, db)
     return AdminAuthStateResponse(
-        has_admin=db.query(User).filter(User.is_admin == True).count() > 0,  # noqa: E712
+        has_admin=db.query(V2User).filter(V2User.is_admin == True).count() > 0,  # noqa: E712
         user=_serialize_admin_user(current_admin) if current_admin else None,
     )
 
@@ -85,30 +87,31 @@ async def bootstrap_admin(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    if db.query(User).filter(User.is_admin == True).count() > 0:  # noqa: E712
+    if db.query(V2User).filter(V2User.is_admin == True).count() > 0:  # noqa: E712
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Admin already exists")
 
     username = payload.username.strip()
     email = normalize_email(payload.email) if payload.email else None
-    if db.query(User).filter(User.username == username).first() is not None:
+    if db.query(V2User).filter(V2User.username == username).first() is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already exists")
-    if email and db.query(User).filter(User.email == email).first() is not None:
+    if email and db.query(V2User).filter(V2User.email == email).first() is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already exists")
 
-    user = User(
+    user = V2User(
         username=username,
         password=hash_password(payload.password),
-        email=email,
-        email_verified=False,
+        email=email or "",
+        email_verified=bool(email),
         is_admin=True,
         is_active=True,
+        identity_version=2,
         created_at=utcnow_naive(),
         last_login_at=utcnow_naive(),
     )
     db.add(user)
     db.flush()
 
-    access_token, refresh_token, _ = issue_login_artifacts(db, user, request)
+    access_token, refresh_token, _ = issue_v2_login_artifacts(db, user, request)
     db.commit()
     db.refresh(user)
 
@@ -132,14 +135,14 @@ async def login_admin(
         identity=payload.login,
         identity_limit=settings.ADMIN_LOGIN_IDENTITY_LIMIT,
     )
-    user = authenticate_user(db, payload.login.strip(), payload.password)
+    user = authenticate_v2_user(db, payload.login.strip(), payload.password)
     if user is None or not user.is_admin:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
 
     user.last_login_at = utcnow_naive()
-    access_token, refresh_token, _ = issue_login_artifacts(db, user, request)
+    access_token, refresh_token, _ = issue_v2_login_artifacts(db, user, request)
     db.commit()
     db.refresh(user)
 
@@ -154,30 +157,30 @@ async def login_admin(
 async def logout_admin(
     request: Request,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
 ):
-    revoke_user_session(db, request)
+    revoke_v2_user_session(db, request)
     db.commit()
     return {"message": "Logged out"}
 
 
 @router.get("/auth/me", response_model=AdminUserResponse)
-async def me_admin(current_user: User = Depends(get_current_admin_user)):
+async def me_admin(current_user: V2User = Depends(get_current_admin_v2_user)):
     return _serialize_admin_user(current_user)
 
 
 @router.get("/dashboard/summary")
-async def dashboard_summary(_: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+async def dashboard_summary(_: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     return admin_service.build_dashboard_summary(db)
 
 
 @router.get("/users")
-async def list_users(_: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+async def list_users(_: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     return admin_service.list_users_payload(db)
 
 
 @router.get("/users/{user_id}")
-async def get_user(user_id: int, _: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+async def get_user(user_id: int, _: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     try:
         return admin_service.get_user_detail_payload(db, user_id)
     except ValueError as exc:
@@ -187,7 +190,7 @@ async def get_user(user_id: int, _: User = Depends(get_current_admin_user), db: 
 @router.post("/users")
 async def create_user(
     payload: AdminUserCreateRequest,
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -200,7 +203,7 @@ async def create_user(
 async def update_user(
     user_id: int,
     payload: AdminUserUpdateRequest,
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -214,7 +217,7 @@ async def update_user(
 async def update_user_entitlements(
     user_id: int,
     payload: AdminUserEntitlementCorrectionRequest,
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -227,10 +230,10 @@ async def update_user_entitlements(
 @router.delete("/users/{user_id}")
 async def delete_user(
     user_id: int,
-    current_user: User = Depends(get_current_admin_user),
+    current_user: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
-    target = db.query(User).filter(User.id == user_id).first()
+    target = db.query(V2User).filter(V2User.id == user_id).first()
     if target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     if target.id == current_user.id:
@@ -239,14 +242,14 @@ async def delete_user(
 
 
 @router.get("/orders")
-async def list_orders(_: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+async def list_orders(_: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     return admin_service.list_orders_payload(db)
 
 
 @router.post("/orders/lookup")
 async def lookup_order(
     payload: AdminOrderLookupRequest,
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     return await admin_service.lookup_afdian_order_payload(db, payload.keyword)
@@ -255,7 +258,7 @@ async def lookup_order(
 @router.post("/orders/activate")
 async def activate_order(
     payload: AdminOrderActivateRequest,
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     out_trade_no, remark_or_custom_id = admin_service.resolve_activate_lookup(db, payload.keyword)
@@ -274,7 +277,7 @@ async def activate_order(
 
 
 @router.get("/orders/{order_id}")
-async def get_order(order_id: int, _: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+async def get_order(order_id: int, _: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     try:
         return admin_service.get_order_detail_payload(db, order_id)
     except ValueError as exc:
@@ -282,19 +285,19 @@ async def get_order(order_id: int, _: User = Depends(get_current_admin_user), db
 
 
 @router.get("/stats")
-async def stats(hour: str | None = None, _: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+async def stats(hour: str | None = None, _: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     return admin_service.build_stats_payload(db, hour)
 
 
 @router.get("/content/announcements", response_model=AdminAnnouncementListResponse)
-async def list_announcements(_: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+async def list_announcements(_: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     return content_service.list_admin_announcements_payload(db)
 
 
 @router.post("/content/announcements")
 async def create_announcement(
     payload: AdminAnnouncementCreateRequest,
-    current_user: User = Depends(get_current_admin_user),
+    current_user: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     return content_service.create_announcement(db, current_user, payload)
@@ -304,7 +307,7 @@ async def create_announcement(
 async def update_announcement(
     item_id: int,
     payload: AdminAnnouncementUpdateRequest,
-    current_user: User = Depends(get_current_admin_user),
+    current_user: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -316,7 +319,7 @@ async def update_announcement(
 @router.delete("/content/announcements/{item_id}")
 async def delete_announcement(
     item_id: int,
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -326,14 +329,14 @@ async def delete_announcement(
 
 
 @router.get("/content/faqs", response_model=AdminFaqListResponse)
-async def list_faqs(_: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+async def list_faqs(_: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     return content_service.list_admin_faqs_payload(db)
 
 
 @router.post("/content/faqs")
 async def create_faq(
     payload: AdminFaqCreateRequest,
-    current_user: User = Depends(get_current_admin_user),
+    current_user: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     return content_service.create_faq(db, current_user, payload)
@@ -343,7 +346,7 @@ async def create_faq(
 async def update_faq(
     item_id: int,
     payload: AdminFaqUpdateRequest,
-    current_user: User = Depends(get_current_admin_user),
+    current_user: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -355,7 +358,7 @@ async def update_faq(
 @router.delete("/content/faqs/{item_id}")
 async def delete_faq(
     item_id: int,
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -367,7 +370,7 @@ async def delete_faq(
 @router.get("/configs", response_model=AdminSiteConfigListResponse)
 async def list_site_configs(
     group: str | None = Query(default=None, max_length=64),
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -380,7 +383,7 @@ async def list_site_configs(
 async def update_site_configs(
     payload: AdminSiteConfigUpdateRequest,
     request: Request,
-    current_user: User = Depends(get_current_admin_user),
+    current_user: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -401,7 +404,7 @@ async def list_site_config_audit_logs(
     config_key: str | None = Query(default=None, max_length=100),
     group: str | None = Query(default=None, max_length=64),
     limit: int = Query(default=100, ge=1, le=500),
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -418,7 +421,7 @@ async def list_site_config_audit_logs(
 @router.post("/afdian/parse-token")
 async def parse_afdian_token(
     payload: AdminOrderLookupRequest,
-    _: User = Depends(get_current_admin_user),
+    _: V2User = Depends(get_current_admin_v2_user),
 ):
     try:
         return admin_service.parse_afdian_token_payload(payload.keyword)

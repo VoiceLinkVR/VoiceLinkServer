@@ -36,14 +36,11 @@ def validate_password_strength(password: str, *, context: str = "password") -> s
     if any(char.isspace() for char in value):
         raise ValueError(f"{context} must not contain spaces")
 
-    categories = (
-        any(char.islower() for char in value),
-        any(char.isupper() for char in value),
-        any(char.isdigit() for char in value),
-        any(not char.isalnum() for char in value),
-    )
-    if sum(bool(category) for category in categories) < 3:
-        raise ValueError(f"{context} must include at least three of: lowercase, uppercase, number, symbol")
+    has_lower = any(char.islower() for char in value)
+    has_upper = any(char.isupper() for char in value)
+    has_digit = any(char.isdigit() for char in value)
+    if not (has_lower and has_upper and has_digit):
+        raise ValueError(f"{context} must include lowercase, uppercase, and number")
 
     lowered = value.lower()
     if lowered in COMMON_PASSWORDS:

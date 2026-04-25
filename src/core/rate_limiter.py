@@ -4,17 +4,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request, status
 from limits import parse
 from limits.storage import storage_from_string
 from limits.strategies import MovingWindowRateLimiter
 from sqlalchemy.orm import Session
 
 from core.config import settings
-from core.dependencies import get_current_user, get_db, get_effective_user_limit_rule
+from core.dependencies import get_db, get_effective_user_limit_rule, oauth2_scheme, resolve_authenticated_user
 from core.logging_config import logger
 from core.quota_service import prepare_quota_allocation
-from db.models import User
+from core.v2_dependencies import resolve_authenticated_v2_user
+from db.models import User, V2User
 
 DEFAULT_GLOBAL_LIMIT = "3000/hour"
 FALLBACK_USER_LIMIT = "800/day;8/minute"
@@ -22,6 +23,12 @@ SHARED_LIMIT_SCOPE = "shared_limit_scope"
 USER_CENTER_LIMIT = "8/minute"
 USER_CENTER_SCOPE = "user_center"
 AUTH_LIMIT_STATUS_MAX = 499
+WEBSITE_RATE_LIMIT_EXEMPT_PREFIXES = (
+    "/v2/auth",
+    "/v2/api/account",
+    "/v2/api/billing",
+    "/v2/api/content",
+)
 
 
 def _utc_day_bucket() -> str:
@@ -66,6 +73,11 @@ def get_client_ip(request: Request) -> str:
     if request.client:
         return request.client.host
     return "unknown"
+
+
+def is_website_rate_limit_exempt_path(path: str) -> bool:
+    normalized = str(path or "").strip()
+    return any(normalized.startswith(prefix) for prefix in WEBSITE_RATE_LIMIT_EXEMPT_PREFIXES)
 
 
 @dataclass
@@ -181,11 +193,31 @@ class RateLimiter:
 rate_limiter = RateLimiter(settings.LIMITER_REDIS_URL)
 
 
+async def _resolve_rate_limited_user(
+    request: Request,
+    token: Optional[str],
+    db: Session,
+) -> User | V2User:
+    user: User | V2User | None = None
+    if request.scope.get("path", "").startswith("/v2/"):
+        user = resolve_authenticated_v2_user(request, db, token=token)
+    if user is None:
+        user = resolve_authenticated_user(request, db, token=token)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+
 async def enforce_user_rate_limit(
     request: Request,
-    current_user: User = Depends(get_current_user),
+    token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
-) -> User:
+) -> User | V2User:
+    current_user = await _resolve_rate_limited_user(request, token, db)
     client_ip = get_client_ip(request)
     request.state.quota_user = current_user
     request.state.quota_db = db
@@ -260,6 +292,8 @@ def enforce_auth_attempt_rate_limit(
     identity_limit: Optional[str] = None,
 ) -> None:
     if not rate_limiter.enabled:
+        return
+    if is_website_rate_limit_exempt_path(request.url.path):
         return
 
     contexts: list[RateLimitContext] = []

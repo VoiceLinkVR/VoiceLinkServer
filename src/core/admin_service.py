@@ -2,12 +2,13 @@ import json
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import case, desc, func, or_, text
+from sqlalchemy import case, desc, func, literal, or_, text
 from sqlalchemy.orm import Session
 
 from core.afdian_service import afdian_service
 from core.dependencies import hash_password, normalize_email, utcnow_naive
 from core.entitlement_service import (
+    build_subscription_snapshot_for_existing_values,
     ensure_user_entitlement_state,
     rebuild_user_entitlement_state_from_legacy_fields,
     reset_user_entitlements_to_free,
@@ -15,7 +16,17 @@ from core.entitlement_service import (
 )
 from core.logging_config import logger
 from core.plan_catalog import get_free_plan
-from db.models import PaymentOrder, RequestLog, User, V2RequestLog, normalize_payment_lookup_value, payment_lookup_digest
+from core.v2_request_metrics import V2_METRIC_EXCLUDED_ENDPOINTS, V2_METRIC_EXCLUDED_PREFIXES
+from db.models import (
+    LegacyRequestLog,
+    PaymentOrder,
+    RequestLog,
+    V2EndpointHourlyStats,
+    V2RequestAuditLog,
+    V2User,
+    normalize_payment_lookup_value,
+    payment_lookup_digest,
+)
 
 LOCAL_TIME_OFFSET_HOURS = 8
 MAX_HOUR_OPTIONS = 168
@@ -66,7 +77,7 @@ def _to_utc_iso(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat().replace("+00:00", "Z")
 
 
-def serialize_admin_user(user: User) -> dict[str, Any]:
+def serialize_admin_user(user: V2User) -> dict[str, Any]:
     return {
         "id": str(user.id),
         "username": user.username,
@@ -207,7 +218,7 @@ def _build_user_afdian_summary_map(db: Session) -> dict[str, dict[str, Any]]:
     return summary_map
 
 
-def _serialize_user_record(db: Session, user: User, afdian_summary: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def _serialize_user_record(db: Session, user: V2User, afdian_summary: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     subscription_state, addon_wallet = ensure_user_entitlement_state(db, user)
     rate_limit_rule = (getattr(subscription_state, "rate_limit_rule", None) or "").strip()
     current_quota_label = f"{int(subscription_state.daily_quota or 0)}/day"
@@ -251,23 +262,23 @@ def _serialize_user_record(db: Session, user: User, afdian_summary: Optional[dic
 
 def list_users_payload(db: Session) -> dict[str, Any]:
     close_expired_pending_orders(db)
-    users = db.query(User).order_by(desc(User.created_at), desc(User.id)).all()
+    users = db.query(V2User).order_by(desc(V2User.created_at), desc(V2User.id)).all()
     afdian_summary_map = _build_user_afdian_summary_map(db)
 
     now = datetime.now()
     soon = now + timedelta(days=7)
     summary = {
-        "total_users": db.query(func.count(User.id)).scalar() or 0,
-        "admin_users": db.query(func.count(User.id)).filter(User.is_admin == True).scalar() or 0,  # noqa: E712
-        "active_users": db.query(func.count(User.id)).filter(User.is_active == True).scalar() or 0,  # noqa: E712
-        "non_permanent_users": db.query(func.count(User.id)).filter(User.expiration_date.isnot(None)).scalar() or 0,
+        "total_users": db.query(func.count(V2User.id)).scalar() or 0,
+        "admin_users": db.query(func.count(V2User.id)).filter(V2User.is_admin == True).scalar() or 0,  # noqa: E712
+        "active_users": db.query(func.count(V2User.id)).filter(V2User.is_active == True).scalar() or 0,  # noqa: E712
+        "non_permanent_users": db.query(func.count(V2User.id)).filter(V2User.expiration_date.isnot(None)).scalar() or 0,
         "expiring_in_7_days": (
-            db.query(func.count(User.id))
+            db.query(func.count(V2User.id))
             .filter(
-                User.expiration_date.isnot(None),
-                User.is_active == True,  # noqa: E712
-                User.expiration_date >= now,
-                User.expiration_date <= soon,
+                V2User.expiration_date.isnot(None),
+                V2User.is_active == True,  # noqa: E712
+                V2User.expiration_date >= now,
+                V2User.expiration_date <= soon,
             )
             .scalar()
             or 0
@@ -281,7 +292,7 @@ def list_users_payload(db: Session) -> dict[str, Any]:
 
 def get_user_detail_payload(db: Session, user_id: int) -> dict[str, Any]:
     close_expired_pending_orders(db)
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(V2User).filter(V2User.id == user_id).first()
     if user is None:
         raise ValueError("User not found")
 
@@ -318,16 +329,17 @@ def get_user_detail_payload(db: Session, user_id: int) -> dict[str, Any]:
 def create_user(db: Session, payload: Any) -> dict[str, Any]:
     username = payload.username.strip()
     email = normalize_email(payload.email) if payload.email else None
-    if db.query(User).filter(User.username == username).first() is not None:
+    if db.query(V2User).filter(V2User.username == username).first() is not None:
         raise ValueError("Username already exists")
-    if email and db.query(User).filter(User.email == email).first() is not None:
+    if email and db.query(V2User).filter(V2User.email == email).first() is not None:
         raise ValueError("Email already exists")
 
-    user = User(
+    user = V2User(
         username=username,
         password=hash_password(payload.password),
-        email=email,
+        email=email or "",
         email_verified=False,
+        identity_version=2,
         is_admin=bool(payload.is_admin),
         is_active=bool(payload.is_active),
         limit_rule=payload.limit_rule,
@@ -343,13 +355,13 @@ def create_user(db: Session, payload: Any) -> dict[str, Any]:
 
 
 def update_user(db: Session, user_id: int, payload: Any) -> dict[str, Any]:
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(V2User).filter(V2User.id == user_id).first()
     if user is None:
         raise ValueError("User not found")
 
     if payload.username is not None:
         username = payload.username.strip()
-        exists = db.query(User).filter(User.username == username, User.id != user_id).first()
+        exists = db.query(V2User).filter(V2User.username == username, V2User.id != user_id).first()
         if exists is not None:
             raise ValueError("Username already exists")
         user.username = username
@@ -357,7 +369,7 @@ def update_user(db: Session, user_id: int, payload: Any) -> dict[str, Any]:
     if payload.email is not None:
         email = normalize_email(payload.email) if payload.email else None
         if email:
-            exists = db.query(User).filter(User.email == email, User.id != user_id).first()
+            exists = db.query(V2User).filter(V2User.email == email, V2User.id != user_id).first()
             if exists is not None:
                 raise ValueError("Email already exists")
         user.email = email
@@ -380,7 +392,7 @@ def update_user(db: Session, user_id: int, payload: Any) -> dict[str, Any]:
 
 
 def update_user_manual_entitlement(db: Session, user_id: int, payload: Any) -> dict[str, Any]:
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(V2User).filter(V2User.id == user_id).first()
     if user is None:
         raise ValueError("User not found")
 
@@ -393,20 +405,67 @@ def update_user_manual_entitlement(db: Session, user_id: int, payload: Any) -> d
             clear_addon=bool(getattr(payload, "clear_addon", False)),
         )
     else:
-        if payload.plan_price is not None:
-            subscription_state.plan_price = round(float(payload.plan_price or 0), 2)
-        if payload.daily_quota is not None:
-            subscription_state.daily_quota = int(payload.daily_quota or 0)
-        if payload.pricing_mode is not None:
-            subscription_state.pricing_mode = payload.pricing_mode
-        if payload.plan_ref is not None:
-            subscription_state.plan_ref = (payload.plan_ref or "").strip() or subscription_state.plan_ref
-        if payload.subscription_status is not None:
-            subscription_state.status = payload.subscription_status
-        if payload.subscription_expires_at is not None or payload.subscription_status == "free":
-            subscription_state.expires_at = None if payload.subscription_status == "free" else payload.subscription_expires_at
-        if payload.rate_limit_rule is not None:
-            subscription_state.rate_limit_rule = (payload.rate_limit_rule or "").strip()
+        free_plan = get_free_plan()
+        free_daily_quota = int(free_plan["daily_quota"])
+
+        requested_plan_price = (
+            round(float(payload.plan_price or 0), 2)
+            if payload.plan_price is not None
+            else round(float(subscription_state.plan_price or 0), 2)
+        )
+        requested_daily_quota = (
+            int(payload.daily_quota or 0)
+            if payload.daily_quota is not None
+            else int(subscription_state.daily_quota or 0)
+        )
+        requested_pricing_mode = (
+            str(payload.pricing_mode or "").strip().lower()
+            if payload.pricing_mode is not None
+            else str(subscription_state.pricing_mode or "").strip().lower()
+        )
+        requested_plan_ref = (
+            (payload.plan_ref or "").strip()
+            if payload.plan_ref is not None
+            else str(subscription_state.plan_ref or "").strip()
+        )
+        requested_status = (
+            str(payload.subscription_status or "").strip().lower()
+            if payload.subscription_status is not None
+            else str(subscription_state.status or "free").strip().lower()
+        )
+        requested_expires_at = payload.subscription_expires_at if payload.subscription_expires_at is not None else subscription_state.expires_at
+        requested_rate_limit_rule = (
+            (payload.rate_limit_rule or "").strip()
+            if payload.rate_limit_rule is not None
+            else str(subscription_state.rate_limit_rule or "").strip()
+        )
+        explicit_rate_limit_rule_provided = payload.rate_limit_rule is not None
+
+        wants_paid_snapshot = requested_plan_price > 0 or requested_daily_quota > free_daily_quota
+        if wants_paid_snapshot and requested_status == "free":
+            requested_status = "active"
+
+        resolved_pricing_mode = None if requested_pricing_mode in {"", "free"} and wants_paid_snapshot else (requested_pricing_mode or None)
+        snapshot = build_subscription_snapshot_for_existing_values(
+            requested_plan_price,
+            daily_quota=requested_daily_quota or None,
+            rate_limit_rule=requested_rate_limit_rule if explicit_rate_limit_rule_provided else None,
+            pricing_mode=resolved_pricing_mode,
+        )
+
+        subscription_state.plan_price = round(float(snapshot["plan_price"] or 0), 2)
+        subscription_state.plan_ref = str(snapshot["plan_ref"])
+        subscription_state.pricing_mode = str(snapshot["pricing_mode"])
+        subscription_state.daily_quota = int(snapshot["daily_quota"])
+        subscription_state.rate_limit_rule = (
+            requested_rate_limit_rule
+            if explicit_rate_limit_rule_provided and requested_rate_limit_rule == ""
+            else str(snapshot["rate_limit_rule"] or "")
+        )
+        if requested_plan_ref and requested_plan_ref.lower() != "free" and subscription_state.plan_price > 0:
+            subscription_state.plan_ref = requested_plan_ref
+        subscription_state.status = "free" if subscription_state.plan_price <= 0 or requested_status == "free" else requested_status
+        subscription_state.expires_at = None if subscription_state.status == "free" else requested_expires_at
 
         if bool(getattr(payload, "clear_addon", False)):
             addon_wallet.balance = 0
@@ -422,7 +481,6 @@ def update_user_manual_entitlement(db: Session, user_id: int, payload: Any) -> d
             addon_wallet.expires_at = None if bool(getattr(payload, "clear_addon", False)) else payload.addon_expires_at
 
         if float(subscription_state.plan_price or 0) <= 0 or subscription_state.status == "free":
-            free_plan = get_free_plan()
             subscription_state.plan_price = 0
             subscription_state.plan_ref = str(free_plan["id"])
             subscription_state.pricing_mode = "free"
@@ -467,7 +525,7 @@ def update_user_manual_entitlement(db: Session, user_id: int, payload: Any) -> d
 
 
 def delete_user(db: Session, user_id: int) -> dict[str, Any]:
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(V2User).filter(V2User.id == user_id).first()
     if user is None:
         raise ValueError("User not found")
     username = user.username
@@ -687,9 +745,7 @@ def parse_afdian_token_payload(token: str) -> dict[str, Any]:
 
 
 def _stats_log_model(db: Session):
-    if db.query(func.count(V2RequestLog.id)).scalar():
-        return V2RequestLog
-    return RequestLog
+    return LegacyRequestLog
 
 
 def _endpoint_filters(log_model):
@@ -751,8 +807,10 @@ def _get_utc_hour_range(selected_hour: str):
     return utc_start, utc_start + timedelta(hours=1)
 
 
-def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict[str, Any]:
+def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict[str, Any]:
     log_model = _stats_log_model(db)
+    status_column = getattr(log_model, "status", None)
+    resource_cost_column = getattr(log_model, "resource_cost", None)
     hour_expr = _get_local_hour_expr(db, log_model)
     date_expr = _get_local_date_expr(db, log_model)
     hours = _get_recent_hours(db, hour_expr, log_model)
@@ -770,6 +828,26 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
     duration_stats = []
     top_endpoints = []
 
+    def success_case(label: str):
+        if status_column is None:
+            return func.count().label(label)
+        return func.sum(case((status_column == "success", 1), else_=0)).label(label)
+
+    def failed_case(label: str):
+        if status_column is None:
+            return literal(0).label(label)
+        return func.sum(case((status_column == "failed", 1), else_=0)).label(label)
+
+    def rate_limited_case(label: str):
+        if status_column is None:
+            return literal(0).label(label)
+        return func.sum(case((status_column == "rate_limited", 1), else_=0)).label(label)
+
+    def resource_cost_sum(label: str):
+        if resource_cost_column is None:
+            return literal(0).label(label)
+        return func.coalesce(func.sum(resource_cost_column), 0).label(label)
+
     if selected_hour:
         hour_start_utc, hour_end_utc = _get_utc_hour_range(selected_hour)
         base_filters = [
@@ -780,10 +858,10 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
 
         summary_row = (
             db.query(
-                func.sum(case((log_model.status == "success", 1), else_=0)).label("total_success"),
-                func.sum(case((log_model.status == "failed", 1), else_=0)).label("total_fail"),
-                func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("total_rate_limited"),
-                func.sum(log_model.resource_cost).label("total_resource_cost"),
+                success_case("total_success"),
+                failed_case("total_fail"),
+                rate_limited_case("total_rate_limited"),
+                resource_cost_sum("total_resource_cost"),
                 func.count().label("total_count"),
             )
             .filter(*base_filters)
@@ -802,10 +880,10 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
                 log_model.username,
                 log_model.ip,
                 log_model.endpoint,
-                func.sum(case((log_model.status == "success", 1), else_=0)).label("success_count"),
-                func.sum(case((log_model.status == "failed", 1), else_=0)).label("fail_count"),
-                func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
-                func.sum(log_model.resource_cost).label("resource_cost"),
+                success_case("success_count"),
+                failed_case("fail_count"),
+                rate_limited_case("rate_limited_count"),
+                resource_cost_sum("resource_cost"),
                 total_count_col,
             )
             .filter(*base_filters)
@@ -819,10 +897,10 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
         top_endpoints = (
             db.query(
                 log_model.endpoint,
-                func.sum(case((log_model.status == "success", 1), else_=0)).label("success_count"),
-                func.sum(case((log_model.status == "failed", 1), else_=0)).label("fail_count"),
-                func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
-                func.sum(log_model.resource_cost).label("resource_cost"),
+                success_case("success_count"),
+                failed_case("fail_count"),
+                rate_limited_case("rate_limited_count"),
+                resource_cost_sum("resource_cost"),
                 endpoint_total_col,
             )
             .filter(*base_filters)
@@ -881,10 +959,10 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
     daily_rows = (
         db.query(
             date_expr.label("day"),
-            func.sum(case((log_model.status == "success", 1), else_=0)).label("daily_success"),
-            func.sum(case((log_model.status == "failed", 1), else_=0)).label("daily_fail"),
-            func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("daily_rate_limited"),
-            func.sum(log_model.resource_cost).label("daily_resource_cost"),
+            success_case("daily_success"),
+            failed_case("daily_fail"),
+            rate_limited_case("daily_rate_limited"),
+            resource_cost_sum("daily_resource_cost"),
             func.count().label("daily_total"),
         )
         .filter(log_model.timestamp >= utc_start_dt, log_model.timestamp < utc_end_dt, *_endpoint_filters(log_model))
@@ -971,3 +1049,272 @@ def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict
             "max_detail_rows": MAX_DETAIL_ROWS,
         },
     }
+
+
+def _has_v2_stats_data(db: Session) -> bool:
+    return (
+        db.query(V2EndpointHourlyStats.id).first() is not None
+        or db.query(V2RequestAuditLog.id).first() is not None
+    )
+
+
+def _v2_audit_filters():
+    filters = [V2RequestAuditLog.endpoint.notin_(list(V2_METRIC_EXCLUDED_ENDPOINTS))]
+    for prefix in V2_METRIC_EXCLUDED_PREFIXES:
+        filters.append(V2RequestAuditLog.endpoint.notlike(f"{prefix}%"))
+    return filters
+
+
+def _local_hour_from_utc_naive(value: datetime) -> str:
+    return (value.replace(tzinfo=timezone.utc) + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)).strftime("%Y-%m-%d %H:00")
+
+
+def _build_v2_recent_hours(db: Session) -> list[str]:
+    latest_hour = db.query(func.max(V2EndpointHourlyStats.stat_hour)).scalar()
+    if not latest_hour:
+        return []
+
+    recent_start = latest_hour - timedelta(days=14)
+    rows = (
+        db.query(V2EndpointHourlyStats.stat_hour)
+        .filter(V2EndpointHourlyStats.stat_hour >= recent_start)
+        .group_by(V2EndpointHourlyStats.stat_hour)
+        .order_by(desc(V2EndpointHourlyStats.stat_hour))
+        .limit(MAX_HOUR_OPTIONS)
+        .all()
+    )
+    return [_local_hour_from_utc_naive(row[0]) for row in rows if row and row[0] is not None]
+
+
+def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict[str, Any]:
+    hours = _build_v2_recent_hours(db)
+    selected_hour = _normalize_hour(selected_hour_param, hours)
+
+    if selected_hour and selected_hour not in hours:
+        hours = [selected_hour, *hours[: MAX_HOUR_OPTIONS - 1]]
+
+    total_success = 0
+    total_fail = 0
+    total_rate_limited = 0
+    total_resource_cost = 0
+    total_count = 0
+    hourly_stats = []
+    duration_stats = []
+    top_endpoints = []
+
+    if selected_hour:
+        hour_start_utc, hour_end_utc = _get_utc_hour_range(selected_hour)
+        summary_row = (
+            db.query(
+                func.sum(V2EndpointHourlyStats.success_count).label("total_success"),
+                func.sum(V2EndpointHourlyStats.failed_count).label("total_fail"),
+                func.sum(V2EndpointHourlyStats.rate_limited_count).label("total_rate_limited"),
+                func.sum(V2EndpointHourlyStats.resource_cost_sum).label("total_resource_cost"),
+                func.sum(V2EndpointHourlyStats.total_count).label("total_count"),
+            )
+            .filter(
+                V2EndpointHourlyStats.stat_hour >= hour_start_utc,
+                V2EndpointHourlyStats.stat_hour < hour_end_utc,
+            )
+            .first()
+        )
+        if summary_row:
+            total_success = int(summary_row.total_success or 0)
+            total_fail = int(summary_row.total_fail or 0)
+            total_rate_limited = int(summary_row.total_rate_limited or 0)
+            total_resource_cost = int(summary_row.total_resource_cost or 0)
+            total_count = int(summary_row.total_count or 0)
+
+        endpoint_total_col = func.sum(V2EndpointHourlyStats.total_count).label("endpoint_total")
+        top_endpoints = (
+            db.query(
+                V2EndpointHourlyStats.endpoint,
+                func.sum(V2EndpointHourlyStats.success_count).label("success_count"),
+                func.sum(V2EndpointHourlyStats.failed_count).label("fail_count"),
+                func.sum(V2EndpointHourlyStats.rate_limited_count).label("rate_limited_count"),
+                func.sum(V2EndpointHourlyStats.resource_cost_sum).label("resource_cost"),
+                endpoint_total_col,
+            )
+            .filter(
+                V2EndpointHourlyStats.stat_hour >= hour_start_utc,
+                V2EndpointHourlyStats.stat_hour < hour_end_utc,
+            )
+            .group_by(V2EndpointHourlyStats.endpoint)
+            .order_by(desc(endpoint_total_col))
+            .limit(8)
+            .all()
+        )
+
+        audit_filters = [
+            V2RequestAuditLog.created_at >= hour_start_utc,
+            V2RequestAuditLog.created_at < hour_end_utc,
+            *_v2_audit_filters(),
+        ]
+        total_count_col = func.count().label("total_count")
+        hourly_stats = (
+            db.query(
+                V2RequestAuditLog.username,
+                V2RequestAuditLog.ip,
+                V2RequestAuditLog.endpoint,
+                func.sum(case((V2RequestAuditLog.status == "success", 1), else_=0)).label("success_count"),
+                func.sum(case((V2RequestAuditLog.status == "failed", 1), else_=0)).label("fail_count"),
+                func.sum(case((V2RequestAuditLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+                func.sum(V2RequestAuditLog.resource_cost).label("resource_cost"),
+                total_count_col,
+            )
+            .filter(*audit_filters)
+            .group_by(V2RequestAuditLog.username, V2RequestAuditLog.ip, V2RequestAuditLog.endpoint)
+            .order_by(desc(total_count_col))
+            .limit(MAX_DETAIL_ROWS)
+            .all()
+        )
+
+        duration_range = case(
+            (V2RequestAuditLog.duration_ms < 500, "0-0.5s"),
+            (V2RequestAuditLog.duration_ms < 1000, "0.5-1s"),
+            (V2RequestAuditLog.duration_ms < 2000, "1-2s"),
+            (V2RequestAuditLog.duration_ms < 3000, "2-3s"),
+            (V2RequestAuditLog.duration_ms < 4000, "3-4s"),
+            (V2RequestAuditLog.duration_ms < 6000, "4-6s"),
+            (V2RequestAuditLog.duration_ms < 10000, "5-10s"),
+            (V2RequestAuditLog.duration_ms < 20000, "10-20s"),
+            (V2RequestAuditLog.duration_ms < 30000, "20-30s"),
+            (V2RequestAuditLog.duration_ms < 50000, "30-50s"),
+            else_="50+s",
+        ).label("duration_range")
+        bucket_order = case(
+            (V2RequestAuditLog.duration_ms < 500, 1),
+            (V2RequestAuditLog.duration_ms < 1000, 2),
+            (V2RequestAuditLog.duration_ms < 2000, 3),
+            (V2RequestAuditLog.duration_ms < 3000, 4),
+            (V2RequestAuditLog.duration_ms < 4000, 5),
+            (V2RequestAuditLog.duration_ms < 6000, 6),
+            (V2RequestAuditLog.duration_ms < 10000, 7),
+            (V2RequestAuditLog.duration_ms < 20000, 8),
+            (V2RequestAuditLog.duration_ms < 30000, 9),
+            (V2RequestAuditLog.duration_ms < 50000, 10),
+            else_=11,
+        ).label("bucket_order")
+        duration_stats = (
+            db.query(duration_range, func.count().label("count"), bucket_order)
+            .filter(*audit_filters)
+            .group_by(duration_range, bucket_order)
+            .order_by(bucket_order)
+            .all()
+        )
+
+    if selected_hour:
+        local_end_day = datetime.strptime(selected_hour.split()[0], "%Y-%m-%d").date()
+    else:
+        local_end_day = (datetime.utcnow() + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)).date()
+    local_start_day = local_end_day - timedelta(days=6)
+
+    local_start_dt = datetime.combine(local_start_day, time.min)
+    local_end_exclusive = datetime.combine(local_end_day + timedelta(days=1), time.min)
+    utc_start_dt = local_start_dt - timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
+    utc_end_dt = local_end_exclusive - timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
+    daily_rows = (
+        db.query(
+            V2EndpointHourlyStats.stat_hour,
+            V2EndpointHourlyStats.success_count,
+            V2EndpointHourlyStats.failed_count,
+            V2EndpointHourlyStats.rate_limited_count,
+            V2EndpointHourlyStats.resource_cost_sum,
+            V2EndpointHourlyStats.total_count,
+        )
+        .filter(V2EndpointHourlyStats.stat_hour >= utc_start_dt, V2EndpointHourlyStats.stat_hour < utc_end_dt)
+        .all()
+    )
+
+    daily_map: dict[str, dict[str, Any]] = {}
+    for row in daily_rows:
+        day_key = _local_hour_from_utc_naive(row.stat_hour).split(" ")[0]
+        target = daily_map.setdefault(
+            day_key,
+            {
+                "day": day_key,
+                "daily_success": 0,
+                "daily_fail": 0,
+                "daily_rate_limited": 0,
+                "daily_resource_cost": 0,
+                "daily_total": 0,
+            },
+        )
+        target["daily_success"] += int(row.success_count or 0)
+        target["daily_fail"] += int(row.failed_count or 0)
+        target["daily_rate_limited"] += int(row.rate_limited_count or 0)
+        target["daily_resource_cost"] += int(row.resource_cost_sum or 0)
+        target["daily_total"] += int(row.total_count or 0)
+
+    daily_stats = []
+    for day_offset in range(7):
+        day_text = (local_start_day + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        daily_stats.append(
+            daily_map.get(
+                day_text,
+                {
+                    "day": day_text,
+                    "daily_success": 0,
+                    "daily_fail": 0,
+                    "daily_rate_limited": 0,
+                    "daily_resource_cost": 0,
+                    "daily_total": 0,
+                },
+            )
+        )
+
+    return {
+        "selected_hour": selected_hour,
+        "hours": hours,
+        "summary": {
+            "total_success": total_success,
+            "total_fail": total_fail,
+            "total_rate_limited": total_rate_limited,
+            "total_resource_cost": total_resource_cost,
+            "total_count": total_count,
+            "success_rate": round((total_success / total_count) * 100, 2) if total_count else 0,
+            "fail_rate": round((total_fail / total_count) * 100, 2) if total_count else 0,
+            "rate_limited_rate": round((total_rate_limited / total_count) * 100, 2) if total_count else 0,
+            "resource_per_request": round((total_resource_cost / total_count), 2) if total_count else 0,
+        },
+        "date_filter_info": {
+            "start_date": local_start_day.strftime("%Y-%m-%d"),
+            "end_date": local_end_day.strftime("%Y-%m-%d"),
+        },
+        "daily_stats": daily_stats,
+        "duration_stats": [{"duration_range": row.duration_range, "count": row.count} for row in duration_stats],
+        "top_endpoints": [
+            {
+                "endpoint": row.endpoint,
+                "success_count": int(row.success_count or 0),
+                "fail_count": int(row.fail_count or 0),
+                "rate_limited_count": int(row.rate_limited_count or 0),
+                "resource_cost": int(row.resource_cost or 0),
+                "total_count": int(row.endpoint_total or 0),
+            }
+            for row in top_endpoints
+        ],
+        "hourly_stats": [
+            {
+                "username": row.username or "anonymous",
+                "ip": row.ip,
+                "endpoint": row.endpoint,
+                "success_count": int(row.success_count or 0),
+                "fail_count": int(row.fail_count or 0),
+                "rate_limited_count": int(row.rate_limited_count or 0),
+                "resource_cost": int(row.resource_cost or 0),
+                "total_count": int(row.total_count or 0),
+            }
+            for row in hourly_stats
+        ],
+        "meta": {
+            "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "max_detail_rows": MAX_DETAIL_ROWS,
+        },
+    }
+
+
+def build_stats_payload(db: Session, selected_hour_param: Optional[str]) -> dict[str, Any]:
+    if _has_v2_stats_data(db):
+        return _build_v2_stats_payload(db, selected_hour_param)
+    return _build_legacy_stats_payload(db, selected_hour_param)

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import Depends, HTTPException, Request, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from core.config import settings
@@ -14,9 +15,7 @@ from core.dependencies import (
     _request_user_agent,
     clear_portal_session,
     create_access_token,
-    fallback_expired_user_to_free,
     get_db,
-    get_active_user_session_by_id,
     normalize_email,
     normalize_expiration_utc,
     oauth2_scheme,
@@ -28,6 +27,8 @@ from core.dependencies import (
 from core.entitlement_service import reset_user_entitlements_to_free
 from core.plan_catalog import build_limit_rule, get_free_plan
 from db.models import DeviceAuthorization, RefreshToken, UserSession, V2User
+
+REFRESH_TOKEN_IDEMPOTENCY_WINDOW = timedelta(seconds=10)
 
 
 def fallback_expired_v2_user_to_free(db: Session, user: V2User) -> tuple[bool, Optional[datetime]]:
@@ -42,7 +43,12 @@ def fallback_expired_v2_user_to_free(db: Session, user: V2User) -> tuple[bool, O
 
 def authenticate_v2_user(db: Session, login: str, password: str) -> Optional[V2User]:
     normalized_email = normalize_email(login)
-    user = db.query(V2User).filter(V2User.email == normalized_email).first()
+    raw_login = (login or "").strip()
+    user = (
+        db.query(V2User)
+        .filter(or_(V2User.email == normalized_email, V2User.username == raw_login))
+        .first()
+    )
     if user is None or not verify_password(password, user.password):
         return None
     return user
@@ -154,6 +160,74 @@ def _create_v2_refresh_token(
     return token_value, record
 
 
+def _get_active_v2_user_session_for_update(
+    db: Session,
+    session_id: str,
+    *,
+    user_id: Optional[int] = None,
+    user_uuid: Optional[str] = None,
+) -> Optional[UserSession]:
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        return None
+
+    record = (
+        db.query(UserSession)
+        .filter(
+            UserSession.session_id == normalized_session_id,
+            UserSession.revoked_at.is_(None),
+        )
+        .with_for_update()
+        .first()
+    )
+    if record is None:
+        return None
+
+    expires_at = normalize_expiration_utc(record.expires_at)
+    if expires_at is None or expires_at <= datetime.now(timezone.utc):
+        record.revoked_at = utcnow_naive()
+        return None
+
+    if user_id is not None and int(record.user_id) != int(user_id):
+        return None
+    normalized_user_uuid = str(user_uuid or "").strip()
+    if normalized_user_uuid and (record.user_uuid or "").strip() not in {"", normalized_user_uuid}:
+        return None
+    return record
+
+
+def _revoke_active_v2_refresh_tokens_for_session(db: Session, session_id: str) -> None:
+    now = utcnow_naive()
+    records = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.session_id == session_id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .with_for_update()
+        .all()
+    )
+    for record in records:
+        record.revoked_at = now
+
+
+def _get_active_v2_refresh_token_for_session(db: Session, session_id: str) -> Optional[RefreshToken]:
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        return None
+
+    return (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.session_id == normalized_session_id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .with_for_update()
+        .order_by(RefreshToken.id.desc())
+        .first()
+    )
+
+
 def issue_v2_login_artifacts(
     db: Session,
     user: V2User,
@@ -222,9 +296,50 @@ def revoke_v2_user_session(
 
 
 def rotate_v2_refresh_token(db: Session, refresh_token: str) -> tuple[V2User, str, str]:
+    candidate_record = db.query(RefreshToken).filter(RefreshToken.token == refresh_token).first()
+    if candidate_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+
+    session_record: UserSession | None = None
+    if candidate_record.session_id:
+        session_record = _get_active_v2_user_session_for_update(
+            db,
+            candidate_record.session_id,
+            user_id=candidate_record.user_id,
+            user_uuid=candidate_record.user_uuid,
+        )
+        if session_record is None:
+            if candidate_record.revoked_at is None:
+                candidate_record.revoked_at = utcnow_naive()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+
+        db.refresh(candidate_record)
+        revoked_at_utc = normalize_expiration_utc(candidate_record.revoked_at)
+        if candidate_record.revoked_at is not None and revoked_at_utc is not None:
+            now_utc = datetime.now(timezone.utc)
+            if now_utc - revoked_at_utc <= REFRESH_TOKEN_IDEMPOTENCY_WINDOW:
+                current_refresh = _get_active_v2_refresh_token_for_session(db, candidate_record.session_id)
+                if current_refresh is not None:
+                    user = None
+                    if candidate_record.user_uuid:
+                        user = db.query(V2User).filter(V2User.user_uuid == candidate_record.user_uuid).first()
+                    if user is None:
+                        user = db.query(V2User).filter(V2User.id == candidate_record.user_id).first()
+                    if user is None:
+                        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+                    if not user.is_active:
+                        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
+
+                    session_type = (getattr(session_record, "session_type", None) or "").strip() or "portal"
+                    access_token = create_access_token(
+                        build_v2_access_token_payload(user, session_id=candidate_record.session_id, session_type=session_type)
+                    )
+                    return user, access_token, current_refresh.token
+
     record = (
         db.query(RefreshToken)
         .filter(RefreshToken.token == refresh_token, RefreshToken.revoked_at.is_(None))
+        .with_for_update()
         .first()
     )
     if record is None:
@@ -243,22 +358,18 @@ def rotate_v2_refresh_token(db: Session, refresh_token: str) -> tuple[V2User, st
     if user is None:
         record.revoked_at = utcnow_naive()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
-    if record.session_id and get_active_user_session_by_id(
-        db,
-        record.session_id,
-        user_id=record.user_id,
-        user_uuid=record.user_uuid,
-    ) is None:
-        record.revoked_at = utcnow_naive()
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
 
     fallback_expired_v2_user_to_free(db, user)
-    record.revoked_at = utcnow_naive()
+    if record.session_id:
+        _revoke_active_v2_refresh_tokens_for_session(db, record.session_id)
+    else:
+        record.revoked_at = utcnow_naive()
     new_refresh_token, _ = _create_v2_refresh_token(db, user, session_id=record.session_id)
+    session_type = (getattr(session_record, "session_type", None) or "").strip() or "portal"
     new_access_token = create_access_token(
-        build_v2_access_token_payload(user, session_id=record.session_id, session_type="portal")
+        build_v2_access_token_payload(user, session_id=record.session_id, session_type=session_type)
     )
     return user, new_access_token, new_refresh_token
 
@@ -333,6 +444,15 @@ async def get_current_v2_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
+
+
+async def get_current_admin_v2_user(current_user: V2User = Depends(get_current_v2_user)) -> V2User:
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The user doesn't have enough privileges",
+        )
+    return current_user
 
 
 def get_v2_user_by_device_authorization(db: Session, record: DeviceAuthorization) -> Optional[V2User]:

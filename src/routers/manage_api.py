@@ -3,13 +3,21 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Dict
 
+from core.config import settings
 from core.dependencies import get_db, get_current_user, get_current_admin_user, hash_password
 from core.entitlement_service import rebuild_user_entitlement_state_from_legacy_fields
 from core.security_policy import validate_password_strength
 from db.models import User
 from schemas.user import UserCreate, UserUpdate
 
-router = APIRouter()
+
+def _ensure_legacy_manage_api_enabled() -> None:
+    # Legacy manage API writes directly to the historical user table and is disabled
+    # now that the new backend uses dedicated v2_* tables.
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
+router = APIRouter(dependencies=[Depends(_ensure_legacy_manage_api_enabled)])
 
 class UserCredentials(BaseModel):
     username: str

@@ -6,7 +6,7 @@ from typing import Optional
 
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
@@ -41,12 +41,27 @@ from core.entitlement_service import (
 )
 from core.identity import has_bound_email, is_v2_identity_ready
 from core.plan_catalog import get_paid_tiers
-from core.quota_service import QUOTA_SOURCE_ADDON, QUOTA_SOURCE_DAILY, build_quota_snapshot, get_daily_subscription_limit, is_new_quota_mode_enabled
+from core.quota_service import build_quota_snapshot, get_daily_subscription_limit
 from core.rate_limiter import enforce_auth_attempt_rate_limit
+from core.v2_request_metrics import get_subject_daily_usage_row, list_subject_daily_usage_rows, resolve_usage_subject_for_user
 from core.v2_dependencies import get_current_v2_user
 from core.v2_dependencies import revoke_v2_user_session
-from db.models import PaymentOrder, RefreshToken, User, UserIdentityLink, UserSession, V2RequestLog, V2User, set_payment_order_remark
+from db.models import (
+    LegacyPaymentOrder,
+    PaymentOrder,
+    RefreshToken,
+    User,
+    UserIdentityLink,
+    UserSession,
+    V2User,
+    payment_lookup_digest,
+    set_payment_order_custom_id,
+    set_payment_order_remark,
+)
 from routers.user_center import (
+    AFDIAN_WEBHOOK_FORWARD_HEADER,
+    AFDIAN_WEBHOOK_OK,
+    _process_afdian_webhook_payload,
     PRICE_EPSILON,
     _calculate_addon_resource_from_amount,
     _calculate_daily_limit_from_price,
@@ -59,10 +74,12 @@ from routers.user_center import (
     _has_active_subscription,
     _is_first_purchase_like,
     _is_new_quota_purchase_enabled,
+    _resolve_upgrade_charge_months,
     _normalize_action,
     _normalize_addon_amount,
     _normalize_months,
     _normalize_plan_price,
+    _safe_parse_amount,
     _to_utc_iso,
     _utc_now_naive,
 )
@@ -95,19 +112,6 @@ from schemas.portal import (
 router = APIRouter()
 
 PLACEHOLDER_PORTAL_PASSWORD = "__portal_authenticated_user__"
-PORTAL_USAGE_EXCLUDED_PREFIXES = (
-    "/v2/auth",
-    "/v2/api/account",
-    "/v2/api/billing",
-    "/v2/api/content",
-    "/auth",
-    "/api/account",
-    "/api/billing",
-    "/api/content",
-    "/v2/adminapi",
-)
-
-
 def _ensure_v2_billing_enabled() -> None:
     if not settings.API_V2_ENABLED or not settings.API_V2_PORTAL_ENABLED or not settings.API_V2_BILLING_ENABLED:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
@@ -161,7 +165,7 @@ def _legacy_daily_quota_to_price(daily_quota: Optional[int]) -> Optional[float]:
     return round((normalized_quota / 1500.0) * 5.0, 2)
 
 
-def _extract_legacy_order_payload(order: PaymentOrder) -> dict[str, object]:
+def _extract_legacy_order_payload(order: LegacyPaymentOrder) -> dict[str, object]:
     raw_payload = getattr(order, "raw_payload", None)
     if not raw_payload:
         return {}
@@ -183,13 +187,13 @@ def _extract_legacy_order_payload(order: PaymentOrder) -> dict[str, object]:
 
 def _resolve_legacy_subscription_basis(db: Session, legacy_user: User) -> tuple[Optional[float], Optional[int], Optional[int]]:
     orders = (
-        db.query(PaymentOrder)
+        db.query(LegacyPaymentOrder)
         .filter(
-            or_(PaymentOrder.user_uuid == legacy_user.user_uuid, PaymentOrder.username == legacy_user.username),
-            PaymentOrder.status == "activated",
-            PaymentOrder.action != "addon",
+            LegacyPaymentOrder.username == legacy_user.username,
+            LegacyPaymentOrder.status == "activated",
+            LegacyPaymentOrder.action != "addon",
         )
-        .order_by(PaymentOrder.activated_at.desc(), PaymentOrder.updated_at.desc(), PaymentOrder.id.desc())
+        .order_by(LegacyPaymentOrder.activated_at.desc(), LegacyPaymentOrder.updated_at.desc(), LegacyPaymentOrder.id.desc())
         .all()
     )
 
@@ -401,34 +405,6 @@ def _serialize_entitlements(user: V2User, db: Session) -> PortalEntitlementRespo
     )
 
 
-def _v2_daily_resource_cost_case():
-    if is_new_quota_mode_enabled():
-        return case((V2RequestLog.quota_source == QUOTA_SOURCE_DAILY, V2RequestLog.resource_cost), else_=0)
-    return V2RequestLog.resource_cost
-
-
-def _v2_addon_resource_cost_case():
-    if is_new_quota_mode_enabled():
-        return case((V2RequestLog.quota_source == QUOTA_SOURCE_ADDON, V2RequestLog.resource_cost), else_=0)
-    return 0
-
-
-def _build_v2_usage_filters(
-    current_user: V2User,
-    *,
-    range_start: datetime,
-    range_end_exclusive: datetime,
-):
-    filters = [
-        or_(V2RequestLog.user_uuid == current_user.user_uuid, V2RequestLog.username == current_user.username),
-        V2RequestLog.timestamp >= range_start,
-        V2RequestLog.timestamp < range_end_exclusive,
-    ]
-    for prefix in PORTAL_USAGE_EXCLUDED_PREFIXES:
-        filters.append(V2RequestLog.endpoint.notlike(f"{prefix}%"))
-    return filters
-
-
 def _payment_status(raw_status: Optional[str]) -> str:
     normalized = (raw_status or "").strip().lower()
     if normalized in {"activated", "paid"}:
@@ -491,6 +467,60 @@ def _guide_option_for_action(raw_guide: dict, action: str) -> dict:
     return {}
 
 
+def _summarize_guide_token(token: str) -> dict[str, object]:
+    normalized = (token or "").strip()
+    summary: dict[str, object] = {
+        "present": bool(normalized),
+        "length": len(normalized),
+    }
+    if not normalized:
+        return summary
+
+    try:
+        payload = _parse_payment_guide_token(normalized)
+    except Exception as exc:
+        summary["parse_error"] = str(exc)
+        return summary
+
+    summary["payload"] = {
+        "username": str(payload.get("username") or "").strip() or None,
+        "user_uuid": str(payload.get("user_uuid") or "").strip() or None,
+        "current_price": payload.get("current_price"),
+        "subscription_mode": payload.get("subscription_mode"),
+        "is_expired": payload.get("is_expired"),
+        "ts": payload.get("ts"),
+    }
+    return summary
+
+
+def _build_order_intent_audit_payload(
+    current_user: V2User,
+    payload: PortalCreateOrderIntentRequest,
+    *,
+    result: dict[str, object] | None = None,
+    error_detail: str | None = None,
+) -> dict[str, object]:
+    audit_payload: dict[str, object] = {
+        "user": {
+            "user_uuid": (getattr(current_user, "user_uuid", None) or "").strip() or None,
+            "username": current_user.username,
+        },
+        "request": {
+            "planId": payload.planId,
+            "action": payload.action,
+            "months": payload.months,
+            "targetMonthlyPrice": payload.targetMonthlyPrice,
+            "addonAmount": payload.addonAmount,
+            "guideToken": _summarize_guide_token(payload.guideToken or ""),
+        },
+    }
+    if result is not None:
+        audit_payload["result"] = result
+    if error_detail:
+        audit_payload["error"] = {"detail": error_detail}
+    return audit_payload
+
+
 def _validate_checkout_request_against_guide(
     user: V2User,
     payload: PortalCreateOrderIntentRequest,
@@ -508,7 +538,11 @@ def _validate_checkout_request_against_guide(
 
     if afdian_service.is_custom_id_expired(parsed_guide):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="guideToken expired")
-    if str(parsed_guide.get("username") or "").strip() != user.username:
+    guide_user_uuid = str(parsed_guide.get("user_uuid") or "").strip()
+    if guide_user_uuid:
+        if guide_user_uuid != (user.user_uuid or "").strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="guideToken does not belong to the current account")
+    elif str(parsed_guide.get("username") or "").strip() != user.username:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="guideToken does not belong to the current account")
 
     raw_guide = _build_payment_guide_response(user, user.username)
@@ -567,6 +601,8 @@ def _serialize_order(order: PaymentOrder) -> PortalOrderResponse:
         createdAt=_format_datetime(order.created_at),
         payUrl=_build_pay_url(order) if status_text == "pending" else "",
         cancellable=status_text == "pending",
+        activationError=str(order.activation_error or "").strip(),
+        activationErrorAt=_format_datetime(order.activation_error_at),
     )
 
 
@@ -630,6 +666,7 @@ def _serialize_billing_guide(db: Session, user: V2User) -> PortalBillingGuideRes
         displayResourceSummary=str(raw.get("display_resource_summary") or ""),
         anchorReason=str(raw.get("anchor_reason") or "current"),
         allowedActions=[str(item) for item in raw.get("allowed_actions", []) if str(item).strip()],
+        upgradeChargeMonths=int(raw.get("upgrade_charge_months") or _resolve_upgrade_charge_months(user)),
         renewOption=_serialize_guide_option(raw.get("renew_option") or {}),
         upgradeOption=_serialize_guide_option(raw.get("upgrade_option") or {}),
         addonOption=_serialize_addon_guide(raw.get("addon_option") or {}),
@@ -707,6 +744,9 @@ def _resolve_plan(user: V2User, plan_id: str) -> tuple[str, int, float, float]:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Selected tier must not be lower than current tier",
         )
+
+    if action == "upgrade":
+        months = _resolve_upgrade_charge_months(user)
 
     if action == "upgrade":
         donation_amount = round(max(0.0, target_price - current_price) * months, 2)
@@ -850,7 +890,7 @@ def _ensure_identity_link(
         user_uuid=target_user.user_uuid,
         legacy_user_id=legacy_user.id,
         legacy_username=legacy_user.username,
-        legacy_email=legacy_user.email,
+        legacy_email=getattr(legacy_user, "email", None),
         link_type="legacy_password_bind",
         status="linked",
         linked_at=utcnow_naive(),
@@ -868,20 +908,61 @@ def _merge_legacy_assets(db: Session, target_user: V2User, legacy_user: User) ->
 
     _merge_legacy_subscription_value(db, target_user, legacy_user)
 
-    orders = (
-        db.query(PaymentOrder)
-        .filter(
-            or_(PaymentOrder.user_uuid == legacy_user.user_uuid, PaymentOrder.username == legacy_user.username),
-            or_(PaymentOrder.user_uuid.is_(None), PaymentOrder.user_uuid != target_user.user_uuid),
-        )
+    legacy_orders = (
+        db.query(LegacyPaymentOrder)
+        .filter(LegacyPaymentOrder.username == legacy_user.username)
+        .order_by(LegacyPaymentOrder.created_at.asc(), LegacyPaymentOrder.id.asc())
         .all()
     )
-    for order in orders:
-        order.user_uuid = target_user.user_uuid
-        if target_user.email:
-            order.email = target_user.email
-        if not order.billing_version:
-            order.billing_version = 1
+    for legacy_order in legacy_orders:
+        existing = None
+        if legacy_order.out_trade_no:
+            existing = db.query(PaymentOrder).filter(PaymentOrder.out_trade_no == legacy_order.out_trade_no).first()
+        if existing is None and legacy_order.order_no:
+            existing = db.query(PaymentOrder).filter(PaymentOrder.order_no == legacy_order.order_no).first()
+        if existing is None and legacy_order.custom_id:
+            existing = db.query(PaymentOrder).filter(PaymentOrder.custom_id_digest == payment_lookup_digest(legacy_order.custom_id)).first()
+        if existing is not None:
+            continue
+
+        cloned_order = PaymentOrder(
+            order_no=legacy_order.order_no,
+            out_trade_no=legacy_order.out_trade_no,
+            username=target_user.username,
+            user_uuid=target_user.user_uuid,
+            email=target_user.email,
+            action=legacy_order.action,
+            amount=legacy_order.amount,
+            status=legacy_order.status,
+            activated_at=legacy_order.activated_at,
+            activation_source=legacy_order.activation_source,
+            activation_error=legacy_order.activation_error,
+            activation_error_at=legacy_order.activation_error_at,
+            raw_payload=legacy_order.raw_payload,
+            created_at=legacy_order.created_at,
+            updated_at=legacy_order.updated_at,
+        )
+        set_payment_order_custom_id(cloned_order, legacy_order.custom_id)
+        set_payment_order_remark(cloned_order, legacy_order.remark)
+        legacy_payload = _extract_legacy_order_payload(legacy_order)
+        legacy_action = str(legacy_payload.get("action") or legacy_order.action or "").strip().lower() or "renew"
+        legacy_months = int(legacy_payload.get("months") or 1)
+        legacy_plan_price = _safe_parse_amount(legacy_payload.get("plan_price"))
+        if legacy_plan_price is None and legacy_order.amount is not None:
+            legacy_plan_price = round(float(legacy_order.amount) / max(1, legacy_months), 2)
+        legacy_expected_amount = _safe_parse_amount(legacy_payload.get("requested_amount"))
+        if legacy_expected_amount is None:
+            legacy_expected_amount = _safe_parse_amount(legacy_order.amount)
+        set_payment_order_snapshot(
+            cloned_order,
+            action=legacy_action,
+            plan_price=legacy_plan_price,
+            months=legacy_months,
+            expected_amount=legacy_expected_amount,
+            paid_amount=_safe_parse_amount(legacy_order.amount),
+            addon_resource_amount=int(legacy_payload.get("addon_resource_amount") or 0),
+        )
+        db.add(cloned_order)
         merged_orders += 1
 
     legacy_balance = int(getattr(legacy_user, "addon_resource_balance", 0) or 0)
@@ -897,6 +978,8 @@ def _merge_legacy_assets(db: Session, target_user: V2User, legacy_user: User) ->
 
     target_user.legacy_user_id = legacy_user.id
     rebuild_user_entitlement_state_from_legacy_fields(db, target_user)
+    legacy_user.is_active = False
+    db.flush()
     return merged_orders, merged_addons
 
 
@@ -985,94 +1068,37 @@ async def portal_usage(
             detail={"code": "date_range_too_large", "message": "date range cannot exceed 366 days"},
         )
 
-    range_start = datetime.combine(query_start_date, datetime.min.time())
-    range_end_exclusive = datetime.combine(query_end_date + timedelta(days=1), datetime.min.time())
-    base_filters = _build_v2_usage_filters(
-        current_user,
-        range_start=range_start,
-        range_end_exclusive=range_end_exclusive,
-    )
-
-    usage_row = (
-        db.query(
-            func.sum(case((V2RequestLog.status == "success", 1), else_=0)).label("success_count"),
-            func.sum(case((V2RequestLog.status == "failed", 1), else_=0)).label("failed_count"),
-            func.sum(case((V2RequestLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
-            func.sum(V2RequestLog.resource_cost).label("resource_cost_sum"),
-            func.sum(_v2_daily_resource_cost_case()).label("daily_resource_cost_sum"),
-            func.sum(_v2_addon_resource_cost_case()).label("addon_resource_cost_sum"),
-            func.sum(case((V2RequestLog.resource_deducted == True, 1), else_=0)).label("deducted_request_count"),  # noqa: E712
-            func.count().label("total_count"),
+    usage_subject = resolve_usage_subject_for_user(current_user)
+    if usage_subject is None:
+        usage_rows = []
+    else:
+        subject_type, subject_key = usage_subject
+        usage_rows = list_subject_daily_usage_rows(
+            db,
+            subject_type=subject_type,
+            subject_key=subject_key,
+            start_date=query_start_date,
+            end_date=query_end_date,
         )
-        .filter(*base_filters)
-        .first()
-    )
-
-    success_count = int((usage_row.success_count if usage_row and usage_row.success_count is not None else 0) or 0)
-    failed_count = int((usage_row.failed_count if usage_row and usage_row.failed_count is not None else 0) or 0)
-    rate_limited_count = int((usage_row.rate_limited_count if usage_row and usage_row.rate_limited_count is not None else 0) or 0)
-    resource_cost_sum = int((usage_row.resource_cost_sum if usage_row and usage_row.resource_cost_sum is not None else 0) or 0)
-    daily_resource_cost_sum = int((usage_row.daily_resource_cost_sum if usage_row and usage_row.daily_resource_cost_sum is not None else 0) or 0)
-    addon_resource_cost_sum = int((usage_row.addon_resource_cost_sum if usage_row and usage_row.addon_resource_cost_sum is not None else 0) or 0)
-    deducted_request_count = int((usage_row.deducted_request_count if usage_row and usage_row.deducted_request_count is not None else 0) or 0)
-    total_count = int((usage_row.total_count if usage_row and usage_row.total_count is not None else 0) or 0)
-
-    today_range_start = datetime.combine(today_utc, datetime.min.time())
-    today_range_end_exclusive = datetime.combine(today_utc + timedelta(days=1), datetime.min.time())
-    today_usage_row = (
-        db.query(
-            func.sum(case((V2RequestLog.status == "success", 1), else_=0)).label("success_count"),
-            func.count().label("total_count"),
-        )
-        .filter(
-            *_build_v2_usage_filters(
-                current_user,
-                range_start=today_range_start,
-                range_end_exclusive=today_range_end_exclusive,
-            )
-        )
-        .first()
-    )
-    today_success_count = int((today_usage_row.success_count if today_usage_row and today_usage_row.success_count is not None else 0) or 0)
-    today_total_count = int((today_usage_row.total_count if today_usage_row and today_usage_row.total_count is not None else 0) or 0)
 
     daily_limit = get_daily_subscription_limit(current_user)
     quota_snapshot = build_quota_snapshot(db, current_user)
 
-    date_expr = func.date(V2RequestLog.timestamp)
-    daily_rows = (
-        db.query(
-            date_expr.label("day"),
-            func.sum(case((V2RequestLog.status == "success", 1), else_=0)).label("daily_success_count"),
-            func.sum(case((V2RequestLog.status == "failed", 1), else_=0)).label("daily_failed_count"),
-            func.sum(case((V2RequestLog.status == "rate_limited", 1), else_=0)).label("daily_rate_limited_count"),
-            func.sum(V2RequestLog.resource_cost).label("daily_resource_cost"),
-            func.sum(_v2_daily_resource_cost_case()).label("daily_subscription_resource_cost"),
-            func.sum(_v2_addon_resource_cost_case()).label("daily_addon_resource_cost"),
-            func.sum(case((V2RequestLog.resource_deducted == True, 1), else_=0)).label("daily_deducted_request_count"),  # noqa: E712
-            func.count().label("daily_total_count"),
-        )
-        .filter(*base_filters)
-        .group_by(date_expr)
-        .order_by(date_expr.asc())
-        .all()
-    )
-
     daily_map = {}
-    for row in daily_rows:
-        day_text = row.day.strftime("%Y-%m-%d") if hasattr(row.day, "strftime") else str(row.day)
-        day_subscription_resource_cost = int((row.daily_subscription_resource_cost or 0) or 0)
+    for row in usage_rows:
+        day_text = row.usage_date.strftime("%Y-%m-%d") if hasattr(row.usage_date, "strftime") else str(row.usage_date)
+        day_subscription_resource_cost = int((row.daily_resource_used or 0) or 0)
         daily_map[day_text] = {
             "date": day_text,
             "day": day_text,
-            "daily_success_count": int((row.daily_success_count or 0) or 0),
-            "daily_failed_count": int((row.daily_failed_count or 0) or 0),
-            "daily_rate_limited_count": int((row.daily_rate_limited_count or 0) or 0),
-            "daily_resource_cost": int((row.daily_resource_cost or 0) or 0),
+            "daily_success_count": int((row.success_count or 0) or 0),
+            "daily_failed_count": int((row.failed_count or 0) or 0),
+            "daily_rate_limited_count": int((row.rate_limited_count or 0) or 0),
+            "daily_resource_cost": int((row.resource_cost_sum or 0) or 0),
             "daily_subscription_resource_cost": day_subscription_resource_cost,
-            "daily_addon_resource_cost": int((row.daily_addon_resource_cost or 0) or 0),
-            "daily_deducted_request_count": int((row.daily_deducted_request_count or 0) or 0),
-            "daily_total_count": int((row.daily_total_count or 0) or 0),
+            "daily_addon_resource_cost": int((row.addon_resource_used or 0) or 0),
+            "daily_deducted_request_count": int((row.deducted_request_count or 0) or 0),
+            "daily_total_count": int((row.total_count or 0) or 0),
             "daily_limit": daily_limit,
             "remaining_daily": None if daily_limit is None else max(0, daily_limit - day_subscription_resource_cost),
         }
@@ -1101,6 +1127,29 @@ async def portal_usage(
             )
         )
         cursor += timedelta(days=1)
+
+    success_count = sum(int(item["daily_success_count"] or 0) for item in daily_stats)
+    failed_count = sum(int(item["daily_failed_count"] or 0) for item in daily_stats)
+    rate_limited_count = sum(int(item["daily_rate_limited_count"] or 0) for item in daily_stats)
+    resource_cost_sum = sum(int(item["daily_resource_cost"] or 0) for item in daily_stats)
+    daily_resource_cost_sum = sum(int(item["daily_subscription_resource_cost"] or 0) for item in daily_stats)
+    addon_resource_cost_sum = sum(int(item["daily_addon_resource_cost"] or 0) for item in daily_stats)
+    deducted_request_count = sum(int(item["daily_deducted_request_count"] or 0) for item in daily_stats)
+    total_count = sum(int(item["daily_total_count"] or 0) for item in daily_stats)
+
+    if usage_subject is None:
+        today_success_count = 0
+        today_total_count = 0
+    else:
+        subject_type, subject_key = usage_subject
+        today_usage_row = get_subject_daily_usage_row(
+            db,
+            subject_type=subject_type,
+            subject_key=subject_key,
+            usage_date=today_utc,
+        )
+        today_success_count = int((getattr(today_usage_row, "success_count", 0) or 0))
+        today_total_count = int((getattr(today_usage_row, "total_count", 0) or 0))
 
     end_date_text = query_end_date.strftime("%Y-%m-%d")
     end_day_subscription_resource_cost = int(daily_map.get(end_date_text, {}).get("daily_subscription_resource_cost", 0) or 0)
@@ -1203,6 +1252,8 @@ async def portal_legacy_login(
     user = db.query(User).filter(User.username == legacy_username).first()
     if user is None or authenticate_user(db, legacy_username, payload.legacyPassword, allow_legacy_username=True) is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid legacy credentials")
+    if not bool(getattr(user, "is_active", True)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Legacy account is disabled")
     if bool(getattr(user, "is_default_test_user", False)):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Default test user cannot be migrated")
     if has_bound_email(getattr(user, "email", None)):
@@ -1210,8 +1261,8 @@ async def portal_legacy_login(
 
     return PortalLegacyLoginResponse(
         migrationRequired=True,
-        emailBound=bool(user.email),
-        emailVerified=bool(user.email_verified),
+        emailBound=bool(getattr(user, "email", None)),
+        emailVerified=bool(getattr(user, "email_verified", False)),
         legacyUserId=user.id,
         legacyUsername=user.username,
         migrationToken=_build_migration_token(user),
@@ -1237,13 +1288,17 @@ async def portal_legacy_link(
     legacy_user = db.query(User).filter(User.username == legacy_username).first()
     if legacy_user is None or authenticate_user(db, legacy_username, payload.legacyPassword, allow_legacy_username=True) is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid legacy credentials")
+    if not bool(getattr(legacy_user, "is_active", True)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Legacy account is disabled")
     if legacy_user.id == int(getattr(current_user, "legacy_user_id", 0) or 0):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current account is already this legacy account")
     if bool(getattr(legacy_user, "is_default_test_user", False)):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Default test user cannot be linked")
 
-    if current_user.email_verified and legacy_user.email_verified and current_user.email and legacy_user.email:
-        if normalize_email(current_user.email) != normalize_email(legacy_user.email):
+    legacy_email = getattr(legacy_user, "email", None)
+    legacy_email_verified = bool(getattr(legacy_user, "email_verified", False))
+    if current_user.email_verified and legacy_email_verified and current_user.email and legacy_email:
+        if normalize_email(current_user.email) != normalize_email(legacy_email):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Verified email conflict, manual merge required")
 
     _ensure_identity_link(
@@ -1436,19 +1491,60 @@ async def portal_billing_guide(
 @router.post("/billing/order-intents", response_model=PortalOrderIntentResponse)
 async def portal_create_order_intent(
     payload: PortalCreateOrderIntentRequest,
+    request: Request,
     _: None = Depends(_ensure_v2_billing_enabled),
     db: Session = Depends(get_db),
     current_user: V2User = Depends(get_current_v2_user),
 ):
     if _migration_required(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Finish account migration before billing")
-    action, months, plan_price, donation_amount = _resolve_checkout_request(current_user, payload)
-    order = _create_order_intent(db, current_user, action, months, plan_price, donation_amount)
-    return PortalOrderIntentResponse(
-        id=str(order.id),
-        status=_payment_status(order.status),
-        payUrl=_build_pay_url(order),
+    request.state.audit_payload = _build_order_intent_audit_payload(current_user, payload)
+    try:
+        action, months, plan_price, donation_amount = _resolve_checkout_request(current_user, payload)
+        order = _create_order_intent(db, current_user, action, months, plan_price, donation_amount)
+        request.state.audit_payload = _build_order_intent_audit_payload(
+            current_user,
+            payload,
+            result={
+                "order_id": str(order.id),
+                "status": _payment_status(order.status),
+                "action": action,
+                "months": months,
+                "plan_price": round(float(plan_price or 0), 2),
+                "donation_amount": round(float(donation_amount or 0), 2),
+                "pay_url_generated": bool(_build_pay_url(order)),
+            },
+        )
+        return PortalOrderIntentResponse(
+            id=str(order.id),
+            status=_payment_status(order.status),
+            payUrl=_build_pay_url(order),
+        )
+    except HTTPException as exc:
+        request.state.audit_payload = _build_order_intent_audit_payload(
+            current_user,
+            payload,
+            error_detail=str(exc.detail),
+        )
+        raise
+
+
+@router.post("/user-center/afdian/webhook")
+async def portal_afdian_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Webhook request body is not valid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Webhook request body is invalid")
+
+    background_tasks.add_task(
+        _process_afdian_webhook_payload,
+        payload,
+        request.headers.get(AFDIAN_WEBHOOK_FORWARD_HEADER) == "1",
     )
+    return AFDIAN_WEBHOOK_OK
 
 
 @router.get("/billing/order-intents/{order_id}", response_model=PortalOrderIntentResponse)

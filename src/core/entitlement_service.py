@@ -142,7 +142,10 @@ def build_subscription_snapshot_for_existing_values(
     free_quota = int(free_plan["daily_quota"])
     if normalized_price <= 0:
         if daily_quota is None or int(daily_quota or 0) <= free_quota:
-            return build_subscription_snapshot_for_price(0, pricing_mode="free")
+            snapshot = build_subscription_snapshot_for_price(0, pricing_mode="free")
+            if rate_limit_rule is not None:
+                snapshot["rate_limit_rule"] = _normalize_rate_limit_rule(rate_limit_rule)
+            return snapshot
 
     resolved_mode = pricing_mode or get_subscription_mode(catalog)
     if resolved_mode == SUBSCRIPTION_MODE_LADDER:
@@ -213,13 +216,33 @@ def build_subscription_snapshot_from_limit_rule(
     )
 
 
-def build_user_limit_rule_from_state(subscription_state: UserSubscriptionState) -> str:
-    base_rule = subscription_state.rate_limit_rule or (_default_rate_limit_rule() if float(subscription_state.plan_price or 0) <= 0 else "")
+def build_user_limit_rule_from_state(
+    subscription_state: UserSubscriptionState,
+    *,
+    honor_empty_rate_limit_rule: bool = False,
+) -> str:
+    if honor_empty_rate_limit_rule:
+        base_rule = subscription_state.rate_limit_rule or ""
+    else:
+        base_rule = subscription_state.rate_limit_rule or (_default_rate_limit_rule() if float(subscription_state.plan_price or 0) <= 0 else "")
     return build_limit_rule(
         base_rule,
         subscription_state.plan_ref or str(get_free_plan()["id"]),
         int(subscription_state.daily_quota or get_free_plan()["daily_quota"]),
     )
+
+
+def _snapshot_source(subscription_state: UserSubscriptionState) -> str:
+    raw_snapshot = getattr(subscription_state, "snapshot_json", None)
+    if not raw_snapshot:
+        return ""
+    try:
+        payload = json.loads(raw_snapshot)
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("source") or "").strip().lower()
 
 
 def _ensure_subscription_state_row(db: Session, user: User | V2User) -> UserSubscriptionState:
@@ -267,7 +290,10 @@ def sync_user_cache_from_entitlements(
     subscription_state: UserSubscriptionState,
     addon_wallet: UserAddonWallet,
 ) -> None:
-    user.limit_rule = build_user_limit_rule_from_state(subscription_state)
+    user.limit_rule = build_user_limit_rule_from_state(
+        subscription_state,
+        honor_empty_rate_limit_rule=_snapshot_source(subscription_state) == "admin_manual_correction",
+    )
     user.expiration_date = subscription_state.expires_at
     user.is_active = subscription_state.status != "inactive"
     user.boost_limit_rule = None

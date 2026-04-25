@@ -4,7 +4,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from db.models import AnnouncementEntry, FaqEntry, User
+from db.models import AnnouncementEntry, FaqEntry, V2User
 
 
 def _utc_now_naive() -> datetime:
@@ -107,7 +107,7 @@ def list_published_faqs_payload(db: Session) -> list[dict]:
     ]
 
 
-def create_announcement(db: Session, actor: User, payload) -> dict:
+def create_announcement(db: Session, actor: V2User, payload) -> dict:
     now = _utc_now_naive()
     item = AnnouncementEntry(
         title=payload.title.strip(),
@@ -128,7 +128,7 @@ def create_announcement(db: Session, actor: User, payload) -> dict:
     return _serialize_announcement(item)
 
 
-def update_announcement(db: Session, item_id: int, actor: User, payload) -> dict:
+def update_announcement(db: Session, item_id: int, actor: V2User, payload) -> dict:
     item = db.query(AnnouncementEntry).filter(AnnouncementEntry.id == item_id).first()
     if item is None:
         raise ValueError("Announcement not found")
@@ -164,7 +164,7 @@ def delete_announcement(db: Session, item_id: int) -> dict:
     return {"message": "Announcement deleted"}
 
 
-def create_faq(db: Session, actor: User, payload) -> dict:
+def create_faq(db: Session, actor: V2User, payload) -> dict:
     now = _utc_now_naive()
     item = FaqEntry(
         title=payload.title.strip(),
@@ -183,7 +183,7 @@ def create_faq(db: Session, actor: User, payload) -> dict:
     return _serialize_faq(item)
 
 
-def update_faq(db: Session, item_id: int, actor: User, payload) -> dict:
+def update_faq(db: Session, item_id: int, actor: V2User, payload) -> dict:
     item = db.query(FaqEntry).filter(FaqEntry.id == item_id).first()
     if item is None:
         raise ValueError("FAQ not found")

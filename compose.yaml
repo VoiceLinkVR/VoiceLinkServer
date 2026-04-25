@@ -113,7 +113,14 @@ services:
       - "${VOICELINK_HOST_PORT:-8980}:8980"
     volumes:
       - ${VOICELINK_DATA_VOLUME:-voice-link-vr-server-local}:/usr/src/app/data:rw
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-aaargwgwqewe}
+      SESSION_SECRET_KEY: ${SESSION_SECRET_KEY:-feefadfagagagwadsee}
+      SESSION_COOKIE_HTTPS_ONLY: ${SESSION_COOKIE_HTTPS_ONLY:-True}
+      SESSION_COOKIE_SAME_SITE: ${SESSION_COOKIE_SAME_SITE:-lax}
+      SESSION_COOKIE_MAX_AGE: ${SESSION_COOKIE_MAX_AGE:-2592000}
       WHISPER_HOST: ${WHISPER_HOST:-faster-whisper}
       WHISPER_PORT: ${WHISPER_PORT:-8000}
       WHISPER_BACKEND: ${WHISPER_BACKEND:-faster-whisper}
@@ -130,6 +137,9 @@ services:
       LIMITER_REDIS_URL: ${LIMITER_REDIS_URL:-redis://redis:6379/0}
       TTS_TOKEN: ${TTS_TOKEN:-}
       TTS_URL: ${TTS_URL:-}
+      QWEN_TTS_BASE_URL: ${QWEN_TTS_BASE_URL:-http://host.docker.internal:8010}
+      QWEN_TTS_TOKEN: ${QWEN_TTS_TOKEN:-}
+      QWEN_TTS_TIMEOUT: ${QWEN_TTS_TIMEOUT:-300}
       AFDIAN_CUSTOM_ID_KEY: ${AFDIAN_CUSTOM_ID_KEY:-change-me-to-32-byte-secret-change-me-now}
       ENABLE_WEB_TRANSLATORS: ${ENABLE_WEB_TRANSLATORS:-True}
       GEMMA_TRANSLATE_ENABLED: ${GEMMA_TRANSLATE_ENABLED:-False}
@@ -158,6 +168,7 @@ services:
       API_V2_BILLING_ENABLED: ${API_V2_BILLING_ENABLED:-False}
       API_V2_SELF_ACTIVATE_ENABLED: ${API_V2_SELF_ACTIVATE_ENABLED:-False}
       API_V2_LEGACY_MIGRATION_ENABLED: ${API_V2_LEGACY_MIGRATION_ENABLED:-True}
+      ADMIN_SURFACE_LAN_ONLY: ${ADMIN_SURFACE_LAN_ONLY:-True}
       API_V1_HOSTS: ${API_V1_HOSTS:-}
       API_V2_HOSTS: ${API_V2_HOSTS:-}
       DEFAULT_TEST_USER_ENABLED: ${DEFAULT_TEST_USER_ENABLED:-True}

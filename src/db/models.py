@@ -1,12 +1,16 @@
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, Column, Date, DateTime, Float, Integer, String, Text, UniqueConstraint
 
 from core.identity import generate_user_uuid
 
 from .base import Base
+
+
+def utcnow_naive_value() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def normalize_payment_lookup_value(value: Optional[str]) -> Optional[str]:
@@ -37,24 +41,17 @@ class User(Base):
     __tablename__ = "user"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_uuid = Column(String(36), unique=True, nullable=False, index=True, default=generate_user_uuid)
-    username = Column(String(50), unique=True, nullable=False, index=True)
+    username = Column(String(254), nullable=True, index=True)
     password = Column(String(255), nullable=False)
-    email = Column(String(255), nullable=True, index=True)
-    email_verified = Column(Boolean, default=False, nullable=False)
-    is_default_test_user = Column(Boolean, default=False, nullable=False, index=True)
-    identity_version = Column(Integer, default=1, nullable=False)
     is_admin = Column(Boolean, default=False)
-    limit_rule = Column(String(100), nullable=True)
+    limit_rule = Column(String(254), nullable=True)
     expiration_date = Column(DateTime, nullable=True)
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=False)
     boost_expiration_date = Column(DateTime, nullable=True)
     boost_limit_rule = Column(String(100), nullable=True)
-    addon_resource_balance = Column(Integer, nullable=False, default=0)
-    addon_resource_total = Column(Integer, nullable=False, default=0)
+    addon_resource_balance = Column(Integer, nullable=True, default=0)
+    addon_resource_total = Column(Integer, nullable=True, default=0)
     addon_expiration_date = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.now, nullable=True)
-    last_login_at = Column(DateTime, nullable=True)
 
 
 class V2User(Base):
@@ -67,6 +64,7 @@ class V2User(Base):
     password = Column(String(255), nullable=False)
     email = Column(String(255), nullable=False, index=True)
     email_verified = Column(Boolean, default=False, nullable=False)
+    is_default_test_user = Column(Boolean, default=False, nullable=False, index=True)
     identity_version = Column(Integer, default=2, nullable=False)
     is_admin = Column(Boolean, default=False)
     limit_rule = Column(String(100), nullable=True)
@@ -82,7 +80,7 @@ class V2User(Base):
 
 
 class UserIdentityLink(Base):
-    __tablename__ = "user_identity_link"
+    __tablename__ = "v2_user_identity_link"
 
     id = Column(Integer, primary_key=True, index=True)
     user_uuid = Column(String(36), nullable=False, index=True)
@@ -97,7 +95,7 @@ class UserIdentityLink(Base):
 
 
 class AccountToken(Base):
-    __tablename__ = "account_token"
+    __tablename__ = "v2_account_token"
 
     id = Column(Integer, primary_key=True, index=True)
     token = Column(String(255), unique=True, nullable=False, index=True)
@@ -112,7 +110,7 @@ class AccountToken(Base):
 
 
 class UserSession(Base):
-    __tablename__ = "user_session"
+    __tablename__ = "v2_user_session"
 
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String(128), unique=True, nullable=False, index=True)
@@ -128,7 +126,7 @@ class UserSession(Base):
 
 
 class RefreshToken(Base):
-    __tablename__ = "refresh_token"
+    __tablename__ = "v2_refresh_token"
 
     id = Column(Integer, primary_key=True, index=True)
     token = Column(String(255), unique=True, nullable=False, index=True)
@@ -141,7 +139,7 @@ class RefreshToken(Base):
 
 
 class DeviceAuthorization(Base):
-    __tablename__ = "device_authorization"
+    __tablename__ = "v2_device_authorization"
 
     id = Column(Integer, primary_key=True, index=True)
     device_code = Column(String(128), unique=True, nullable=False, index=True)
@@ -161,8 +159,19 @@ class DeviceAuthorization(Base):
     created_at = Column(DateTime, default=datetime.now, nullable=False)
 
 
-class RequestLog(Base):
+class LegacyRequestLog(Base):
     __tablename__ = "request_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), nullable=True)
+    ip = Column(String(45), nullable=False)
+    endpoint = Column(String(100), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.now, index=True)
+    duration = Column(Float, nullable=False)
+
+
+class RequestLog(Base):
+    __tablename__ = "v2_request_log"
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), nullable=True)
@@ -180,32 +189,120 @@ class RequestLog(Base):
     quota_source = Column(String(20), nullable=False, default="none", index=True)
 
 
-class V2RequestLog(Base):
-    __tablename__ = "v2_request_log"
+class V2RequestAuditLog(Base):
+    __tablename__ = "v2_request_audit_log"
 
     id = Column(Integer, primary_key=True, index=True)
-    request_id = Column(String(64), nullable=True, index=True)
+    request_id = Column(String(64), nullable=False, index=True)
     username = Column(String(50), nullable=True, index=True)
     user_uuid = Column(String(36), nullable=True, index=True)
-    actor_type = Column(String(32), nullable=True, default="authenticated")
+    actor_type = Column(String(32), nullable=True, default="authenticated", index=True)
     rate_limit_scope = Column(String(32), nullable=True)
-    quota_scope = Column(String(32), nullable=True)
+    quota_scope = Column(String(32), nullable=True, index=True)
     ip = Column(String(45), nullable=False, index=True)
     host = Column(String(255), nullable=True, index=True)
     method = Column(String(16), nullable=True, index=True)
     endpoint = Column(String(255), nullable=False, index=True)
-    timestamp = Column(DateTime, default=datetime.now, index=True)
-    duration = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=utcnow_naive_value, nullable=False, index=True)
+    duration_ms = Column(Integer, nullable=False, default=0)
     status = Column(String(20), nullable=False, index=True)
     status_code = Column(Integer, nullable=True, index=True)
-    resource_cost = Column(Integer, nullable=False, default=0, index=True)
+    resource_cost = Column(Integer, nullable=False, default=0)
     resource_deducted = Column(Boolean, nullable=False, default=False, index=True)
     quota_source = Column(String(20), nullable=False, default="none", index=True)
     extra_payload = Column(Text, nullable=True)
 
 
-class PaymentOrder(Base):
+class V2UsageEvent(Base):
+    __tablename__ = "v2_usage_event"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(String(64), nullable=True, index=True)
+    subject_type = Column(String(16), nullable=False, index=True)
+    subject_key = Column(String(64), nullable=False, index=True)
+    username = Column(String(50), nullable=True, index=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
+    actor_type = Column(String(32), nullable=True, default="authenticated", index=True)
+    ip = Column(String(45), nullable=True, index=True)
+    endpoint = Column(String(255), nullable=False, index=True)
+    occurred_at = Column(DateTime, default=utcnow_naive_value, nullable=False, index=True)
+    status = Column(String(20), nullable=False, index=True)
+    status_code = Column(Integer, nullable=True, index=True)
+    resource_cost = Column(Integer, nullable=False, default=0)
+    resource_deducted = Column(Boolean, nullable=False, default=False, index=True)
+    quota_source = Column(String(20), nullable=False, default="none", index=True)
+    extra_payload = Column(Text, nullable=True)
+
+
+class V2SubjectDailyUsage(Base):
+    __tablename__ = "v2_subject_daily_usage"
+    __table_args__ = (
+        UniqueConstraint("usage_date", "subject_type", "subject_key", name="uq_v2_subject_daily_usage"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    usage_date = Column(Date, nullable=False, index=True)
+    subject_type = Column(String(16), nullable=False, index=True)
+    subject_key = Column(String(64), nullable=False, index=True)
+    username = Column(String(50), nullable=True, index=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
+    success_count = Column(Integer, nullable=False, default=0)
+    failed_count = Column(Integer, nullable=False, default=0)
+    rate_limited_count = Column(Integer, nullable=False, default=0)
+    total_count = Column(Integer, nullable=False, default=0)
+    resource_cost_sum = Column(Integer, nullable=False, default=0)
+    daily_resource_used = Column(Integer, nullable=False, default=0)
+    addon_resource_used = Column(Integer, nullable=False, default=0)
+    deducted_request_count = Column(Integer, nullable=False, default=0)
+    first_request_at = Column(DateTime, nullable=True)
+    last_request_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=utcnow_naive_value, nullable=False)
+    updated_at = Column(DateTime, default=utcnow_naive_value, nullable=False, index=True)
+
+
+class V2EndpointHourlyStats(Base):
+    __tablename__ = "v2_endpoint_hourly_stats"
+    __table_args__ = (
+        UniqueConstraint("stat_hour", "endpoint", "method", name="uq_v2_endpoint_hourly_stats"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    stat_hour = Column(DateTime, nullable=False, index=True)
+    endpoint = Column(String(255), nullable=False, index=True)
+    method = Column(String(16), nullable=False, index=True)
+    success_count = Column(Integer, nullable=False, default=0)
+    failed_count = Column(Integer, nullable=False, default=0)
+    rate_limited_count = Column(Integer, nullable=False, default=0)
+    total_count = Column(Integer, nullable=False, default=0)
+    resource_cost_sum = Column(Integer, nullable=False, default=0)
+    duration_ms_sum = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=utcnow_naive_value, nullable=False)
+    updated_at = Column(DateTime, default=utcnow_naive_value, nullable=False, index=True)
+
+
+class LegacyPaymentOrder(Base):
     __tablename__ = "payment_order"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_no = Column(String(128), nullable=True, unique=True, index=True)
+    out_trade_no = Column(String(128), nullable=True, unique=True, index=True)
+    custom_id = Column(Text, nullable=True)
+    remark = Column(Text, nullable=True)
+    username = Column(String(50), nullable=True, index=True)
+    action = Column(String(32), nullable=True)
+    amount = Column(Float, nullable=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    activated_at = Column(DateTime, nullable=True)
+    activation_source = Column(String(64), nullable=True, index=True)
+    activation_error = Column(Text, nullable=True)
+    activation_error_at = Column(DateTime, nullable=True)
+    raw_payload = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
+class PaymentOrder(Base):
+    __tablename__ = "v2_payment_order"
 
     id = Column(Integer, primary_key=True, index=True)
     order_no = Column(String(128), nullable=True, unique=True, index=True)
@@ -244,7 +341,7 @@ class PaymentOrder(Base):
 
 
 class UserSubscriptionState(Base):
-    __tablename__ = "user_subscription_state"
+    __tablename__ = "v2_user_subscription_state"
 
     id = Column(Integer, primary_key=True, index=True)
     user_uuid = Column(String(36), nullable=False, unique=True, index=True)
@@ -264,7 +361,7 @@ class UserSubscriptionState(Base):
 
 
 class UserAddonWallet(Base):
-    __tablename__ = "user_addon_wallet"
+    __tablename__ = "v2_user_addon_wallet"
 
     id = Column(Integer, primary_key=True, index=True)
     user_uuid = Column(String(36), nullable=False, unique=True, index=True)
@@ -280,7 +377,7 @@ class UserAddonWallet(Base):
 
 
 class AnnouncementEntry(Base):
-    __tablename__ = "announcement_entry"
+    __tablename__ = "v2_announcement_entry"
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(200), nullable=False)
@@ -297,7 +394,7 @@ class AnnouncementEntry(Base):
 
 
 class FaqEntry(Base):
-    __tablename__ = "faq_entry"
+    __tablename__ = "v2_faq_entry"
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(200), nullable=False)
@@ -312,7 +409,7 @@ class FaqEntry(Base):
 
 
 class SiteConfig(Base):
-    __tablename__ = "site_config"
+    __tablename__ = "v2_site_config"
 
     id = Column(Integer, primary_key=True, index=True)
     config_key = Column(String(100), unique=True, nullable=False, index=True)
@@ -330,7 +427,7 @@ class SiteConfig(Base):
 
 
 class SiteConfigAuditLog(Base):
-    __tablename__ = "site_config_audit_log"
+    __tablename__ = "v2_site_config_audit_log"
 
     id = Column(Integer, primary_key=True, index=True)
     config_key = Column(String(100), nullable=False, index=True)

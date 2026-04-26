@@ -494,7 +494,7 @@ async def request_logging_middleware(request: Request, call_next):
                 )
                 if authenticated_v2_user is not None:
                     authenticated_user = authenticated_v2_user
-            if authenticated_user is None:
+            if authenticated_user is None and not is_v2_request:
                 authenticated_user = resolve_authenticated_user(
                     request,
                     db,
@@ -505,7 +505,7 @@ async def request_logging_middleware(request: Request, call_next):
 
             if authenticated_user is not None:
                 current_user = authenticated_user.username
-                current_user_uuid = authenticated_user.user_uuid
+                current_user_uuid = getattr(authenticated_user, "user_uuid", None)
                 if bool(getattr(authenticated_user, "is_default_test_user", False)):
                     actor_type = "anonymous_test"
                     rate_limit_scope = "ip"

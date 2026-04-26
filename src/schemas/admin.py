@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.security_policy import validate_password_strength
 
@@ -80,10 +80,10 @@ class AdminUserUpdateRequest(BaseModel):
 
 
 class AdminUserEntitlementCorrectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     plan_price: Optional[float] = Field(default=None, ge=0)
-    daily_quota: Optional[int] = Field(default=None, ge=0)
     pricing_mode: Optional[str] = Field(default=None, min_length=1, max_length=32)
-    plan_ref: Optional[str] = Field(default=None, max_length=100)
     subscription_status: Optional[str] = Field(default=None, min_length=1, max_length=32)
     subscription_expires_at: Optional[datetime] = None
     rate_limit_rule: Optional[str] = Field(default=None, max_length=255)

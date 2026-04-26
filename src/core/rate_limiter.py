@@ -18,7 +18,6 @@ from core.v2_dependencies import resolve_authenticated_v2_user
 from db.models import User, V2User
 
 DEFAULT_GLOBAL_LIMIT = "3000/hour"
-FALLBACK_USER_LIMIT = "800/day;8/minute"
 SHARED_LIMIT_SCOPE = "shared_limit_scope"
 USER_CENTER_LIMIT = "8/minute"
 USER_CENTER_SCOPE = "user_center"
@@ -209,11 +208,17 @@ async def _resolve_rate_limited_user(
     token: Optional[str],
     db: Session,
 ) -> User | V2User:
-    user: User | V2User | None = None
     if request.scope.get("path", "").startswith("/v2/"):
         user = resolve_authenticated_v2_user(request, db, token=token)
-    if user is None:
-        user = resolve_authenticated_user(request, db, token=token)
+        if user is not None:
+            return user
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = resolve_authenticated_user(request, db, token=token)
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -239,7 +244,7 @@ async def enforce_user_rate_limit(
     if not rate_limiter.enabled:
         return current_user
 
-    limit_rule = _strip_limit_metadata(get_effective_user_limit_rule(current_user) or "") or FALLBACK_USER_LIMIT
+    limit_rule = _strip_limit_metadata(get_effective_user_limit_rule(current_user) or "")
     is_default_test_user = bool(getattr(current_user, "is_default_test_user", False))
 
     if is_default_test_user:
@@ -253,14 +258,29 @@ async def enforce_user_rate_limit(
         )
     else:
         if not settings.LEGACY_CLIENT_COMPAT:
-            limit_rule = _strip_day_limits(limit_rule) or _strip_day_limits(FALLBACK_USER_LIMIT) or FALLBACK_USER_LIMIT
-        context = rate_limiter.create_context(
-            limit_string=limit_rule,
-            key=f"{current_user.user_uuid or current_user.username}:{_utc_day_bucket()}",
-            scope=f"user:{current_user.user_uuid or current_user.username}",
-            context_type="user",
-            deduct_when=lambda status: status == 200,
-        )
+            limit_rule = _strip_day_limits(limit_rule)
+        # 普通用户没有配置分钟/小时等频率规则时，不回退默认速率限制；
+        # 新额度模式下 /day 只作为额度规则，由 quota_service 负责。
+        context = None
+        if limit_rule:
+            user_key = (
+                str(getattr(current_user, "user_uuid", "") or "").strip()
+                if request.scope.get("path", "").startswith("/v2/")
+                else str(getattr(current_user, "user_uuid", None) or current_user.username).strip()
+            )
+            if not user_key:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Not authenticated",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            context = rate_limiter.create_context(
+                limit_string=limit_rule,
+                key=f"{user_key}:{_utc_day_bucket()}",
+                scope=f"user:{user_key}",
+                context_type="user",
+                deduct_when=lambda status: status == 200,
+            )
 
     if context:
         context.check()

@@ -406,27 +406,17 @@ def update_user_manual_entitlement(db: Session, user_id: int, payload: Any) -> d
         )
     else:
         free_plan = get_free_plan()
-        free_daily_quota = int(free_plan["daily_quota"])
-
+        plan_price_provided = payload.plan_price is not None
+        pricing_mode_provided = payload.pricing_mode is not None
         requested_plan_price = (
             round(float(payload.plan_price or 0), 2)
-            if payload.plan_price is not None
+            if plan_price_provided
             else round(float(subscription_state.plan_price or 0), 2)
-        )
-        requested_daily_quota = (
-            int(payload.daily_quota or 0)
-            if payload.daily_quota is not None
-            else int(subscription_state.daily_quota or 0)
         )
         requested_pricing_mode = (
             str(payload.pricing_mode or "").strip().lower()
-            if payload.pricing_mode is not None
+            if pricing_mode_provided
             else str(subscription_state.pricing_mode or "").strip().lower()
-        )
-        requested_plan_ref = (
-            (payload.plan_ref or "").strip()
-            if payload.plan_ref is not None
-            else str(subscription_state.plan_ref or "").strip()
         )
         requested_status = (
             str(payload.subscription_status or "").strip().lower()
@@ -441,15 +431,22 @@ def update_user_manual_entitlement(db: Session, user_id: int, payload: Any) -> d
         )
         explicit_rate_limit_rule_provided = payload.rate_limit_rule is not None
 
-        wants_paid_snapshot = requested_plan_price > 0 or requested_daily_quota > free_daily_quota
+        wants_paid_snapshot = requested_plan_price > 0
         if wants_paid_snapshot and requested_status == "free":
             requested_status = "active"
 
         resolved_pricing_mode = None if requested_pricing_mode in {"", "free"} and wants_paid_snapshot else (requested_pricing_mode or None)
+        should_rebuild_plan_snapshot = plan_price_provided or pricing_mode_provided
+        daily_quota_for_snapshot = None if should_rebuild_plan_snapshot else int(subscription_state.daily_quota or 0) or None
+        rate_limit_rule_for_snapshot = (
+            requested_rate_limit_rule
+            if explicit_rate_limit_rule_provided or not should_rebuild_plan_snapshot
+            else None
+        )
         snapshot = build_subscription_snapshot_for_existing_values(
             requested_plan_price,
-            daily_quota=requested_daily_quota or None,
-            rate_limit_rule=requested_rate_limit_rule if explicit_rate_limit_rule_provided else None,
+            daily_quota=daily_quota_for_snapshot,
+            rate_limit_rule=rate_limit_rule_for_snapshot,
             pricing_mode=resolved_pricing_mode,
         )
 
@@ -462,8 +459,6 @@ def update_user_manual_entitlement(db: Session, user_id: int, payload: Any) -> d
             if explicit_rate_limit_rule_provided and requested_rate_limit_rule == ""
             else str(snapshot["rate_limit_rule"] or "")
         )
-        if requested_plan_ref and requested_plan_ref.lower() != "free" and subscription_state.plan_price > 0:
-            subscription_state.plan_ref = requested_plan_ref
         subscription_state.status = "free" if subscription_state.plan_price <= 0 or requested_status == "free" else requested_status
         subscription_state.expires_at = None if subscription_state.status == "free" else requested_expires_at
 

@@ -8,11 +8,12 @@ import struct
 import wave
 import re
 
+from fastapi import HTTPException
 from io import BytesIO
 from openai import OpenAI, AsyncOpenAI
 import opuslib
 import emoji
-from core.config import settings, WHISPER_URL, WHISPER_TRT_URL, SENSEVOICE_URL
+from core.config import settings, WHISPER_URL
 from core.gemma_translate_service import gemma_translate, is_gemma_translation_supported
 from core.logging_config import logger
 from core.text_compressor import compress_repeated_chars
@@ -53,6 +54,108 @@ supportedLanguagesList = [
 whisperSupportedLanguageList = ["af","am","ar","as","az","ba","be","bg","bn","bo","br","bs","ca","cs","cy","da","de","el","en","es","et","eu","fa","fi","fo","fr","gl","gu","ha","haw","he","hi","hr","ht","hu","hy","id","is","it","ja","jw","ka","kk","km","kn","ko","la","lb","ln","lo","lt","lv","mg","mi","mk","ml","mn","mr","ms","mt","my","ne","nl","nn","no","oc","pa","pl","ps","pt","ro","ru","sa","sd","si","sk","sl","sn","so","sq","sr","su","sv","sw","ta","te","tg","th","tk","tl","tr","tt","uk","ur","uz","vi","yi","yo","yue","zh"]
 codeTochinese = {'af':'阿非利堪斯语','am':'阿姆哈拉语','ar':'阿拉伯语','as':'阿萨姆语','az':'阿塞拜疆语','ba':'巴什基尔语','be':'白俄罗斯语','bg':'保加利亚语','bn':'孟加拉语','bo':'藏语','br':'布列塔尼语','bs':'波斯尼亚语','ca':'加泰罗尼亚语','cs':'捷克语','cy':'威尔士语','da':'丹麦语','de':'德语','el':'希腊语','en':'英语','es':'西班牙语','et':'爱沙尼亚语','eu':'巴斯克语','fa':'波斯语','fi':'芬兰语','fo':'法罗语','fr':'法语','gl':'加利西亚语','gu':'古吉拉特语','ha':'豪萨语','haw':'夏威夷语','he':'希伯来语','hi':'印地语','hr':'克罗地亚语','ht':'海地克里奥尔语','hu':'匈牙利语','hy':'亚美尼亚语','id':'印尼语','is':'冰岛语','it':'意大利语','ja':'日语','jw':'爪哇语','ka':'格鲁吉亚语','kk':'哈萨克语','km':'高棉语','kn':'卡纳达语','ko':'韩语','la':'拉丁语','lb':'卢森堡语','ln':'林加拉语','lo':'老挝语','lt':'立陶宛语','lv':'拉脱维亚语','mg':'马达加斯加语','mi':'毛利语','mk':'马其顿语','ml':'马拉雅拉姆语','mn':'蒙古语','mr':'马拉地语','ms':'马来语','mt':'马耳他语','my':'缅甸语','ne':'尼泊尔语','nl':'荷兰语','nn':'新挪威语','no':'挪威语','oc':'奥克语','pa':'旁遮普语','pl':'波兰语','ps':'普什图语','pt':'葡萄牙语','ro':'罗马尼亚语','ru':'俄语','sa':'梵语','sd':'信德语','si':'僧伽罗语','sk':'斯洛伐克语','sl':'斯洛文尼亚语','sn':'修纳语','so':'索马里语','sq':'阿尔巴尼亚语','sr':'塞尔维亚语','su':'巽他语','sv':'瑞典语','sw':'斯瓦希里语','ta':'泰米尔语','te':'泰卢固语','tg':'塔吉克语','th':'泰语','tk':'土库曼语','tl':'他加禄语','tr':'土耳其语','tt':'鞑靼语','uk':'乌克兰语','ur':'乌尔都语','uz':'乌兹别克语','vi':'越南语','yi':'意第绪语','yo':'约鲁巴语','yue':'粤语','zh':'简体中文','zt':'繁体中文','eo':'世界语','ga':'爱尔兰语','nb':'挪威语'}
 transalte_zt = {'bing':'zh-Hant','baidu':'cht','alibaba':'zh-TW','sogou':'zh-CHT','iciba':'cnt','itranslate':'zh-TW','papago':'zh-TW'}
+
+ASR_ENGINE_ALIASES = {
+    "firered": "firered",
+    "fireredasr": "firered",
+    "fireredasr2": "firered",
+    "fireredasr2s": "firered",
+    "fire-red": "firered",
+    "fire-red-asr": "firered",
+    "sensevoice": "sensevoice",
+    "sense-voice": "sensevoice",
+    "whisper": "whisper",
+    "faster-whisper": "whisper",
+    "faster_whisper": "whisper",
+    "openai": "whisper",
+    "whisper-trt": "whisper-trt",
+    "whisper_trt": "whisper-trt",
+    "trt": "whisper-trt",
+}
+
+CHINESE_ASR_LANGUAGES = {"zh", "zt"}
+CHINESE_ONLY_ASR_ENGINES = {"firered", "sensevoice"}
+FIRERED_MIN_AUDIO_SECONDS = 0.6
+
+
+def normalize_asr_engine(engine: str | None = None) -> str:
+    requested = (engine or settings.ASR_DEFAULT_ENGINE or "firered").strip().lower()
+    normalized = ASR_ENGINE_ALIASES.get(requested)
+    if normalized:
+        return normalized
+    raise ValueError(
+        "unsupported ASR engine: "
+        f"{engine}. supported engines: firered, sensevoice, whisper, whisper-trt"
+    )
+
+
+def _default_whisper_engine() -> str:
+    return "whisper-trt" if settings.WHISPER_BACKEND == "whisper-trt" else "whisper"
+
+
+def _is_chinese_asr_language(language: str) -> bool:
+    return _canonical_lang_code(language) in CHINESE_ASR_LANGUAGES
+
+
+def resolve_asr_engine_for_language(engine: str | None, language: str) -> str:
+    selected_engine = normalize_asr_engine(engine)
+    if selected_engine in CHINESE_ONLY_ASR_ENGINES and not _is_chinese_asr_language(language):
+        return _default_whisper_engine()
+    return selected_engine
+
+
+def asr_engine_supports_direct_translation(engine: str | None = None) -> bool:
+    return normalize_asr_engine(engine) == "whisper-trt"
+
+
+def _whisper_trt_base_url() -> str:
+    return f"http://{settings.WHISPER_TRT_HOST}:{settings.WHISPER_TRT_PORT}"
+
+
+def _sensevoice_transcription_url() -> str:
+    return f"http://{settings.SENSEVOICE_HOST}:{settings.SENSEVOICE_PORT}/v1/audio/transcriptions"
+
+
+def _firered_asr_base_url() -> str:
+    return f"http://{settings.FIRERED_ASR_HOST}:{settings.FIRERED_ASR_PORT}"
+
+
+def _extract_asr_text(result: dict, log_prefix: str) -> str:
+    text = result.get("text", "")
+    if not isinstance(text, str):
+        logger.warning("[%s] Unexpected text payload type: %s", log_prefix, type(text))
+        return ""
+    return text
+
+
+def _get_wav_duration_seconds(audio_file: bytes) -> float | None:
+    if not audio_file:
+        return 0.0
+
+    try:
+        with wave.open(BytesIO(audio_file), "rb") as wf:
+            frame_count = wf.getnframes()
+            sample_rate = wf.getframerate()
+    except (wave.Error, EOFError):
+        logger.debug("[ASYNC_TRANSCRIBE_FIRERED] Skip duration check for non-WAV payload")
+        return None
+
+    if sample_rate <= 0:
+        return None
+    return frame_count / sample_rate
+
+
+def _raise_if_firered_audio_too_short(audio_file: bytes) -> None:
+    duration_seconds = _get_wav_duration_seconds(audio_file)
+    if duration_seconds is None or duration_seconds >= FIRERED_MIN_AUDIO_SECONDS:
+        return
+
+    logger.info(
+        "[ASYNC_TRANSCRIBE_FIRERED] Reject short audio: %.3fs < %.3fs",
+        duration_seconds,
+        FIRERED_MIN_AUDIO_SECONDS,
+    )
+    raise HTTPException(status_code=400, detail="音频过短")
 
 LANG_CANONICAL_MAPPING = {
     "zh": "zh",
@@ -380,6 +483,33 @@ async def async_translate_audio(audio_file: bytes) -> str:
         raise
 
 
+async def async_transcribe_sensevoice(audio_file: bytes, filename: str = "audio.wav") -> str:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            files = {'file': (filename or 'audio.wav', audio_file, 'audio/wav')}
+            response = await client.post(_sensevoice_transcription_url(), files=files)
+            response.raise_for_status()
+            return _extract_asr_text(response.json(), "ASYNC_TRANSCRIBE_SENSEVOICE")
+    except Exception as e:
+        logger.error(f"[ASYNC_TRANSCRIBE_SENSEVOICE] SenseVoice璇煶璇嗗埆澶辫触: {e}")
+        raise
+
+
+async def async_transcribe_firered(audio_file: bytes, filename: str = "audio.wav") -> str:
+    try:
+        _raise_if_firered_audio_too_short(audio_file)
+        async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
+            files = {'file': (filename or 'audio.wav', audio_file, 'application/octet-stream')}
+            response = await client.post(f"{_firered_asr_base_url()}/transcribe", files=files)
+            response.raise_for_status()
+            return _extract_asr_text(response.json(), "ASYNC_TRANSCRIBE_FIRERED")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[ASYNC_TRANSCRIBE_FIRERED] FireRedASR2S璇煶璇嗗埆澶辫触: {e}")
+        raise
+
+
 def _normalize_target_language_for_trt(language: str) -> str:
     normalized = (language or "").strip().lower()
     if normalized == "auto":
@@ -404,32 +534,70 @@ async def async_transcribe_trt(audio_file: bytes, language: str = 'zh') -> str:
                 'response_format': 'json',
             }
             response = await client.post(
-                f"{WHISPER_TRT_URL}/v1/audio/transcriptions",
+                f"{_whisper_trt_base_url()}/v1/audio/transcriptions",
                 files=files,
                 data=data,
             )
             response.raise_for_status()
-            result = response.json()
-            text = result.get("text", "")
-            if not isinstance(text, str):
-                logger.warning("[ASYNC_TRANSCRIBE_TRT] Unexpected text payload type: %s", type(text))
-                return ""
-            return text
+            return _extract_asr_text(response.json(), "ASYNC_TRANSCRIBE_TRT")
     except Exception as e:
         logger.error(f"[ASYNC_TRANSCRIBE_TRT] TRT语音识别失败: {e}")
         raise
 
 
-async def do_transcribe(audio_file: bytes, language: str = "zh") -> str:
-    if settings.WHISPER_BACKEND == "whisper-trt":
+async def do_transcribe(
+    audio_file: bytes,
+    language: str = "zh",
+    engine: str | None = None,
+    filename: str = "audio.wav",
+) -> str:
+    requested_engine = normalize_asr_engine(engine)
+    selected_engine = resolve_asr_engine_for_language(engine, language)
+    if selected_engine != requested_engine:
+        logger.info(
+            "[ASR] engine fallback: requested=%s effective=%s language=%s",
+            requested_engine,
+            selected_engine,
+            language,
+        )
+    else:
+        logger.info("[ASR] engine selected: effective=%s language=%s", selected_engine, language)
+    if selected_engine == "firered":
+        try:
+            return await async_transcribe_firered(audio_file, filename=filename)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[ASR] FireRed failed; falling back to SenseVoice for this request: %s",
+                exc,
+            )
+            return await async_transcribe_sensevoice(audio_file, filename=filename)
+    if selected_engine == "sensevoice":
+        return await async_transcribe_sensevoice(audio_file, filename=filename)
+    if selected_engine == "whisper-trt":
         return await async_transcribe_trt(audio_file, language=language)
     return await async_transcribe(audio_file, language=language)
 
 
-async def do_translate_audio(audio_file: bytes) -> str:
-    if settings.WHISPER_BACKEND == "whisper-trt":
+async def do_translate_audio(
+    audio_file: bytes,
+    engine: str | None = None,
+    filename: str = "audio.wav",
+) -> str:
+    selected_engine = normalize_asr_engine(engine)
+    if selected_engine == "whisper-trt":
         return await async_transcribe_trt(audio_file, language="en")
-    return await async_translate_audio(audio_file)
+    if selected_engine == "whisper":
+        return await async_translate_audio(audio_file)
+
+    text = await do_transcribe(audio_file, language="zh", engine=selected_engine, filename=filename)
+    if not text:
+        return ""
+    detected_source = detect_translation_source_language(text)
+    if _is_same_translation_lang(detected_source, "en"):
+        return text
+    return do_translate(text, from_=detected_source, to="en")
 
 
 def do_translate(text: str, from_: str, to: str):

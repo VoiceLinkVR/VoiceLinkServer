@@ -1,0 +1,16 @@
+services:
+  legacy-update-backend:
+    build: .
+    image: voicelink-legacy-update-backend:latest
+    container_name: voicelink-legacy-update-backend
+    restart: unless-stopped
+    ports:
+      - "8980:8980"
+    environment:
+      LEGACY_UPDATE_MANIFEST_URL: "https://cloudflarestorage.boyqiu001.top/app-releases/upload-manifest.json"
+      LEGACY_UPDATE_CACHE_SECONDS: "300"
+      LEGACY_UPDATE_FETCH_TIMEOUT: "10"
+      # If you want to pin a release instead of reading upload-manifest.json,
+      # set both variables below.
+      # LEGACY_UPDATE_VERSION: "0.7.0-beta28"
+      # LEGACY_UPDATE_PACKAGE_URL: "https://cloudflarestorage.boyqiu001.top/app-releases/VRCLS-0.7.0-beta28-win-x64-setup.exe"

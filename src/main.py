@@ -25,7 +25,7 @@ from core.v2_request_metrics import V2RequestMetricRecord, record_v2_request_met
 from core.v2_dependencies import fallback_expired_v2_user_to_free, resolve_authenticated_v2_user
 from db.base import SessionLocal, engine
 from db.models import RequestLog, V2User
-from routers import admin_api, api, auth, manage_api, portal_api, user_center, v2_tts
+from routers import admin_api, api, auth, manage_api, portal_api, public_download, user_center, v2_tts, voice_clone_presets
 
 
 def _ensure_password_column_capacity(db, inspector) -> None:
@@ -708,14 +708,17 @@ if settings.API_V1_ENABLED:
     app.include_router(manage_api.router, prefix="/v1/manageapi", tags=["V1 Management API"])
 
 if settings.API_V2_ENABLED:
+    app.include_router(public_download.router, prefix="/v2/api", tags=["V2 Public Downloads"])
     if settings.API_V2_AUTH_ENABLED:
         app.include_router(auth.router, prefix="/v2/auth", tags=["V2 Auth"])
+    app.include_router(voice_clone_presets.router, prefix="/v2/api", tags=["V2 Voice Clone Presets"])
     app.include_router(v2_tts.router, prefix="/v2/api", tags=["V2 TTS API"])
     if settings.API_V2_PORTAL_ENABLED:
         app.include_router(portal_api.router, prefix="/v2/api", tags=["V2 Portal API"])
         app.include_router(api.router, prefix="/v2/api", tags=["V2 Compat API"])
 
 app.include_router(admin_api.router, prefix="/v2/adminapi", tags=["V2 Admin API"])
+app.include_router(voice_clone_presets.admin_router, prefix="/v2/adminapi", tags=["V2 Admin Voice Clone Presets"])
 
 
 @app.get("/", include_in_schema=False)

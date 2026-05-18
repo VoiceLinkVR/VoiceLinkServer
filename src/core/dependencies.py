@@ -1,6 +1,7 @@
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generator, Optional
+from uuid import UUID
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
@@ -478,9 +479,26 @@ def validate_access_token_payload(token: str, db: Session) -> Optional[dict[str,
     return payload
 
 
+def _is_v2_access_payload(payload: dict[str, Any]) -> bool:
+    return str(payload.get("account_version") or "").strip().lower() == "v2"
+
+
+def _looks_like_user_uuid(value: Optional[str]) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return False
+    try:
+        UUID(normalized)
+    except ValueError:
+        return False
+    return True
+
+
 def _get_user_from_access_token(token: str, db: Session) -> Optional[User]:
     payload = validate_access_token_payload(token, db)
     if payload is None:
+        return None
+    if _is_v2_access_payload(payload):
         return None
 
     user_uuid = str(payload.get("user_uuid") or payload.get("sub") or "").strip()
@@ -511,8 +529,11 @@ def resolve_authenticated_user(
     if user is None:
         session_record = get_active_portal_session(request, db)
         if session_record is not None:
-            if session_record.user_uuid:
-                user = db.query(User).filter(User.username == session_record.user_uuid).first()
+            session_user_key = str(session_record.user_uuid or "").strip()
+            if session_user_key:
+                user = db.query(User).filter(User.username == session_user_key).first()
+                if user is None and _looks_like_user_uuid(session_user_key):
+                    return None
             if user is None:
                 user = db.query(User).filter(User.id == session_record.user_id).first()
 

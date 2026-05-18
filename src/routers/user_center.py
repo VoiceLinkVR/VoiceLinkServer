@@ -377,14 +377,15 @@ def _add_calendar_months(base: datetime, months: int) -> datetime:
     return normalized.replace(year=year, month=month, day=day)
 
 
-def _extend_subscription_expiration(current: Optional[datetime], months: int, *, grace_days: int = 1) -> datetime:
+def _extend_subscription_expiration(current: Optional[datetime], months: int, *, grace_days: Optional[int] = None) -> datetime:
     now_utc = _utc_now_naive()
     base = _normalize_naive_utc(current) or now_utc
     if base < now_utc:
         base = now_utc
     extended = _add_calendar_months(base, months)
-    if grace_days > 0:
-        extended += timedelta(days=grace_days)
+    effective_grace_days = int(settings.AFDIAN_RENEW_GRACE_DAYS if grace_days is None else grace_days)
+    if effective_grace_days > 0:
+        extended += timedelta(days=effective_grace_days)
     return extended
 
 
@@ -908,22 +909,12 @@ def _validate_remote_order_snapshot_consistency(
             remote_month = None
 
     if remote_month is not None and remote_month != months:
-        detail = f"订单月份与系统订单不一致（系统 {months} 个月，支付 {remote_month} 个月）"
-        _record_order_activation_failure(
-            db,
-            local_order,
-            detail,
-            source,
-            remote_order,
-            source_payload,
-            {
-                "expected_months": months,
-                "remote_month": remote_month,
-                "expected_amount": requested_amount,
-                "actual_amount": actual_amount,
-            },
+        logger.info(
+            "[USER-CENTER] Ignored Afdian month mismatch during activation. order_id=%s expected_months=%s remote_month=%s",
+            getattr(local_order, "id", None),
+            months,
+            remote_month,
         )
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
     if actual_amount is None:
         detail = "订单支付金额缺失，无法完成激活"

@@ -57,7 +57,7 @@ LANGUAGE_NAMES = {
     "tr": "Turkish",
     "uk": "Ukrainian",
     "ur": "Urdu",
-    "zh": "Chinese",
+    "zh": "Simplified Chinese",
     "zh-Hant": "Traditional Chinese",
 }
 
@@ -252,6 +252,7 @@ def _build_image_completion_prompt(source_lang: str, target_lang: str) -> str:
     mapped_source = _map_lang_code(source_lang)
     mapped_target = _map_lang_code(target_lang)
     target_name = _language_name(target_lang)
+    target_extra_instruction = _image_target_extra_instruction(mapped_target, target_name)
 
     if is_auto_lang_code(source_lang):
         return (
@@ -259,7 +260,8 @@ def _build_image_completion_prompt(source_lang: str, target_lang: str) -> str:
             f"You are a professional translator. Detect the source language text in the provided image and translate it into "
             f"{target_name} ({mapped_target}). Produce only the {target_name} translation, without any additional explanations, "
             f"alternatives or commentary. Focus only on the text, do not output where the text is located, surrounding objects "
-            f"or any other explanation about the picture. Ignore symbols, pictogram, and arrows!\n\n\n"
+            f"or any other explanation about the picture. Ignore symbols, pictogram, and arrows! "
+            f"{target_extra_instruction}\n\n\n"
             f"<__media__><end_of_turn>\n"
             f"<start_of_turn>model\n"
         )
@@ -273,10 +275,28 @@ def _build_image_completion_prompt(source_lang: str, target_lang: str) -> str:
         f"Please translate the {source_name} text in the provided image into {target_name}. Produce only the {target_name} "
         f"translation, without any additional explanations, alternatives or commentary. Focus only on the text, do not "
         f"output where the text is located, surrounding objects or any other explanation about the picture. Ignore "
-        f"symbols, pictogram, and arrows!\n\n\n"
+        f"symbols, pictogram, and arrows! {target_extra_instruction}\n\n\n"
         f"<__media__><end_of_turn>\n"
         f"<start_of_turn>model\n"
     )
+
+
+def _image_target_extra_instruction(mapped_target: str, target_name: str) -> str:
+    if mapped_target == "zh":
+        return (
+            "Use Simplified Chinese characters. If the image text is English or another Latin-script language, "
+            "translate it into Simplified Chinese instead of copying the source text unchanged. "
+            "For proper nouns, translate common words and transliterate names when needed."
+        )
+
+    if mapped_target == "zh-Hant":
+        return (
+            "Use Traditional Chinese characters. If the image text is English or another Latin-script language, "
+            "translate it into Traditional Chinese instead of copying the source text unchanged. "
+            "For proper nouns, translate common words and transliterate names when needed."
+        )
+
+    return f"Do not return the source text unchanged unless it is already valid {target_name}."
 
 
 def _build_completion_payload(

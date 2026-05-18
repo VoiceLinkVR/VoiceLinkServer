@@ -175,8 +175,23 @@ async def dashboard_summary(_: V2User = Depends(get_current_admin_v2_user), db: 
 
 
 @router.get("/users")
-async def list_users(_: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
-    return admin_service.list_users_payload(db)
+async def list_users(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    search: str | None = Query(default=None, max_length=255),
+    role: str | None = Query(default=None, max_length=32),
+    user_status: str | None = Query(default=None, alias="status", max_length=32),
+    _: V2User = Depends(get_current_admin_v2_user),
+    db: Session = Depends(get_db),
+):
+    return admin_service.list_users_payload(
+        db,
+        page=page,
+        page_size=page_size,
+        search=search,
+        role=role,
+        status_filter=user_status,
+    )
 
 
 @router.get("/users/{user_id}")
@@ -242,8 +257,34 @@ async def delete_user(
 
 
 @router.get("/orders")
-async def list_orders(_: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
-    return admin_service.list_orders_payload(db)
+async def list_orders(
+    search: str | None = Query(default=None),
+    order_status: str | None = Query(default="all", alias="status"),
+    action: str | None = Query(default="all"),
+    created_from: str | None = Query(default=None),
+    created_to: str | None = Query(default=None),
+    min_amount: float | None = Query(default=None),
+    max_amount: float | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    _: V2User = Depends(get_current_admin_v2_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return admin_service.list_orders_payload(
+            db,
+            search=search,
+            status_filter=order_status,
+            action_filter=action,
+            created_from=created_from,
+            created_to=created_to,
+            min_amount=min_amount,
+            max_amount=max_amount,
+            page=page,
+            page_size=page_size,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.post("/orders/lookup")

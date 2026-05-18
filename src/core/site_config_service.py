@@ -72,6 +72,10 @@ GROUP_DESCRIPTIONS = {
 }
 
 LABEL_OVERRIDES = {
+    "OCR_IMAGE_TRANSLATE_ENABLED": "OCR 图片翻译开关",
+    "OCR_IMAGE_TRANSLATE_BASE_URL": "OCR 图片翻译地址",
+    "OCR_IMAGE_TRANSLATE_TIMEOUT": "OCR 图片翻译超时",
+    "OCR_IMAGE_TRANSLATE_FALLBACK_TO_GEMMA": "OCR 失败回退 Gemma",
     "WHISPER_HOST": "Whisper 主机",
     "WHISPER_PORT": "Whisper 端口",
     "WHISPER_BACKEND": "Whisper 后端",
@@ -79,6 +83,10 @@ LABEL_OVERRIDES = {
     "WHISPER_TRT_PORT": "Whisper TRT 端口",
     "SENSEVOICE_HOST": "SenseVoice 主机",
     "SENSEVOICE_PORT": "SenseVoice 端口",
+    "ASR_DEFAULT_ENGINE": "默认 ASR 引擎",
+    "FIRERED_ASR_HOST": "FireRedASR2S 主机",
+    "FIRERED_ASR_PORT": "FireRedASR2S 端口",
+    "FIRERED_ASR_TIMEOUT": "FireRedASR2S 超时",
     "WHISPER_APIKEY": "Whisper API Key",
     "JWT_SECRET_KEY": "JWT 密钥",
     "SESSION_SECRET_KEY": "会话密钥",
@@ -96,8 +104,21 @@ LABEL_OVERRIDES = {
     "AFDIAN_CUSTOM_ID_KEY": "爱发电自定义 ID 密钥",
     "AFDIAN_WEBHOOK_FORWARD_URL": "Webhook 转发地址",
     "AFDIAN_WEBHOOK_FORWARD_AUTHORIZATION": "Webhook 转发鉴权",
-    "TTS_URL": "TTS 地址",
-    "TTS_TOKEN": "TTS 令牌",
+    "EDGE_TTS_ENABLED": "Edge TTS 启用开关",
+    "TTS_URL": "Edge TTS 地址",
+    "TTS_TOKEN": "Edge TTS 令牌",
+    "EDGE_TTS_TIMEOUT": "Edge TTS 超时",
+    "EDGE_TTS_MAX_INPUT_CHARS": "Edge TTS 最大输入字符数",
+    "QWEN_TTS_ENABLED": "Qwen TTS 启用开关",
+    "QWEN_TTS_BUILTIN_VOICES_ENABLED": "Qwen 内置音色启用开关",
+    "QWEN_TTS_BASE_URL": "Qwen TTS 地址",
+    "QWEN_TTS_TOKEN": "Qwen TTS 令牌",
+    "MOSS_TTS_ENABLED": "MOSS TTS 启用开关",
+    "MOSS_TTS_BASE_URL": "MOSS TTS 地址",
+    "MOSS_TTS_TOKEN": "MOSS TTS 令牌",
+    "OMNIVOICE_TTS_ENABLED": "OmniVoice TTS 启用开关",
+    "OMNIVOICE_TTS_BASE_URL": "OmniVoice TTS 地址",
+    "OMNIVOICE_TTS_TOKEN": "OmniVoice TTS 令牌",
 }
 
 PLAN_LABEL_OVERRIDES = {
@@ -163,6 +184,9 @@ SECRET_KEYS = {
     "AFDIAN_CUSTOM_ID_KEY",
     "AFDIAN_WEBHOOK_FORWARD_AUTHORIZATION",
     "TTS_TOKEN",
+    "QWEN_TTS_TOKEN",
+    "MOSS_TTS_TOKEN",
+    "OMNIVOICE_TTS_TOKEN",
     "DEFAULT_TEST_USER_PASSWORD",
 }
 
@@ -198,14 +222,21 @@ URL_KEYS = {
     "FILTER_WEB_URL",
     "PACKAGE_BASE_URL",
     "UPDATE_PUBLIC_BASE_URL",
+    "UPDATE_APP_RELEASE_MANIFEST_URL",
+    "UPDATE_APP_RELEASE_APPCAST_URL",
+    "UPDATE_APP_RELEASE_FALLBACK_URL",
     "AFDIAN_ORDER_CREATE_BASE_URL",
     "AFDIAN_QUERY_ORDER_URL",
     "AFDIAN_WEBHOOK_FORWARD_URL",
     "TTS_URL",
+    "OCR_IMAGE_TRANSLATE_BASE_URL",
+    "QWEN_TTS_BASE_URL",
+    "MOSS_TTS_BASE_URL",
+    "OMNIVOICE_TTS_BASE_URL",
 }
 REDIS_URL_KEYS = {"LIMITER_REDIS_URL"}
 EMAIL_KEYS = {"SMTP_USERNAME", "SMTP_FROM_EMAIL", "DEFAULT_TEST_USER_EMAIL"}
-HOST_KEYS = {"WHISPER_HOST", "WHISPER_TRT_HOST", "SENSEVOICE_HOST", "SMTP_HOST"}
+HOST_KEYS = {"WHISPER_HOST", "WHISPER_TRT_HOST", "SENSEVOICE_HOST", "FIRERED_ASR_HOST", "SMTP_HOST"}
 HOST_PORT_KEYS = {"GEMMA_TRANSLATE_URL"}
 PATH_KEYS = {
     "UPDATE_STATIC_ROOT",
@@ -219,6 +250,7 @@ POSITIVE_INT_KEYS = {
     "WHISPER_PORT",
     "WHISPER_TRT_PORT",
     "SENSEVOICE_PORT",
+    "FIRERED_ASR_PORT",
     "SMTP_PORT",
     "EMAIL_CODE_LENGTH",
     "EMAIL_CODE_TTL_MINUTES",
@@ -230,6 +262,7 @@ POSITIVE_INT_KEYS = {
     "SQL_MAX_OVERFLOW",
     "SQL_POOL_RECYCLE",
     "TRANSLATION_CAPABILITIES_CACHE_SECONDS",
+    "UPDATE_APP_RELEASE_CACHE_SECONDS",
     "AFDIAN_RENEW_DAYS",
     "AFDIAN_BOOST_DAYS",
     "AFDIAN_BOOST_DAILY_INCREMENT",
@@ -241,11 +274,22 @@ POSITIVE_INT_KEYS = {
     "GUEST_SESSION_EXPIRES_MINUTES",
     "TEXT_COMPRESSION_MIN_REPEAT",
     "GEMMA_TRANSLATE_MAX_TOKENS",
+    "EDGE_TTS_MAX_INPUT_CHARS",
+    "QWEN_TTS_MAX_INPUT_CHARS",
+    "MOSS_TTS_MAX_INPUT_CHARS",
+    "OMNIVOICE_TTS_MAX_INPUT_CHARS",
 }
 POSITIVE_FLOAT_KEYS = {
     "TRANSLATION_TIMEOUT",
+    "FIRERED_ASR_TIMEOUT",
     "GEMMA_TRANSLATE_TIMEOUT",
+    "OCR_IMAGE_TRANSLATE_TIMEOUT",
+    "EDGE_TTS_TIMEOUT",
+    "QWEN_TTS_TIMEOUT",
+    "MOSS_TTS_TIMEOUT",
+    "OMNIVOICE_TTS_TIMEOUT",
     "TRANSLATION_CAPABILITY_TIMEOUT",
+    "UPDATE_APP_RELEASE_FETCH_TIMEOUT",
     "AFDIAN_CUSTOM_PRICE",
     "AFDIAN_BOOST_PRICE_STEP",
     "AFDIAN_ADDON_PRICE_STEP",
@@ -253,13 +297,23 @@ POSITIVE_FLOAT_KEYS = {
 }
 LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 JWT_ALGORITHMS = {"HS256", "HS384", "HS512"}
+ASR_ENGINE_VALUES = {
+    "firered",
+    "fireredasr",
+    "fireredasr2",
+    "fireredasr2s",
+    "fire-red",
+    "fire-red-asr",
+    "sensevoice",
+    "sense-voice",
+}
 SAFE_TOKEN_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 SAFE_LIMIT_RULE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789=;_./,:- ")
 SAFE_SIMPLE_TEXT_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
 
 def _infer_group(key: str) -> str:
-    if key.startswith(("WHISPER_", "SENSEVOICE_")):
+    if key.startswith(("ASR_", "FIRERED_ASR_", "WHISPER_", "SENSEVOICE_")):
         return "speech"
     if key.startswith(("JWT_", "SESSION_", "AUTH_LOGIN_", "LEGACY_LOGIN_", "ADMIN_LOGIN_")):
         return "security"
@@ -267,7 +321,7 @@ def _infer_group(key: str) -> str:
         return "portal_email"
     if key.startswith(("SMTP_", "EMAIL_")):
         return "portal_email"
-    if key.startswith(("TRANSLATOR_", "TRANSLATION_", "GEMMA_")) or key in {"FILTER_WEB_URL", "ENABLE_WEB_TRANSLATORS"}:
+    if key.startswith(("TRANSLATOR_", "TRANSLATION_", "GEMMA_", "OCR_IMAGE_TRANSLATE_")) or key in {"FILTER_WEB_URL", "ENABLE_WEB_TRANSLATORS"}:
         return "translation"
     if key.startswith("SQL_") or key == "LIMITER_REDIS_URL":
         return "database"
@@ -283,7 +337,7 @@ def _infer_group(key: str) -> str:
         return "routing"
     if key.startswith(("DEFAULT_TEST_", "GUEST_")):
         return "test_user"
-    if key.startswith("TTS_"):
+    if key.startswith(("EDGE_TTS_", "TTS_", "QWEN_TTS_", "MOSS_TTS_", "OMNIVOICE_TTS_")):
         return "tts"
     return "runtime"
 
@@ -339,6 +393,29 @@ CONFIG_SPECS = {
     **_build_settings_specs(),
     **_build_plan_catalog_specs(),
 }
+
+
+def _infer_tts_engine(key: str) -> Optional[str]:
+    if key.startswith("EDGE_TTS_") or key.startswith("TTS_"):
+        return "edge"
+    if key.startswith("QWEN_TTS_"):
+        return "qwen"
+    if key.startswith("MOSS_TTS_"):
+        return "moss"
+    if key.startswith("OMNIVOICE_TTS_"):
+        return "omnivoice"
+    return None
+
+
+def _config_sort_key(item: dict[str, Any]) -> tuple[str, int, str]:
+    engine_order = {
+        "edge": 0,
+        "qwen": 1,
+        "moss": 2,
+        "omnivoice": 3,
+    }
+    engine = item.get("engine")
+    return (str(item["group"]), engine_order.get(engine, 99), str(item["key"]))
 
 
 def _validate_group(group: Optional[str]) -> Optional[str]:
@@ -581,6 +658,11 @@ def _post_validate_value(spec: ConfigSpec, value: Any) -> Any:
             return normalize_cookie_samesite(value)
         if spec.key == "TRANSLATOR_SERVICES_LIST":
             return _validate_services_list(value, spec.key)
+        if spec.key == "ASR_DEFAULT_ENGINE":
+            normalized_engine = _validate_token_string(value, spec.key).lower()
+            if normalized_engine not in ASR_ENGINE_VALUES:
+                raise ValueError(f"{spec.key} must be one of {', '.join(sorted(ASR_ENGINE_VALUES))}")
+            return normalized_engine
         if spec.key == "LOG_LEVEL":
             return _validate_log_level(value, spec.key)
         if spec.key == "JWT_ALGORITHM":
@@ -595,6 +677,8 @@ def _post_validate_value(spec: ConfigSpec, value: Any) -> Any:
             "PACKAGE_TYPE",
             "GEMMA_TRANSLATE_API_MODE",
             "GEMMA_TRANSLATE_MODEL",
+            "OCR_IMAGE_TRANSLATE_INPAINT_METHOD",
+            "OCR_IMAGE_TRANSLATE_RENDER_STYLE",
         }:
             return _validate_token_string(value, spec.key)
 
@@ -602,7 +686,7 @@ def _post_validate_value(spec: ConfigSpec, value: Any) -> Any:
         raise ValueError(f"{spec.key} 必须大于 0")
     if spec.key in POSITIVE_FLOAT_KEYS and float(value) <= 0:
         raise ValueError(f"{spec.key} 必须大于 0")
-    if spec.key in {"WHISPER_PORT", "WHISPER_TRT_PORT", "SENSEVOICE_PORT", "SMTP_PORT"} and int(value) > 65535:
+    if spec.key in {"WHISPER_PORT", "WHISPER_TRT_PORT", "SENSEVOICE_PORT", "FIRERED_ASR_PORT", "SMTP_PORT"} and int(value) > 65535:
         raise ValueError(f"{spec.key} 端口超出范围")
     return value
 
@@ -713,6 +797,7 @@ def _serialize_item(
         "key": spec.key,
         "group": spec.group,
         "group_label": spec.group_label,
+        "engine": _infer_tts_engine(spec.key),
         "label": spec.label,
         "description": spec.description,
         "is_secret": spec.is_secret,
@@ -748,7 +833,7 @@ def list_site_configs(db: Session, group: Optional[str] = None) -> dict[str, Any
                 effective_catalog=effective_catalog,
             )
         )
-    items.sort(key=lambda item: (item["group"], item["key"]))
+    items.sort(key=_config_sort_key)
     groups = [
         {
             "key": key,

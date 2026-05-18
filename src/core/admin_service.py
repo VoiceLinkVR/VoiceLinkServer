@@ -31,6 +31,7 @@ from db.models import (
 LOCAL_TIME_OFFSET_HOURS = 8
 MAX_HOUR_OPTIONS = 168
 MAX_DETAIL_ROWS = 300
+MAX_ORDER_PAGE_SIZE = 200
 PAYMENT_PENDING_EXPIRE_HOURS = 24
 EXCLUDED_ENDPOINTS = [
     "/api/login",
@@ -120,6 +121,29 @@ def _normalize_payment_status(status: Optional[str]) -> str:
     if normalized in {"pending", "activated", "unpaid"}:
         return normalized
     return normalized or "unknown"
+
+
+def _normalize_order_filter_status(status: Optional[str]) -> Optional[str]:
+    normalized = str(status or "").strip().lower()
+    if not normalized or normalized == "all":
+        return None
+    if normalized in {"closed", "cancelled", "canceled"}:
+        return "unpaid"
+    return normalized
+
+
+def _parse_filter_datetime(value: Optional[str], *, end_of_day: bool = False) -> Optional[datetime]:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return None
+
+    try:
+        if len(raw_value) == 10:
+            parsed = datetime.strptime(raw_value, "%Y-%m-%d")
+            return datetime.combine(parsed.date(), time.max if end_of_day else time.min)
+        return datetime.fromisoformat(raw_value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError as exc:
+        raise ValueError(f"Invalid datetime filter: {raw_value}") from exc
 
 
 def _get_activation_source_label(source: Optional[str]) -> Optional[str]:
@@ -260,12 +284,93 @@ def _serialize_user_record(db: Session, user: V2User, afdian_summary: Optional[d
     }
 
 
-def list_users_payload(db: Session) -> dict[str, Any]:
+def _apply_user_list_filters(
+    query,
+    *,
+    search: Optional[str],
+    role: Optional[str],
+    status_filter: Optional[str],
+):
+    search_text = str(search or "").strip()
+    if search_text:
+        lowered_like = f"%{search_text.lower()}%"
+        search_clauses = [
+            func.lower(V2User.username).like(lowered_like),
+            func.lower(V2User.email).like(lowered_like),
+            func.lower(V2User.user_uuid).like(lowered_like),
+        ]
+        if search_text.isdigit():
+            search_clauses.append(V2User.id == int(search_text))
+        query = query.filter(or_(*search_clauses))
+
+    normalized_role = str(role or "all").strip().lower()
+    if normalized_role == "admin":
+        query = query.filter(V2User.is_admin == True)  # noqa: E712
+    elif normalized_role == "member":
+        query = query.filter(V2User.is_admin == False, V2User.is_default_test_user == False)  # noqa: E712
+    elif normalized_role == "test":
+        query = query.filter(V2User.is_default_test_user == True)  # noqa: E712
+
+    now = datetime.utcnow()
+    soon = now + timedelta(days=7)
+    normalized_status = str(status_filter or "all").strip().lower()
+    if normalized_status == "active":
+        query = query.filter(
+            V2User.is_active == True,  # noqa: E712
+            or_(V2User.expiration_date.is_(None), V2User.expiration_date > now),
+        )
+    elif normalized_status == "inactive":
+        query = query.filter(V2User.is_active == False)  # noqa: E712
+    elif normalized_status == "expired":
+        query = query.filter(V2User.expiration_date.isnot(None), V2User.expiration_date <= now)
+    elif normalized_status == "expiring_7d":
+        query = query.filter(
+            V2User.is_active == True,  # noqa: E712
+            V2User.expiration_date.isnot(None),
+            V2User.expiration_date >= now,
+            V2User.expiration_date <= soon,
+        )
+    elif normalized_status == "permanent":
+        query = query.filter(V2User.expiration_date.is_(None))
+    elif normalized_status == "non_permanent":
+        query = query.filter(V2User.expiration_date.isnot(None))
+
+    return query
+
+
+def list_users_payload(
+    db: Session,
+    *,
+    page: int = 1,
+    page_size: int = 50,
+    search: Optional[str] = None,
+    role: Optional[str] = None,
+    status_filter: Optional[str] = None,
+) -> dict[str, Any]:
     close_expired_pending_orders(db)
-    users = db.query(V2User).order_by(desc(V2User.created_at), desc(V2User.id)).all()
+    page = max(1, int(page or 1))
+    page_size = min(200, max(1, int(page_size or 50)))
+
+    base_query = db.query(V2User)
+    filtered_query = _apply_user_list_filters(
+        base_query,
+        search=search,
+        role=role,
+        status_filter=status_filter,
+    )
+    total_filtered = int(filtered_query.count() or 0)
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+    page = min(page, total_pages)
+    users = (
+        filtered_query
+        .order_by(desc(V2User.created_at), desc(V2User.id))
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
     afdian_summary_map = _build_user_afdian_summary_map(db)
 
-    now = datetime.now()
+    now = datetime.utcnow()
     soon = now + timedelta(days=7)
     summary = {
         "total_users": db.query(func.count(V2User.id)).scalar() or 0,
@@ -283,10 +388,24 @@ def list_users_payload(db: Session) -> dict[str, Any]:
             .scalar()
             or 0
         ),
+        "filtered_users": total_filtered,
     }
     return {
         "items": [_serialize_user_record(db, user, afdian_summary_map.get(user.username)) for user in users],
         "summary": summary,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_items": total_filtered,
+            "total_pages": total_pages,
+            "has_previous": page > 1,
+            "has_next": page < total_pages,
+        },
+        "filters": {
+            "search": str(search or "").strip(),
+            "role": str(role or "all").strip().lower() or "all",
+            "status": str(status_filter or "all").strip().lower() or "all",
+        },
     }
 
 
@@ -605,21 +724,145 @@ def _build_remote_afdian_order_payload(order: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def list_orders_payload(db: Session) -> dict[str, Any]:
+def list_orders_payload(
+    db: Session,
+    *,
+    search: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    action_filter: Optional[str] = None,
+    created_from: Optional[str] = None,
+    created_to: Optional[str] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, Any]:
     close_expired_pending_orders(db)
-    orders = db.query(PaymentOrder).order_by(desc(PaymentOrder.created_at), desc(PaymentOrder.id)).all()
+
+    normalized_status = _normalize_order_filter_status(status_filter)
+    normalized_action = str(action_filter or "").strip().lower()
+    created_from_dt = _parse_filter_datetime(created_from)
+    created_to_dt = _parse_filter_datetime(created_to, end_of_day=True)
+    page_size = min(max(int(page_size or 50), 1), MAX_ORDER_PAGE_SIZE)
+    page = max(int(page or 1), 1)
+
+    filters = []
+    search_value = str(search or "").strip()
+    if search_value:
+        search_like = f"%{search_value}%"
+        search_digest = payment_lookup_digest(search_value)
+        search_filters = [
+            PaymentOrder.out_trade_no.ilike(search_like),
+            PaymentOrder.order_no.ilike(search_like),
+            PaymentOrder.username.ilike(search_like),
+            PaymentOrder.email.ilike(search_like),
+            PaymentOrder.plan_id.ilike(search_like),
+            PaymentOrder.custom_id.ilike(search_like),
+            PaymentOrder.remark.ilike(search_like),
+        ]
+        if search_digest:
+            search_filters.extend(
+                [
+                    PaymentOrder.custom_id_digest == search_digest,
+                    PaymentOrder.remark_digest == search_digest,
+                ]
+            )
+        filters.append(or_(*search_filters))
+
+    if normalized_status:
+        filters.append(PaymentOrder.status == normalized_status)
+    if normalized_action and normalized_action != "all":
+        filters.append(PaymentOrder.action == normalized_action)
+    if created_from_dt:
+        filters.append(PaymentOrder.created_at >= created_from_dt)
+    if created_to_dt:
+        filters.append(PaymentOrder.created_at <= created_to_dt)
+    if min_amount is not None:
+        filters.append(PaymentOrder.amount >= min_amount)
+    if max_amount is not None:
+        filters.append(PaymentOrder.amount <= max_amount)
+
+    filtered_query = db.query(PaymentOrder).filter(*filters)
+    total_items = filtered_query.count()
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    page = min(page, total_pages)
+
+    orders = (
+        filtered_query.order_by(desc(PaymentOrder.created_at), desc(PaymentOrder.id))
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
     parsed_orders = [_build_afdian_order_payload(order) for order in orders]
+
+    status_rows = (
+        db.query(PaymentOrder.status, func.count(PaymentOrder.id).label("count"), func.sum(PaymentOrder.amount).label("amount_total"))
+        .filter(*filters)
+        .group_by(PaymentOrder.status)
+        .all()
+    )
+    status_counts = {
+        _normalize_payment_status(row.status): {
+            "count": row.count or 0,
+            "amount_total": round(float(row.amount_total or 0), 2),
+        }
+        for row in status_rows
+    }
+    activated_orders = status_counts.get("activated", {}).get("count", 0)
+    pending_orders = status_counts.get("pending", {}).get("count", 0)
+    closed_orders = status_counts.get("unpaid", {}).get("count", 0)
+    filtered_amount_total = round(sum(float(row.amount_total or 0) for row in status_rows), 2)
+    activated_amount_total = round(float(status_counts.get("activated", {}).get("amount_total", 0)), 2)
+    activation_error_orders = (
+        db.query(func.count(PaymentOrder.id))
+        .filter(*filters, PaymentOrder.activation_error.isnot(None))
+        .scalar()
+        or 0
+    )
+    total_orders = db.query(func.count(PaymentOrder.id)).scalar() or 0
+    available_actions = [
+        row[0]
+        for row in (
+            db.query(PaymentOrder.action)
+            .filter(PaymentOrder.action.isnot(None))
+            .group_by(PaymentOrder.action)
+            .order_by(PaymentOrder.action)
+            .all()
+        )
+        if row[0]
+    ]
+
     return {
         "summary": {
-            "total_orders": len(parsed_orders),
-            "activated_orders": sum(1 for order in parsed_orders if order["status"] == "activated"),
-            "pending_orders": sum(1 for order in parsed_orders if order["status"] == "pending"),
-            "closed_orders": sum(1 for order in parsed_orders if order["status"] == "unpaid"),
-            "activated_amount_total": round(
-                sum(float(order["amount"] or 0) for order in parsed_orders if order["status"] == "activated"),
-                2,
-            ),
+            "total_orders": total_orders,
+            "filtered_orders": total_items,
+            "activated_orders": activated_orders,
+            "pending_orders": pending_orders,
+            "closed_orders": closed_orders,
+            "activation_error_orders": activation_error_orders,
+            "filtered_amount_total": filtered_amount_total,
+            "activated_amount_total": activated_amount_total,
+            "average_amount": round((filtered_amount_total / total_items), 2) if total_items else 0,
+            "page_amount_total": round(sum(float(order["amount"] or 0) for order in parsed_orders), 2),
         },
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_items": total_items,
+            "total_pages": total_pages,
+            "has_previous": page > 1,
+            "has_next": page < total_pages,
+        },
+        "filters": {
+            "search": search_value,
+            "status": normalized_status or "all",
+            "action": normalized_action or "all",
+            "created_from": str(created_from or "").strip(),
+            "created_to": str(created_to or "").strip(),
+            "min_amount": "" if min_amount is None else str(min_amount),
+            "max_amount": "" if max_amount is None else str(max_amount),
+        },
+        "available_actions": available_actions,
         "items": parsed_orders,
     }
 
@@ -822,6 +1065,12 @@ def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str])
     hourly_stats = []
     duration_stats = []
     top_endpoints = []
+    top_users = []
+    slow_endpoints = []
+    unique_users = 0
+    unique_ips = 0
+    avg_duration = 0
+    max_duration = 0
 
     def success_case(label: str):
         if status_column is None:
@@ -858,6 +1107,10 @@ def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str])
                 rate_limited_case("total_rate_limited"),
                 resource_cost_sum("total_resource_cost"),
                 func.count().label("total_count"),
+                func.count(func.distinct(log_model.username)).label("unique_users"),
+                func.count(func.distinct(log_model.ip)).label("unique_ips"),
+                func.avg(log_model.duration).label("avg_duration"),
+                func.max(log_model.duration).label("max_duration"),
             )
             .filter(*base_filters)
             .first()
@@ -868,6 +1121,10 @@ def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str])
             total_rate_limited = summary_row.total_rate_limited or 0
             total_resource_cost = summary_row.total_resource_cost or 0
             total_count = summary_row.total_count or 0
+            unique_users = summary_row.unique_users or 0
+            unique_ips = summary_row.unique_ips or 0
+            avg_duration = summary_row.avg_duration or 0
+            max_duration = summary_row.max_duration or 0
 
         total_count_col = func.count().label("total_count")
         hourly_stats = (
@@ -901,6 +1158,41 @@ def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str])
             .filter(*base_filters)
             .group_by(log_model.endpoint)
             .order_by(desc(endpoint_total_col))
+            .limit(8)
+            .all()
+        )
+
+        user_total_col = func.count().label("user_total")
+        top_users = (
+            db.query(
+                log_model.username,
+                log_model.ip,
+                success_case("success_count"),
+                failed_case("fail_count"),
+                rate_limited_case("rate_limited_count"),
+                resource_cost_sum("resource_cost"),
+                func.avg(log_model.duration).label("avg_duration"),
+                user_total_col,
+            )
+            .filter(*base_filters)
+            .group_by(log_model.username, log_model.ip)
+            .order_by(desc(user_total_col))
+            .limit(8)
+            .all()
+        )
+
+        slow_endpoint_avg_col = func.avg(log_model.duration).label("avg_duration")
+        slow_endpoints = (
+            db.query(
+                log_model.endpoint,
+                slow_endpoint_avg_col,
+                func.max(log_model.duration).label("max_duration"),
+                func.count().label("total_count"),
+                resource_cost_sum("resource_cost"),
+            )
+            .filter(*base_filters)
+            .group_by(log_model.endpoint)
+            .order_by(desc(slow_endpoint_avg_col))
             .limit(8)
             .all()
         )
@@ -959,6 +1251,10 @@ def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str])
             rate_limited_case("daily_rate_limited"),
             resource_cost_sum("daily_resource_cost"),
             func.count().label("daily_total"),
+            func.count(func.distinct(log_model.username)).label("daily_unique_users"),
+            func.count(func.distinct(log_model.ip)).label("daily_unique_ips"),
+            func.avg(log_model.duration).label("daily_avg_duration"),
+            func.max(log_model.duration).label("daily_max_duration"),
         )
         .filter(log_model.timestamp >= utc_start_dt, log_model.timestamp < utc_end_dt, *_endpoint_filters(log_model))
         .group_by(date_expr)
@@ -969,13 +1265,26 @@ def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str])
     daily_map: dict[str, dict[str, Any]] = {}
     for row in daily_rows:
         day_key = row.day.strftime("%Y-%m-%d") if hasattr(row.day, "strftime") else str(row.day)
+        daily_total = row.daily_total or 0
+        daily_success = row.daily_success or 0
+        daily_fail = row.daily_fail or 0
+        daily_rate_limited = row.daily_rate_limited or 0
+        daily_resource_cost = row.daily_resource_cost or 0
         daily_map[day_key] = {
             "day": day_key,
-            "daily_success": row.daily_success or 0,
-            "daily_fail": row.daily_fail or 0,
-            "daily_rate_limited": row.daily_rate_limited or 0,
-            "daily_resource_cost": row.daily_resource_cost or 0,
-            "daily_total": row.daily_total or 0,
+            "daily_success": daily_success,
+            "daily_fail": daily_fail,
+            "daily_rate_limited": daily_rate_limited,
+            "daily_resource_cost": daily_resource_cost,
+            "daily_total": daily_total,
+            "daily_success_rate": round((daily_success / daily_total) * 100, 2) if daily_total else 0,
+            "daily_fail_rate": round((daily_fail / daily_total) * 100, 2) if daily_total else 0,
+            "daily_rate_limited_rate": round((daily_rate_limited / daily_total) * 100, 2) if daily_total else 0,
+            "daily_resource_per_request": round((daily_resource_cost / daily_total), 2) if daily_total else 0,
+            "daily_unique_users": row.daily_unique_users or 0,
+            "daily_unique_ips": row.daily_unique_ips or 0,
+            "daily_avg_duration": round(float(row.daily_avg_duration or 0), 3),
+            "daily_max_duration": round(float(row.daily_max_duration or 0), 3),
         }
 
     daily_stats = []
@@ -991,6 +1300,14 @@ def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str])
                     "daily_rate_limited": 0,
                     "daily_resource_cost": 0,
                     "daily_total": 0,
+                    "daily_success_rate": 0,
+                    "daily_fail_rate": 0,
+                    "daily_rate_limited_rate": 0,
+                    "daily_resource_per_request": 0,
+                    "daily_unique_users": 0,
+                    "daily_unique_ips": 0,
+                    "daily_avg_duration": 0,
+                    "daily_max_duration": 0,
                 },
             )
         )
@@ -1008,6 +1325,10 @@ def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str])
             "fail_rate": round((total_fail / total_count) * 100, 2) if total_count else 0,
             "rate_limited_rate": round((total_rate_limited / total_count) * 100, 2) if total_count else 0,
             "resource_per_request": round((total_resource_cost / total_count), 2) if total_count else 0,
+            "unique_users": unique_users,
+            "unique_ips": unique_ips,
+            "avg_duration": round(float(avg_duration or 0), 3),
+            "max_duration": round(float(max_duration or 0), 3),
         },
         "date_filter_info": {
             "start_date": local_start_day.strftime("%Y-%m-%d"),
@@ -1025,6 +1346,29 @@ def _build_legacy_stats_payload(db: Session, selected_hour_param: Optional[str])
                 "total_count": row.endpoint_total or 0,
             }
             for row in top_endpoints
+        ],
+        "top_users": [
+            {
+                "username": row.username or "anonymous",
+                "ip": row.ip,
+                "success_count": row.success_count or 0,
+                "fail_count": row.fail_count or 0,
+                "rate_limited_count": row.rate_limited_count or 0,
+                "resource_cost": row.resource_cost or 0,
+                "avg_duration": round(float(row.avg_duration or 0), 3),
+                "total_count": row.user_total or 0,
+            }
+            for row in top_users
+        ],
+        "slow_endpoints": [
+            {
+                "endpoint": row.endpoint,
+                "avg_duration": round(float(row.avg_duration or 0), 3),
+                "max_duration": round(float(row.max_duration or 0), 3),
+                "resource_cost": row.resource_cost or 0,
+                "total_count": row.total_count or 0,
+            }
+            for row in slow_endpoints
         ],
         "hourly_stats": [
             {
@@ -1096,6 +1440,12 @@ def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> 
     hourly_stats = []
     duration_stats = []
     top_endpoints = []
+    top_users = []
+    slow_endpoints = []
+    unique_users = 0
+    unique_ips = 0
+    avg_duration = 0
+    max_duration = 0
 
     if selected_hour:
         hour_start_utc, hour_end_utc = _get_utc_hour_range(selected_hour)
@@ -1145,6 +1495,22 @@ def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> 
             V2RequestAuditLog.created_at < hour_end_utc,
             *_v2_audit_filters(),
         ]
+        audit_summary_row = (
+            db.query(
+                func.count(func.distinct(V2RequestAuditLog.username)).label("unique_users"),
+                func.count(func.distinct(V2RequestAuditLog.ip)).label("unique_ips"),
+                func.avg(V2RequestAuditLog.duration_ms).label("avg_duration_ms"),
+                func.max(V2RequestAuditLog.duration_ms).label("max_duration_ms"),
+            )
+            .filter(*audit_filters)
+            .first()
+        )
+        if audit_summary_row:
+            unique_users = int(audit_summary_row.unique_users or 0)
+            unique_ips = int(audit_summary_row.unique_ips or 0)
+            avg_duration = float(audit_summary_row.avg_duration_ms or 0) / 1000
+            max_duration = float(audit_summary_row.max_duration_ms or 0) / 1000
+
         total_count_col = func.count().label("total_count")
         hourly_stats = (
             db.query(
@@ -1161,6 +1527,41 @@ def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> 
             .group_by(V2RequestAuditLog.username, V2RequestAuditLog.ip, V2RequestAuditLog.endpoint)
             .order_by(desc(total_count_col))
             .limit(MAX_DETAIL_ROWS)
+            .all()
+        )
+
+        user_total_col = func.count().label("user_total")
+        top_users = (
+            db.query(
+                V2RequestAuditLog.username,
+                V2RequestAuditLog.ip,
+                func.sum(case((V2RequestAuditLog.status == "success", 1), else_=0)).label("success_count"),
+                func.sum(case((V2RequestAuditLog.status == "failed", 1), else_=0)).label("fail_count"),
+                func.sum(case((V2RequestAuditLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+                func.sum(V2RequestAuditLog.resource_cost).label("resource_cost"),
+                func.avg(V2RequestAuditLog.duration_ms).label("avg_duration_ms"),
+                user_total_col,
+            )
+            .filter(*audit_filters)
+            .group_by(V2RequestAuditLog.username, V2RequestAuditLog.ip)
+            .order_by(desc(user_total_col))
+            .limit(8)
+            .all()
+        )
+
+        slow_endpoint_avg_col = func.avg(V2RequestAuditLog.duration_ms).label("avg_duration_ms")
+        slow_endpoints = (
+            db.query(
+                V2RequestAuditLog.endpoint,
+                slow_endpoint_avg_col,
+                func.max(V2RequestAuditLog.duration_ms).label("max_duration_ms"),
+                func.count().label("total_count"),
+                func.sum(V2RequestAuditLog.resource_cost).label("resource_cost"),
+            )
+            .filter(*audit_filters)
+            .group_by(V2RequestAuditLog.endpoint)
+            .order_by(desc(slow_endpoint_avg_col))
+            .limit(8)
             .all()
         )
 
@@ -1220,6 +1621,28 @@ def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> 
         .filter(V2EndpointHourlyStats.stat_hour >= utc_start_dt, V2EndpointHourlyStats.stat_hour < utc_end_dt)
         .all()
     )
+    if db.bind.dialect.name == "sqlite":
+        audit_day_expr = func.date(func.datetime(V2RequestAuditLog.created_at, f"+{LOCAL_TIME_OFFSET_HOURS} hours"))
+    else:
+        audit_day_expr = func.date(
+            func.date_add(V2RequestAuditLog.created_at, text(f"INTERVAL {LOCAL_TIME_OFFSET_HOURS} HOUR"))
+        )
+    daily_audit_rows = (
+        db.query(
+            audit_day_expr.label("day"),
+            func.count(func.distinct(V2RequestAuditLog.username)).label("daily_unique_users"),
+            func.count(func.distinct(V2RequestAuditLog.ip)).label("daily_unique_ips"),
+            func.avg(V2RequestAuditLog.duration_ms).label("daily_avg_duration_ms"),
+            func.max(V2RequestAuditLog.duration_ms).label("daily_max_duration_ms"),
+        )
+        .filter(
+            V2RequestAuditLog.created_at >= utc_start_dt,
+            V2RequestAuditLog.created_at < utc_end_dt,
+            *_v2_audit_filters(),
+        )
+        .group_by(audit_day_expr)
+        .all()
+    )
 
     daily_map: dict[str, dict[str, Any]] = {}
     for row in daily_rows:
@@ -1233,6 +1656,14 @@ def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> 
                 "daily_rate_limited": 0,
                 "daily_resource_cost": 0,
                 "daily_total": 0,
+                "daily_success_rate": 0,
+                "daily_fail_rate": 0,
+                "daily_rate_limited_rate": 0,
+                "daily_resource_per_request": 0,
+                "daily_unique_users": 0,
+                "daily_unique_ips": 0,
+                "daily_avg_duration": 0,
+                "daily_max_duration": 0,
             },
         )
         target["daily_success"] += int(row.success_count or 0)
@@ -1240,6 +1671,43 @@ def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> 
         target["daily_rate_limited"] += int(row.rate_limited_count or 0)
         target["daily_resource_cost"] += int(row.resource_cost_sum or 0)
         target["daily_total"] += int(row.total_count or 0)
+
+    for row in daily_audit_rows:
+        day_key = row.day.strftime("%Y-%m-%d") if hasattr(row.day, "strftime") else str(row.day)
+        target = daily_map.setdefault(
+            day_key,
+            {
+                "day": day_key,
+                "daily_success": 0,
+                "daily_fail": 0,
+                "daily_rate_limited": 0,
+                "daily_resource_cost": 0,
+                "daily_total": 0,
+                "daily_success_rate": 0,
+                "daily_fail_rate": 0,
+                "daily_rate_limited_rate": 0,
+                "daily_resource_per_request": 0,
+                "daily_unique_users": 0,
+                "daily_unique_ips": 0,
+                "daily_avg_duration": 0,
+                "daily_max_duration": 0,
+            },
+        )
+        target["daily_unique_users"] = int(row.daily_unique_users or 0)
+        target["daily_unique_ips"] = int(row.daily_unique_ips or 0)
+        target["daily_avg_duration"] = round(float(row.daily_avg_duration_ms or 0) / 1000, 3)
+        target["daily_max_duration"] = round(float(row.daily_max_duration_ms or 0) / 1000, 3)
+
+    for target in daily_map.values():
+        daily_total = int(target.get("daily_total") or 0)
+        daily_success = int(target.get("daily_success") or 0)
+        daily_fail = int(target.get("daily_fail") or 0)
+        daily_rate_limited = int(target.get("daily_rate_limited") or 0)
+        daily_resource_cost = int(target.get("daily_resource_cost") or 0)
+        target["daily_success_rate"] = round((daily_success / daily_total) * 100, 2) if daily_total else 0
+        target["daily_fail_rate"] = round((daily_fail / daily_total) * 100, 2) if daily_total else 0
+        target["daily_rate_limited_rate"] = round((daily_rate_limited / daily_total) * 100, 2) if daily_total else 0
+        target["daily_resource_per_request"] = round((daily_resource_cost / daily_total), 2) if daily_total else 0
 
     daily_stats = []
     for day_offset in range(7):
@@ -1254,6 +1722,14 @@ def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> 
                     "daily_rate_limited": 0,
                     "daily_resource_cost": 0,
                     "daily_total": 0,
+                    "daily_success_rate": 0,
+                    "daily_fail_rate": 0,
+                    "daily_rate_limited_rate": 0,
+                    "daily_resource_per_request": 0,
+                    "daily_unique_users": 0,
+                    "daily_unique_ips": 0,
+                    "daily_avg_duration": 0,
+                    "daily_max_duration": 0,
                 },
             )
         )
@@ -1271,6 +1747,10 @@ def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> 
             "fail_rate": round((total_fail / total_count) * 100, 2) if total_count else 0,
             "rate_limited_rate": round((total_rate_limited / total_count) * 100, 2) if total_count else 0,
             "resource_per_request": round((total_resource_cost / total_count), 2) if total_count else 0,
+            "unique_users": unique_users,
+            "unique_ips": unique_ips,
+            "avg_duration": round(float(avg_duration or 0), 3),
+            "max_duration": round(float(max_duration or 0), 3),
         },
         "date_filter_info": {
             "start_date": local_start_day.strftime("%Y-%m-%d"),
@@ -1288,6 +1768,29 @@ def _build_v2_stats_payload(db: Session, selected_hour_param: Optional[str]) -> 
                 "total_count": int(row.endpoint_total or 0),
             }
             for row in top_endpoints
+        ],
+        "top_users": [
+            {
+                "username": row.username or "anonymous",
+                "ip": row.ip,
+                "success_count": int(row.success_count or 0),
+                "fail_count": int(row.fail_count or 0),
+                "rate_limited_count": int(row.rate_limited_count or 0),
+                "resource_cost": int(row.resource_cost or 0),
+                "avg_duration": round(float(row.avg_duration_ms or 0) / 1000, 3),
+                "total_count": int(row.user_total or 0),
+            }
+            for row in top_users
+        ],
+        "slow_endpoints": [
+            {
+                "endpoint": row.endpoint,
+                "avg_duration": round(float(row.avg_duration_ms or 0) / 1000, 3),
+                "max_duration": round(float(row.max_duration_ms or 0) / 1000, 3),
+                "resource_cost": int(row.resource_cost or 0),
+                "total_count": int(row.total_count or 0),
+            }
+            for row in slow_endpoints
         ],
         "hourly_stats": [
             {

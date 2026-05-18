@@ -32,8 +32,10 @@ from core.v2_dependencies import resolve_authenticated_v2_user
 from db.models import User, RequestLog, V2User
 from core.services import (
     errorFilter, do_translate,
-    supportedLanguagesList, whisperSupportedLanguageList, SENSEVOICE_URL, packaged_opus_stream_to_wav_bytes,
+    supportedLanguagesList, whisperSupportedLanguageList, packaged_opus_stream_to_wav_bytes,
     compress_repeated_chars, do_transcribe, do_translate_audio,
+    normalize_asr_engine, asr_engine_supports_direct_translation,
+    resolve_asr_engine_for_language,
     get_runtime_translation_source_languages, get_runtime_translation_target_languages,
     is_runtime_translation_source_supported, is_runtime_translation_target_supported,
     normalize_translation_language_code,
@@ -66,9 +68,9 @@ async def get_current_api_user_for_status(
     db: Session = Depends(get_db),
 ) -> User | V2User:
     user: User | V2User | None = None
-    if request.scope.get("path", "").startswith("/v2/"):
+    if _is_v2_request(request):
         user = resolve_authenticated_v2_user(request, db, token=token, allow_inactive=True, allow_expired=True)
-    if user is None:
+    else:
         user = resolve_authenticated_user(request, db, token=token, allow_inactive=True, allow_expired=True)
     if user is None:
         raise HTTPException(
@@ -77,6 +79,10 @@ async def get_current_api_user_for_status(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
+
+
+def _is_v2_request(request: Request) -> bool:
+    return str(request.scope.get("path", "") or "").startswith("/v2/")
 
 
 def _extract_daily_limit(limit_rule: str) -> Optional[int]:
@@ -155,14 +161,115 @@ def _validate_runtime_source_language(field_name: str, language: str, allow_none
     return canonical
 
 
-def _get_audio_translation_target_languages() -> list[str]:
+def _resolve_asr_engine(engine: Optional[str], asr_engine: Optional[str]) -> str:
+    requested = engine if (engine or "").strip() else asr_engine
+    try:
+        return normalize_asr_engine(requested)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+CHINESE_ROUTE_ASR_ENGINES = {"firered", "sensevoice"}
+WHISPER_ROUTE_ASR_ENGINES = {"whisper", "whisper-trt"}
+
+
+def _requested_asr_engine_value(engine: Optional[str], asr_engine: Optional[str]) -> Optional[str]:
+    return engine if (engine or "").strip() else asr_engine
+
+
+def _default_whisper_route_engine() -> str:
+    return "whisper-trt" if settings.WHISPER_BACKEND == "whisper-trt" else "whisper"
+
+
+def _resolve_chinese_asr_engine(
+    engine: Optional[str],
+    asr_engine: Optional[str],
+    endpoint: str,
+) -> str:
+    selected_engine = _resolve_asr_engine(engine, asr_engine)
+    if selected_engine not in CHINESE_ROUTE_ASR_ENGINES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{endpoint} Chinese ASR supports firered and sensevoice only",
+        )
+    return selected_engine
+
+
+def _resolve_non_chinese_asr_engine(
+    engine: Optional[str],
+    asr_engine: Optional[str],
+    source_language: str,
+    endpoint: str,
+) -> str:
+    requested = _requested_asr_engine_value(engine, asr_engine)
+    if not (requested or "").strip():
+        selected_engine = _default_whisper_route_engine()
+        logger.info(
+            "[%s] non-Chinese source uses default Whisper ASR chain: effective=%s sourceLanguage=%s",
+            endpoint,
+            selected_engine,
+            source_language,
+        )
+        return selected_engine
+
+    selected_engine = _resolve_asr_engine(engine, asr_engine)
+    if selected_engine in WHISPER_ROUTE_ASR_ENGINES:
+        return selected_engine
+
+    effective_engine = _default_whisper_route_engine()
+    if effective_engine != selected_engine:
+        logger.info(
+            "[%s] non-Chinese source uses full Whisper ASR chain: requested=%s effective=%s sourceLanguage=%s",
+            endpoint,
+            selected_engine,
+            effective_engine,
+            source_language,
+        )
+    return effective_engine
+
+
+def _resolve_source_asr_engine(
+    engine: Optional[str],
+    asr_engine: Optional[str],
+    source_language: str,
+    endpoint: str,
+) -> str:
+    if normalize_translation_language_code(source_language) == "zh":
+        return _resolve_chinese_asr_engine(engine, asr_engine, endpoint)
+    return _resolve_non_chinese_asr_engine(engine, asr_engine, source_language, endpoint)
+
+
+def _resolve_audio_translation_asr_engine(
+    engine: Optional[str],
+    asr_engine: Optional[str],
+    endpoint: str,
+) -> str:
+    requested = _requested_asr_engine_value(engine, asr_engine)
+    if not (requested or "").strip():
+        return _default_whisper_route_engine()
+
+    selected_engine = _resolve_asr_engine(engine, asr_engine)
+    if selected_engine not in WHISPER_ROUTE_ASR_ENGINES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{endpoint} audio translation supports whisper and whisper-trt only",
+        )
+    return selected_engine
+
+
+def _get_audio_translation_target_languages(asr_engine: Optional[str] = None) -> list[str]:
     languages = set(get_runtime_translation_target_languages())
-    if settings.WHISPER_BACKEND == "whisper-trt":
+    if asr_engine and asr_engine_supports_direct_translation(asr_engine):
         languages.update(whisperSupportedLanguageList)
     return sorted(languages)
 
 
-def _validate_audio_target_language(field_name: str, language: str, allow_none: bool = False) -> str:
+def _validate_audio_target_language(
+    field_name: str,
+    language: str,
+    allow_none: bool = False,
+    asr_engine: Optional[str] = None,
+) -> str:
     normalized = (language or "").strip()
     if allow_none and normalized == "none":
         return normalized
@@ -170,12 +277,13 @@ def _validate_audio_target_language(field_name: str, language: str, allow_none: 
         raise HTTPException(status_code=400, detail=f"{field_name} 'auto' is no longer supported")
 
     canonical = normalize_translation_language_code(normalized)
-    if canonical in set(_get_audio_translation_target_languages()):
+    target_languages = _get_audio_translation_target_languages(asr_engine)
+    if canonical in set(target_languages):
         return canonical
 
     raise HTTPException(
         status_code=400,
-        detail=f"{field_name} error, please use following languages: {str(_get_audio_translation_target_languages())}",
+        detail=f"{field_name} error, please use following languages: {str(target_languages)}",
     )
 
 # --- API 路由 ---
@@ -198,6 +306,8 @@ async def login(
     db: Session = Depends(get_db),
     user_credentials: UserLogin = Body(...),
 ):
+    if _is_v2_request(request):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     if not settings.API_V1_LEGACY_LOGIN_ENABLED:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
@@ -516,11 +626,14 @@ async def account_usage(
 async def whisper_transcriptions(
     request: Request,
     file: UploadFile = File(...),
+    engine: Optional[str] = Form(None),
+    asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit),
 ):
+    asr_engine = _resolve_chinese_asr_engine(engine, asrEngine, "WHISPER_TRANSCRIPTIONS")
     _apply_effective_resource_cost(request, 1)
     audio_file = await file.read()
-    text = await do_transcribe(audio_file, language='zh')
+    text = await do_transcribe(audio_file, language='zh', engine=asr_engine, filename=file.filename or "audio.wav")
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
     # 压缩重复字符
@@ -532,11 +645,14 @@ async def whisper_transcriptions(
 async def whisper_translations(
     request: Request,
     file: UploadFile = File(...),
+    engine: Optional[str] = Form(None),
+    asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit),
 ):
+    asr_engine = _resolve_audio_translation_asr_engine(engine, asrEngine, "WHISPER_TRANSLATIONS")
     _apply_effective_resource_cost(request, 2)
     audio_file = await file.read()
-    text = await do_translate_audio(audio_file)
+    text = await do_translate_audio(audio_file, engine=asr_engine, filename=file.filename or "audio.wav")
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
     # 压缩重复字符
@@ -548,11 +664,14 @@ async def whisper_translations(
 async def translate_to_english(
     request: Request,
     file: UploadFile = File(...),
+    engine: Optional[str] = Form(None),
+    asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit),
 ):
+    asr_engine = _resolve_chinese_asr_engine(engine, asrEngine, "TRANSLATE_TO_ENGLISH")
     _apply_effective_resource_cost(request, 2)
     audio_file = await file.read()
-    text = await do_transcribe(audio_file, language='zh')
+    text = await do_transcribe(audio_file, language='zh', engine=asr_engine, filename=file.filename or "audio.wav")
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
     # 压缩重复字符
@@ -561,7 +680,7 @@ async def translate_to_english(
     if settings.ENABLE_WEB_TRANSLATORS:
         translated_text = do_translate(text, from_='zh', to="en")
     else:
-        translated_text = await do_translate_audio(audio_file)
+        translated_text = await do_translate_audio(audio_file, engine=asr_engine, filename=file.filename or "audio.wav")
     return {"text": text, "translatedText": translated_text}
 
 @router.post("/func/translateToOtherLanguage")
@@ -569,21 +688,24 @@ async def translate_to_other_language(
     request: Request,
     file: UploadFile = File(...),
     targetLanguage: str = Form(...),
+    engine: Optional[str] = Form(None),
+    asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit),
 ):
-    targetLanguage = _validate_audio_target_language("targetLanguage", targetLanguage)
+    asr_engine = _resolve_chinese_asr_engine(engine, asrEngine, "TRANSLATE_TO_OTHER_LANGUAGE")
+    targetLanguage = _validate_audio_target_language("targetLanguage", targetLanguage, asr_engine=asr_engine)
     _apply_effective_resource_cost(request, 2)
     audio_file = await file.read()
-    text = await do_transcribe(audio_file, language='zh')
+    text = await do_transcribe(audio_file, language='zh', engine=asr_engine, filename=file.filename or "audio.wav")
     if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
         return {"text": "", "message": "filtered"}
 
-    if settings.WHISPER_BACKEND == "whisper-trt":
-        trans_text = await do_transcribe(audio_file, language=targetLanguage)
+    if asr_engine_supports_direct_translation(asr_engine) and not settings.ENABLE_WEB_TRANSLATORS:
+        trans_text = await do_transcribe(audio_file, language=targetLanguage, engine=asr_engine, filename=file.filename or "audio.wav")
     elif settings.ENABLE_WEB_TRANSLATORS:
         trans_text = do_translate(text, from_='zh', to=targetLanguage)
     else:
-        translated_text = await do_translate_audio(audio_file)
+        translated_text = await do_translate_audio(audio_file, engine=asr_engine, filename=file.filename or "audio.wav")
         if targetLanguage == 'en':
             trans_text = translated_text
         else:
@@ -600,6 +722,8 @@ async def multitranslate_to_other_language(
     targetLanguage2: str = Form("none"),
     targetLanguage3: str = Form("none"),
     emojiOutput: str = Form('true'),
+    engine: Optional[str] = Form(None),
+    asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit)
 ):
     # supportedLanguagesList 现在是硬编码的固定列表，不需要动态初始化
@@ -611,15 +735,19 @@ async def multitranslate_to_other_language(
     logger.debug(f"[MULTITRANSLATE] whisper支持的语言列表: {whisperSupportedLanguageList}")
 
     _reject_auto_language("sourceLanguage", sourceLanguage)
-    targetLanguage = _validate_audio_target_language("targetLanguage", targetLanguage)
-    targetLanguage2 = _validate_audio_target_language("targetLanguage2", targetLanguage2, allow_none=True)
-    targetLanguage3 = _validate_audio_target_language("targetLanguage3", targetLanguage3, allow_none=True)
 
     if sourceLanguage not in whisperSupportedLanguageList:
         logger.warning(f"[MULTITRANSLATE] sourceLanguage错误: {sourceLanguage} 不在支持的列表中")
         logger.debug(f"[MULTITRANSLATE] 支持的语言列表: {whisperSupportedLanguageList}")
         # 参数错误返回400，避免客户端误判为token过期
         raise HTTPException(status_code=400, detail="sourceLanguage error")
+
+    source_asr_engine = _resolve_source_asr_engine(engine, asrEngine, sourceLanguage, "MULTITRANSLATE")
+    logger.info("[MULTITRANSLATE] effective ASR engine: %s", source_asr_engine)
+    targetLanguage = _validate_audio_target_language("targetLanguage", targetLanguage, asr_engine=source_asr_engine)
+    targetLanguage2 = _validate_audio_target_language("targetLanguage2", targetLanguage2, allow_none=True, asr_engine=source_asr_engine)
+    targetLanguage3 = _validate_audio_target_language("targetLanguage3", targetLanguage3, allow_none=True, asr_engine=source_asr_engine)
+
     translation_count = 1 + int(targetLanguage2 != "none") + int(targetLanguage3 != "none")
     _apply_effective_resource_cost(request, 1 + translation_count)
 
@@ -634,39 +762,30 @@ async def multitranslate_to_other_language(
 
     stext = ""
     if sourceLanguage == 'zh':
-        logger.info(f"[MULTITRANSLATE] 使用中文语音识别(SenseVoice)")
-        async with httpx.AsyncClient() as client:
-            files = {'file': ('audio.wav', audio_file, 'audio/wav')}
-            logger.debug(f"[MULTITRANSLATE] 发送请求到SenseVoice - URL: {SENSEVOICE_URL}")
-            response = await client.post(SENSEVOICE_URL, files=files)
-            logger.info(f"[MULTITRANSLATE] SenseVoice响应状态码: {response.status_code}")
-            text_json = response.json()
-            stext = text_json.get('text', '')
-            logger.info(f"[MULTITRANSLATE] 识别结果 - stext: '{stext}'")
-            if emojiOutput == 'true':
-                original_stext = stext
-                stext = emoji.replace_emoji(stext, replace='')
-                if original_stext != stext:
-                    logger.info(f"[MULTITRANSLATE] 移除emoji - 原始: '{original_stext}' -> 处理后: '{stext}'")
-            if stext == '。' or stext == '':
-                logger.info(f"[MULTITRANSLATE] 识别结果为空或只有句号，返回过滤")
-                return {"text": "", "message": "filtered"}
-            # 压缩重复字符
-            if settings.ENABLE_TEXT_COMPRESSION:
-                original_stext = stext
-                stext = compress_repeated_chars(stext, settings.TEXT_COMPRESSION_MIN_REPEAT)
-                if original_stext != stext:
-                    logger.info(f"[MULTITRANSLATE] 压缩重复字符 - 原始: '{original_stext}' -> 处理后: '{stext}'")
+        logger.info("[MULTITRANSLATE] using Chinese ASR engine for zh transcription: %s", source_asr_engine)
+        stext = await do_transcribe(audio_file, language=sourceLanguage, engine=source_asr_engine, filename="audio.wav")
+        logger.info("[MULTITRANSLATE] ASR result: %s", stext)
+        if emojiOutput == 'true':
+            stext = emoji.replace_emoji(stext, replace='')
+        if stext == '。' or stext == '':
+            return {"text": "", "message": "filtered"}
+        if settings.ENABLE_TEXT_COMPRESSION:
+            stext = compress_repeated_chars(stext, settings.TEXT_COMPRESSION_MIN_REPEAT)
+        logger.info("[MULTITRANSLATE] zh transcription completed by engine=%s", source_asr_engine)
     else:
-        logger.info(f"[MULTITRANSLATE] 使用Whisper进行{sourceLanguage}语音识别")
-        logger.debug(f"[MULTITRANSLATE] 先进行中文过滤检测")
-        filter_text = await do_transcribe(audio_file, language="zh")
+        logger.info(
+            "[MULTITRANSLATE] using full Whisper ASR chain for sourceLanguage=%s engine=%s",
+            sourceLanguage,
+            source_asr_engine,
+        )
+        logger.debug(f"[MULTITRANSLATE] 先进行Whisper中文过滤检测")
+        filter_text = await do_transcribe(audio_file, language="zh", engine=source_asr_engine, filename="audio.wav")
         logger.info(f"[MULTITRANSLATE] 中文过滤检测结果: '{filter_text}'")
         if (filter_text in errorFilter.get("errorResultDict", [])) or any(key in filter_text for key in errorFilter.get("errorKeyString", [])):
             logger.warning(f"[MULTITRANSLATE] 内容被过滤规则拦截 检测内容: '{filter_text}'")
             return {"text": "", "message": "filtered"}
         logger.debug(f"[MULTITRANSLATE] 进行{sourceLanguage}语言识别")
-        stext = await do_transcribe(audio_file, language=sourceLanguage)
+        stext = await do_transcribe(audio_file, language=sourceLanguage, engine=source_asr_engine, filename="audio.wav")
         logger.info(f"[MULTITRANSLATE] {sourceLanguage}语音识别结果: '{stext}'")
         # 压缩重复字符
         if settings.ENABLE_TEXT_COMPRESSION:
@@ -693,17 +812,17 @@ async def multitranslate_to_other_language(
             logger.debug(f"[MULTITRANSLATE] 开始翻译到第三目标语言: {targetLanguage3}")
             transText3 = do_translate(stext, from_=translate_source_lang, to=targetLanguage3)
             logger.info(f"[MULTITRANSLATE] 第三目标语言翻译完成: '{transText3}'")
-    elif settings.WHISPER_BACKEND == "whisper-trt":
+    elif asr_engine_supports_direct_translation(source_asr_engine):
         logger.info("[MULTITRANSLATE] 使用 WhisperLive-TRT 内置翻译")
-        transText = await do_transcribe(audio_file, language=targetLanguage)
+        transText = await do_transcribe(audio_file, language=targetLanguage, engine=source_asr_engine, filename="audio.wav")
         if targetLanguage2 != "none":
-            transText2 = await do_transcribe(audio_file, language=targetLanguage2)
+            transText2 = await do_transcribe(audio_file, language=targetLanguage2, engine=source_asr_engine, filename="audio.wav")
         if targetLanguage3 != "none":
-            transText3 = await do_transcribe(audio_file, language=targetLanguage3)
+            transText3 = await do_transcribe(audio_file, language=targetLanguage3, engine=source_asr_engine, filename="audio.wav")
     else:
         logger.info(f"[MULTITRANSLATE] 使用Whisper翻译服务")
         logger.debug(f"[MULTITRANSLATE] 创建Whisper翻译请求")
-        translated_text = await do_translate_audio(audio_file)
+        translated_text = await do_translate_audio(audio_file, engine=source_asr_engine, filename="audio.wav")
         logger.info(f"[MULTITRANSLATE] Whisper翻译结果: '{translated_text}'")
 
         if targetLanguage == 'en':
@@ -733,6 +852,8 @@ async def multitranscription(
     file: UploadFile = File(...),
     sourceLanguage: str = Form(...),
     emojiOutput: str = Form('true'),
+    engine: Optional[str] = Form(None),
+    asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit)
 ):
     _apply_effective_resource_cost(request, 1)
@@ -740,24 +861,21 @@ async def multitranscription(
     if sourceLanguage not in whisperSupportedLanguageList:
         raise HTTPException(status_code=400, detail="sourceLanguage error")
 
+    source_asr_engine = _resolve_source_asr_engine(engine, asrEngine, sourceLanguage, "MULTITRANSCRIPTION")
     audio_file = await file.read()
     if file.content_type == 'audio/opus':
         audio_file = packaged_opus_stream_to_wav_bytes(audio_file, 16000)
 
     text_to_return = ""
     if sourceLanguage != 'zh':
-        filter_text = await do_transcribe(audio_file, language="zh")
+        filter_text = await do_transcribe(audio_file, language="zh", engine=source_asr_engine, filename="audio.wav")
         if (filter_text in errorFilter.get("errorResultDict", [])) or any(key in filter_text for key in errorFilter.get("errorKeyString", [])):
             return {"text": "", "message": "filtered"}
-        text_to_return = await do_transcribe(audio_file, language=sourceLanguage)
+        text_to_return = await do_transcribe(audio_file, language=sourceLanguage, engine=source_asr_engine, filename="audio.wav")
     else:
-        async with httpx.AsyncClient() as client:
-            files = {'file': ('audio.wav', audio_file, 'audio/wav')}
-            response = await client.post(SENSEVOICE_URL, files=files)
-            text_json = response.json()
-            text_to_return = text_json.get('text', '')
-            if emojiOutput == 'true': text_to_return = emoji.replace_emoji(text_to_return, replace='')
-            if text_to_return == '。' or text_to_return == '': return {"text": "", "message": "filtered"}
+        text_to_return = await do_transcribe(audio_file, language=sourceLanguage, engine=source_asr_engine, filename="audio.wav")
+        if emojiOutput == 'true': text_to_return = emoji.replace_emoji(text_to_return, replace='')
+        if text_to_return == '。' or text_to_return == '': return {"text": "", "message": "filtered"}
 
     return {"text": text_to_return}
 
@@ -810,7 +928,44 @@ async def photo_translate(
 class TTSRequest(BaseModel):
     input: str
     voice: str
-    speed: float
+    speed: float = 1.0
+    response_format: Optional[str] = None
+    language: Optional[str] = None
+    instruct: Optional[str] = None
+    volume: Optional[float] = None
+
+
+def _validate_tts_volume(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    if value < 0.0 or value > 4.0:
+        raise HTTPException(status_code=400, detail="volume must be between 0 and 4")
+    return value
+
+
+def _validate_edge_tts_input(value: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="input text is empty")
+    max_chars = max(1, int(settings.EDGE_TTS_MAX_INPUT_CHARS or 500))
+    if len(normalized) > max_chars:
+        raise HTTPException(status_code=400, detail=f"input text exceeds {max_chars} characters")
+    return normalized
+
+
+def _tts_proxy_url() -> str:
+    if not settings.EDGE_TTS_ENABLED:
+        raise HTTPException(status_code=403, detail="Edge TTS is disabled")
+    edge_url = (settings.TTS_URL or "").strip()
+    if edge_url:
+        return edge_url
+    raise HTTPException(status_code=500, detail="Edge TTS service not configured")
+
+
+def _tts_proxy_headers() -> dict[str, str]:
+    token = settings.TTS_TOKEN
+    token = (token or "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 @router.post("/func/tts")
 async def tts_proxy(
@@ -819,14 +974,35 @@ async def tts_proxy(
     current_user: User = Depends(enforce_user_rate_limit),
 ):
     _apply_effective_resource_cost(request, 1)
-    if not settings.TTS_URL or not settings.TTS_TOKEN:
-        raise HTTPException(status_code=500, detail="TTS service not configured")
-    payload = {"model": "tts-1", "input": data.input, "voice": data.voice, "speed": data.speed}
-    headers = {"Authorization": f"Bearer {settings.TTS_TOKEN}"}
+    text = _validate_edge_tts_input(data.input)
+    volume = _validate_tts_volume(data.volume)
+    tts_url = _tts_proxy_url()
+    payload = {"model": "tts-1", "input": text, "voice": data.voice, "speed": data.speed}
+    if data.response_format:
+        payload["response_format"] = data.response_format
+    if data.language:
+        payload["language"] = data.language
+    if data.instruct:
+        payload["instruct"] = data.instruct
+    if volume is not None:
+        payload["volume"] = volume
+    headers = _tts_proxy_headers()
+    request.state.audit_payload = {
+        "feature": "edge_tts",
+        "engine": "edge",
+        "resource_cost": 1,
+        "voice": data.voice,
+        "response_format": data.response_format or "",
+        "volume": volume,
+    }
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(settings.TTS_URL, json=payload, headers=headers, timeout=60.0)
-        return Response(content=response.content, media_type=response.headers['Content-Type'], status_code=response.status_code)
+        response = await client.post(tts_url, json=payload, headers=headers, timeout=settings.EDGE_TTS_TIMEOUT)
+        return Response(
+            content=response.content,
+            media_type=response.headers.get("Content-Type", "audio/wav"),
+            status_code=response.status_code,
+        )
 
 class WebTranslateRequest(BaseModel):
     text: str

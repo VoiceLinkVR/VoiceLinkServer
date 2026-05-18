@@ -45,6 +45,8 @@ class AdminAuthTokenResponse(BaseModel):
 class AdminUserListResponse(BaseModel):
     items: list[dict[str, Any]]
     summary: dict[str, Any]
+    pagination: dict[str, Any] = Field(default_factory=dict)
+    filters: dict[str, Any] = Field(default_factory=dict)
 
 
 class AdminUserCreateRequest(BaseModel):
@@ -221,6 +223,7 @@ class AdminSiteConfigItemResponse(BaseModel):
     key: str
     group: str
     group_label: str
+    engine: Optional[str] = None
     label: str
     description: str
     is_secret: bool

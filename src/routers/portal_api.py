@@ -6,7 +6,9 @@ from typing import Optional
 
 from datetime import date
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import FileResponse
+from pydantic import ValidationError
 from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
@@ -43,6 +45,7 @@ from core.identity import has_bound_email, is_v2_identity_ready
 from core.plan_catalog import get_paid_tiers
 from core.quota_service import build_quota_snapshot, get_daily_subscription_limit
 from core.rate_limiter import enforce_auth_attempt_rate_limit
+from core import support_ticket_service
 from core.v2_request_metrics import get_subject_daily_usage_row, list_subject_daily_usage_rows, resolve_usage_subject_for_user
 from core.v2_dependencies import get_current_v2_user
 from core.v2_dependencies import revoke_v2_user_session
@@ -93,6 +96,7 @@ from schemas.portal import (
     PortalBindEmailRequest,
     PortalChangePasswordRequest,
     PortalCreateOrderIntentRequest,
+    PortalCreateSupportTicketRequest,
     PortalEntitlementResponse,
     PortalFaqItemResponse,
     PortalForgotPasswordRequest,
@@ -104,6 +108,7 @@ from schemas.portal import (
     PortalOrderIntentResponse,
     PortalOrderResponse,
     PortalResetPasswordRequest,
+    PortalSupportTicketResponse,
     PortalUpdateProfileRequest,
     PortalUserResponse,
     PortalVerifyEmailRequest,
@@ -120,6 +125,43 @@ def _ensure_v2_billing_enabled() -> None:
 def _ensure_v2_legacy_migration_enabled() -> None:
     if not settings.API_V2_ENABLED or not settings.API_V2_PORTAL_ENABLED or not settings.API_V2_LEGACY_MIGRATION_ENABLED:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
+def _form_text(value: object) -> str | None:
+    if value is None or hasattr(value, "filename"):
+        return None
+    return str(value)
+
+
+async def _read_support_ticket_payload(request: Request) -> tuple[PortalCreateSupportTicketRequest, list[UploadFile]]:
+    content_type = request.headers.get("content-type", "").lower()
+    attachments: list[UploadFile] = []
+
+    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+        form = await request.form()
+        for key, value in form.multi_items():
+            if key == support_ticket_service.ATTACHMENT_FIELD_NAME and hasattr(value, "filename") and hasattr(value, "read"):
+                attachments.append(value)  # type: ignore[arg-type]
+        try:
+            payload = PortalCreateSupportTicketRequest(
+                subject=_form_text(form.get("subject")),
+                message=_form_text(form.get("message")),
+                category=_form_text(form.get("category")),
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
+        return payload, attachments
+
+    try:
+        raw_payload = await request.json()
+    except Exception:
+        raw_payload = {}
+    if not isinstance(raw_payload, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid ticket payload")
+    try:
+        return PortalCreateSupportTicketRequest.model_validate(raw_payload), attachments
+    except ValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
 
 
 def _format_datetime(value: Optional[datetime]) -> Optional[str]:
@@ -590,7 +632,7 @@ def _validate_checkout_request_against_guide(
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected tier does not match the current pricing step")
 
 
-def _serialize_order(order: PaymentOrder) -> PortalOrderResponse:
+def _serialize_order(order: PaymentOrder, support_ticket: Optional[dict[str, object]] = None) -> PortalOrderResponse:
     status_text = _payment_status(order.status)
     return PortalOrderResponse(
         id=str(order.id),
@@ -603,6 +645,7 @@ def _serialize_order(order: PaymentOrder) -> PortalOrderResponse:
         cancellable=status_text == "pending",
         activationError=str(order.activation_error or "").strip(),
         activationErrorAt=_format_datetime(order.activation_error_at),
+        supportTicket=support_ticket,
     )
 
 
@@ -1216,7 +1259,96 @@ async def portal_orders(db: Session = Depends(get_db), current_user: V2User = De
         .order_by(PaymentOrder.created_at.desc(), PaymentOrder.id.desc())
         .all()
     )
-    return [_serialize_order(order) for order in orders]
+    ticket_map = support_ticket_service.get_ticket_summary_for_orders(db, [int(order.id) for order in orders], current_user)
+    return [_serialize_order(order, ticket_map.get(int(order.id))) for order in orders]
+
+
+@router.get("/account/tickets", response_model=list[PortalSupportTicketResponse])
+async def portal_support_tickets(db: Session = Depends(get_db), current_user: V2User = Depends(get_current_v2_user)):
+    return support_ticket_service.list_user_tickets(db, current_user)
+
+
+@router.post("/account/tickets", response_model=PortalSupportTicketResponse)
+async def portal_create_support_ticket(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: V2User = Depends(get_current_v2_user),
+):
+    payload, attachments = await _read_support_ticket_payload(request)
+    try:
+        return await support_ticket_service.create_general_support_ticket(
+            db,
+            current_user=current_user,
+            subject=payload.subject,
+            message=payload.message,
+            category=payload.category,
+            attachments=attachments,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/account/tickets/{ticket_id}/attachments/{attachment_id}")
+async def portal_support_ticket_attachment(
+    ticket_id: int,
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    current_user: V2User = Depends(get_current_v2_user),
+):
+    try:
+        payload = support_ticket_service.get_user_ticket_attachment_file(
+            db,
+            ticket_id=ticket_id,
+            attachment_id=attachment_id,
+            current_user=current_user,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return FileResponse(
+        payload["path"],
+        media_type=payload["content_type"],
+        filename=payload["filename"],
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@router.get("/account/tickets/{ticket_id}", response_model=PortalSupportTicketResponse)
+async def portal_support_ticket_detail(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    current_user: V2User = Depends(get_current_v2_user),
+):
+    try:
+        return support_ticket_service.get_user_ticket(db, ticket_id, current_user)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.post("/account/orders/{order_id}/support-ticket", response_model=PortalSupportTicketResponse)
+async def portal_create_order_support_ticket(
+    order_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: V2User = Depends(get_current_v2_user),
+):
+    payload, attachments = await _read_support_ticket_payload(request)
+    try:
+        return await support_ticket_service.create_order_support_ticket(
+            db,
+            order_id=order_id,
+            current_user=current_user,
+            message=payload.message,
+            attachments=attachments,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "Order not found":
+            status_code = status.HTTP_404_NOT_FOUND
+        elif detail == "Only activation failed orders can create a support ticket":
+            status_code = status.HTTP_409_CONFLICT
+        else:
+            status_code = status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.get("/account/migration-status", response_model=PortalMigrationStatusResponse)

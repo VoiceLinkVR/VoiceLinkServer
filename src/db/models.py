@@ -340,6 +340,61 @@ class PaymentOrder(Base):
     updated_at = Column(DateTime, default=datetime.now, nullable=False)
 
 
+class SupportTicket(Base):
+    __tablename__ = "v2_support_ticket"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticket_no = Column(String(32), unique=True, nullable=False, index=True)
+    order_id = Column(Integer, nullable=True, index=True)
+    order_no = Column(String(128), nullable=True, index=True)
+    out_trade_no = Column(String(128), nullable=True, index=True)
+    user_uuid = Column(String(36), nullable=True, index=True)
+    username = Column(String(50), nullable=True, index=True)
+    email = Column(String(255), nullable=True, index=True)
+    category = Column(String(32), nullable=False, default="order_activation", index=True)
+    subject = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, default="open", index=True)
+    priority = Column(String(16), nullable=False, default="normal", index=True)
+    public_reply = Column(Text, nullable=True)
+    internal_note = Column(Text, nullable=True)
+    last_event_at = Column(DateTime, nullable=True, index=True)
+    last_notified_at = Column(DateTime, nullable=True)
+    resolved_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+
+class SupportTicketEvent(Base):
+    __tablename__ = "v2_support_ticket_event"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticket_id = Column(Integer, nullable=False, index=True)
+    actor_type = Column(String(32), nullable=False, default="system", index=True)
+    actor_username = Column(String(50), nullable=True, index=True)
+    action = Column(String(32), nullable=False, index=True)
+    old_status = Column(String(32), nullable=True)
+    new_status = Column(String(32), nullable=True, index=True)
+    message = Column(Text, nullable=True)
+    email_sent = Column(Boolean, nullable=False, default=False)
+    email_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+
+class SupportTicketAttachment(Base):
+    __tablename__ = "v2_support_ticket_attachment"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticket_id = Column(Integer, nullable=False, index=True)
+    storage_path = Column(String(512), nullable=False)
+    original_filename = Column(String(255), nullable=False)
+    content_type = Column(String(100), nullable=False)
+    file_size = Column(Integer, nullable=False, default=0)
+    uploaded_by_user_uuid = Column(String(36), nullable=True, index=True)
+    uploaded_by_username = Column(String(50), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+
 class UserSubscriptionState(Base):
     __tablename__ = "v2_user_subscription_state"
 

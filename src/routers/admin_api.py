@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from core import admin_service
+from core import support_ticket_service
 import core.content_service as content_service
 import core.site_config_service as site_config_service
 from core.config import settings
@@ -32,6 +34,7 @@ from schemas.admin import (
     AdminSiteConfigListResponse,
     AdminSiteConfigUpdateRequest,
     AdminSiteConfigUpdateResponse,
+    AdminSupportTicketUpdateRequest,
     AdminAuthTokenResponse,
     AdminOrderActivateRequest,
     AdminOrderLookupRequest,
@@ -172,6 +175,11 @@ async def me_admin(current_user: V2User = Depends(get_current_admin_v2_user)):
 @router.get("/dashboard/summary")
 async def dashboard_summary(_: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     return admin_service.build_dashboard_summary(db)
+
+
+@router.get("/subscriptions/summary")
+async def subscriptions_summary(_: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
+    return admin_service.build_subscription_stats_payload(db)
 
 
 @router.get("/users")
@@ -317,12 +325,103 @@ async def activate_order(
     }
 
 
+@router.post("/orders/{order_id}/mark-handled")
+async def mark_order_handled(
+    order_id: int,
+    _: V2User = Depends(get_current_admin_v2_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return admin_service.mark_order_manually_handled(db, order_id)
+    except ValueError as exc:
+        status_code = status.HTTP_404_NOT_FOUND if str(exc) == "Order not found" else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+
 @router.get("/orders/{order_id}")
 async def get_order(order_id: int, _: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
     try:
         return admin_service.get_order_detail_payload(db, order_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get("/tickets")
+async def list_support_tickets(
+    search: str | None = Query(default=None, max_length=255),
+    ticket_status: str | None = Query(default="all", alias="status", max_length=32),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    _: V2User = Depends(get_current_admin_v2_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return support_ticket_service.list_admin_tickets_payload(
+            db,
+            search=search,
+            status_filter=ticket_status,
+            page=page,
+            page_size=page_size,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/tickets/{ticket_id}")
+async def get_support_ticket(
+    ticket_id: int,
+    _: V2User = Depends(get_current_admin_v2_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return support_ticket_service.get_admin_ticket(db, ticket_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get("/tickets/{ticket_id}/attachments/{attachment_id}")
+async def get_support_ticket_attachment(
+    ticket_id: int,
+    attachment_id: int,
+    _: V2User = Depends(get_current_admin_v2_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        payload = support_ticket_service.get_admin_ticket_attachment_file(
+            db,
+            ticket_id=ticket_id,
+            attachment_id=attachment_id,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return FileResponse(
+        payload["path"],
+        media_type=payload["content_type"],
+        filename=payload["filename"],
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@router.patch("/tickets/{ticket_id}")
+async def update_support_ticket(
+    ticket_id: int,
+    payload: AdminSupportTicketUpdateRequest,
+    current_user: V2User = Depends(get_current_admin_v2_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return support_ticket_service.update_admin_ticket(
+            db,
+            ticket_id=ticket_id,
+            actor=current_user,
+            status_value=payload.status,
+            public_reply=payload.publicReply,
+            internal_note=payload.internalNote,
+            mark_order_handled=payload.markOrderHandled,
+        )
+    except ValueError as exc:
+        status_code = status.HTTP_404_NOT_FOUND if str(exc) == "Ticket not found" else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.get("/stats")

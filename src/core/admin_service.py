@@ -2,7 +2,7 @@ import json
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import case, desc, func, literal, or_, text
+from sqlalchemy import and_, case, desc, func, literal, or_, text
 from sqlalchemy.orm import Session
 
 from core.afdian_service import afdian_service
@@ -33,6 +33,31 @@ MAX_HOUR_OPTIONS = 168
 MAX_DETAIL_ROWS = 300
 MAX_ORDER_PAGE_SIZE = 200
 PAYMENT_PENDING_EXPIRE_HOURS = 24
+ORDER_ACTIVATION_FAILED_STATUS = "activation_failed"
+ORDER_MANUAL_HANDLED_STATUS = "manual_handled"
+ORDER_ACTIVATION_FAILED_ALIASES = {
+    ORDER_ACTIVATION_FAILED_STATUS,
+    "activation_error",
+    "activation_failed_orders",
+    "auto_activation_failed",
+    "auto_failed",
+    "failed",
+    "failed_activation",
+}
+ORDER_MANUAL_HANDLED_ALIASES = {
+    ORDER_MANUAL_HANDLED_STATUS,
+    "manually_handled",
+    "manual_processed",
+    "manual_resolved",
+    "handled",
+}
+ORDER_STATUS_LABELS = {
+    "activated": "Activated",
+    "pending": "Pending",
+    "unpaid": "Closed",
+    ORDER_ACTIVATION_FAILED_STATUS: "Auto activation failed",
+    ORDER_MANUAL_HANDLED_STATUS: "Manually handled",
+}
 EXCLUDED_ENDPOINTS = [
     "/api/login",
     "/api/latestVersionInfo",
@@ -62,6 +87,8 @@ AFDIAN_ACTION_LABELS = {
 AFDIAN_ACTIVATION_SOURCE_LABELS = {
     "manual_activate": "Manual activation",
     "admin_manual_activate": "Admin manual activation",
+    "admin_manual_handled": "Admin marked handled",
+    "admin_ticket_handled": "Support ticket handled",
     "legacy_manual_activate": "Legacy manual activation",
     "webhook_direct": "Webhook direct activation",
     "webhook_query_confirmed": "Webhook query confirmation",
@@ -118,7 +145,7 @@ def _parse_json_text(raw_text: Optional[str]) -> Any:
 
 def _normalize_payment_status(status: Optional[str]) -> str:
     normalized = str(status or "").strip().lower()
-    if normalized in {"pending", "activated", "unpaid"}:
+    if normalized in {"pending", "activated", "unpaid", ORDER_ACTIVATION_FAILED_STATUS, ORDER_MANUAL_HANDLED_STATUS}:
         return normalized
     return normalized or "unknown"
 
@@ -127,9 +154,55 @@ def _normalize_order_filter_status(status: Optional[str]) -> Optional[str]:
     normalized = str(status or "").strip().lower()
     if not normalized or normalized == "all":
         return None
+    if normalized in ORDER_ACTIVATION_FAILED_ALIASES:
+        return ORDER_ACTIVATION_FAILED_STATUS
+    if normalized in ORDER_MANUAL_HANDLED_ALIASES:
+        return ORDER_MANUAL_HANDLED_STATUS
     if normalized in {"closed", "cancelled", "canceled"}:
         return "unpaid"
     return normalized
+
+
+def _order_has_activation_failure(order: PaymentOrder) -> bool:
+    return bool(str(getattr(order, "activation_error", None) or "").strip())
+
+
+def _activation_failure_filters() -> list[Any]:
+    return [
+        PaymentOrder.activation_error.isnot(None),
+        func.length(func.trim(PaymentOrder.activation_error)) > 0,
+    ]
+
+
+def _activation_failure_condition() -> Any:
+    error_condition = and_(*_activation_failure_filters())
+    return or_(
+        PaymentOrder.status == ORDER_ACTIVATION_FAILED_STATUS,
+        and_(
+            error_condition,
+            PaymentOrder.status != ORDER_MANUAL_HANDLED_STATUS,
+        ),
+    )
+
+
+def _no_activation_failure_condition() -> Any:
+    return and_(
+        PaymentOrder.status != ORDER_ACTIVATION_FAILED_STATUS,
+        or_(
+            PaymentOrder.activation_error.is_(None),
+            func.length(func.trim(PaymentOrder.activation_error)) == 0,
+            PaymentOrder.status == ORDER_MANUAL_HANDLED_STATUS,
+        ),
+    )
+
+
+def _display_order_status(order: PaymentOrder) -> tuple[str, str]:
+    payment_status = _normalize_payment_status(order.status)
+    if payment_status == ORDER_MANUAL_HANDLED_STATUS:
+        return ORDER_MANUAL_HANDLED_STATUS, payment_status
+    if payment_status == ORDER_ACTIVATION_FAILED_STATUS or _order_has_activation_failure(order):
+        return ORDER_ACTIVATION_FAILED_STATUS, payment_status
+    return payment_status, payment_status
 
 
 def _parse_filter_datetime(value: Optional[str], *, end_of_day: bool = False) -> Optional[datetime]:
@@ -189,6 +262,7 @@ def close_expired_pending_orders(db: Session) -> int:
             PaymentOrder.status == "pending",
             PaymentOrder.created_at.isnot(None),
             PaymentOrder.created_at <= expire_before,
+            _no_activation_failure_condition(),
         )
         .all()
     )
@@ -651,7 +725,7 @@ def delete_user(db: Session, user_id: int) -> dict[str, Any]:
 def _build_afdian_order_payload(order: PaymentOrder) -> dict[str, Any]:
     parsed_custom_id = None
     custom_id_parse_error = None
-    status = _normalize_payment_status(order.status)
+    status, payment_status = _display_order_status(order)
     if order.custom_id:
         try:
             parsed_custom_id = afdian_service.parse_custom_id(order.custom_id)
@@ -674,12 +748,11 @@ def _build_afdian_order_payload(order: PaymentOrder) -> dict[str, Any]:
         "addon_resource_snapshot": getattr(order, "addon_resource_snapshot", None),
         "amount": round(float(order.amount), 2) if order.amount is not None else None,
         "status": status,
-        "status_label": {
-            "activated": "Activated",
-            "pending": "Pending",
-            "unpaid": "Closed",
-        }.get(status, status),
-        "default_collapsed": status == "unpaid",
+        "status_key": status,
+        "payment_status": payment_status,
+        "raw_status": payment_status,
+        "status_label": ORDER_STATUS_LABELS.get(status, status),
+        "default_collapsed": payment_status == "unpaid" and status != ORDER_ACTIVATION_FAILED_STATUS,
         "activated_at": _to_utc_iso(order.activated_at),
         "activation_source": getattr(order, "activation_source", None),
         "activation_source_label": _get_activation_source_label(getattr(order, "activation_source", None)),
@@ -769,8 +842,14 @@ def list_orders_payload(
             )
         filters.append(or_(*search_filters))
 
-    if normalized_status:
+    if normalized_status == ORDER_ACTIVATION_FAILED_STATUS:
+        filters.append(_activation_failure_condition())
+    elif normalized_status == ORDER_MANUAL_HANDLED_STATUS:
+        filters.append(PaymentOrder.status == ORDER_MANUAL_HANDLED_STATUS)
+    elif normalized_status:
         filters.append(PaymentOrder.status == normalized_status)
+        if normalized_status in {"pending", "unpaid"}:
+            filters.append(_no_activation_failure_condition())
     if normalized_action and normalized_action != "all":
         filters.append(PaymentOrder.action == normalized_action)
     if created_from_dt:
@@ -808,14 +887,35 @@ def list_orders_payload(
         }
         for row in status_rows
     }
-    activated_orders = status_counts.get("activated", {}).get("count", 0)
-    pending_orders = status_counts.get("pending", {}).get("count", 0)
-    closed_orders = status_counts.get("unpaid", {}).get("count", 0)
     filtered_amount_total = round(sum(float(row.amount_total or 0) for row in status_rows), 2)
     activated_amount_total = round(float(status_counts.get("activated", {}).get("amount_total", 0)), 2)
+    activated_orders = (
+        db.query(func.count(PaymentOrder.id))
+        .filter(*filters, PaymentOrder.status == "activated")
+        .scalar()
+        or 0
+    )
+    pending_orders = (
+        db.query(func.count(PaymentOrder.id))
+        .filter(*filters, PaymentOrder.status == "pending", _no_activation_failure_condition())
+        .scalar()
+        or 0
+    )
+    closed_orders = (
+        db.query(func.count(PaymentOrder.id))
+        .filter(*filters, PaymentOrder.status == "unpaid", _no_activation_failure_condition())
+        .scalar()
+        or 0
+    )
     activation_error_orders = (
         db.query(func.count(PaymentOrder.id))
-        .filter(*filters, PaymentOrder.activation_error.isnot(None))
+        .filter(*filters, _activation_failure_condition())
+        .scalar()
+        or 0
+    )
+    manual_handled_orders = (
+        db.query(func.count(PaymentOrder.id))
+        .filter(*filters, PaymentOrder.status == ORDER_MANUAL_HANDLED_STATUS)
         .scalar()
         or 0
     )
@@ -839,7 +939,9 @@ def list_orders_payload(
             "activated_orders": activated_orders,
             "pending_orders": pending_orders,
             "closed_orders": closed_orders,
+            "activation_failed_orders": activation_error_orders,
             "activation_error_orders": activation_error_orders,
+            "manual_handled_orders": manual_handled_orders,
             "filtered_amount_total": filtered_amount_total,
             "activated_amount_total": activated_amount_total,
             "average_amount": round((filtered_amount_total / total_items), 2) if total_items else 0,
@@ -871,6 +973,27 @@ def get_order_detail_payload(db: Session, order_id: int) -> dict[str, Any]:
     order = db.query(PaymentOrder).filter(PaymentOrder.id == order_id).first()
     if order is None:
         raise ValueError("Order not found")
+    return _build_afdian_order_payload(order)
+
+
+def mark_order_manually_handled(db: Session, order_id: int) -> dict[str, Any]:
+    order = db.query(PaymentOrder).filter(PaymentOrder.id == order_id).first()
+    if order is None:
+        raise ValueError("Order not found")
+
+    status_text = _normalize_payment_status(order.status)
+    if status_text == "activated":
+        raise ValueError("Activated order cannot be marked as manually handled")
+    if status_text == ORDER_MANUAL_HANDLED_STATUS:
+        return _build_afdian_order_payload(order)
+    if status_text != ORDER_ACTIVATION_FAILED_STATUS and not _order_has_activation_failure(order):
+        raise ValueError("Only activation failed orders can be marked as manually handled")
+
+    order.status = ORDER_MANUAL_HANDLED_STATUS
+    order.activation_source = "admin_manual_handled"
+    order.updated_at = utcnow_naive()
+    db.commit()
+    db.refresh(order)
     return _build_afdian_order_payload(order)
 
 
@@ -972,6 +1095,161 @@ def build_dashboard_summary(db: Session) -> dict[str, Any]:
         "orders": order_payload["summary"],
         "latest_users": latest_users,
         "latest_orders": latest_orders,
+    }
+
+
+def _subscription_remaining_days(expires_at: Optional[datetime], now: datetime) -> Optional[int]:
+    if expires_at is None:
+        return None
+    remaining_seconds = (expires_at - now).total_seconds()
+    return max(0, int((remaining_seconds + 86399) // 86400))
+
+
+def build_subscription_stats_payload(db: Session) -> dict[str, Any]:
+    close_expired_pending_orders(db)
+
+    now = datetime.utcnow()
+    expiring_7d_at = now + timedelta(days=7)
+    expiring_30d_at = now + timedelta(days=30)
+
+    active_subscription_users = 0
+    active_monthly_amount = 0.0
+    paid_state_users = 0
+    expired_paid_users = 0
+    inactive_paid_users = 0
+    expiring_7d_users = 0
+    expiring_30d_users = 0
+    addon_active_users = 0
+    addon_balance_total = 0
+    plan_groups: dict[tuple[str, str, float, int], dict[str, Any]] = {}
+    expiring_soon: list[dict[str, Any]] = []
+
+    users = db.query(V2User).order_by(desc(V2User.created_at), desc(V2User.id)).all()
+    for user in users:
+        subscription_state, addon_wallet = ensure_user_entitlement_state(db, user)
+        status_value = str(subscription_state.status or "").strip().lower()
+        plan_price = round(float(subscription_state.plan_price or 0), 2)
+        expires_at = subscription_state.expires_at
+        is_paid_state = plan_price > 0
+        expires_in_future = expires_at is None or expires_at > now
+        is_active_paid = is_paid_state and status_value == "active" and expires_in_future
+
+        if is_paid_state:
+            paid_state_users += 1
+            if expires_at is not None and expires_at <= now:
+                expired_paid_users += 1
+            elif status_value == "inactive":
+                inactive_paid_users += 1
+
+        if is_active_paid:
+            active_subscription_users += 1
+            active_monthly_amount += plan_price
+
+            plan_key = (
+                str(subscription_state.plan_ref or ""),
+                str(subscription_state.pricing_mode or ""),
+                plan_price,
+                int(subscription_state.daily_quota or 0),
+            )
+            group = plan_groups.setdefault(
+                plan_key,
+                {
+                    "plan_ref": plan_key[0],
+                    "pricing_mode": plan_key[1],
+                    "plan_price": plan_price,
+                    "daily_quota": plan_key[3],
+                    "user_count": 0,
+                    "monthly_amount": 0.0,
+                },
+            )
+            group["user_count"] += 1
+            group["monthly_amount"] = round(float(group["monthly_amount"]) + plan_price, 2)
+
+            if expires_at is not None and expires_at <= expiring_7d_at:
+                expiring_7d_users += 1
+            if expires_at is not None and expires_at <= expiring_30d_at:
+                expiring_30d_users += 1
+                expiring_soon.append(
+                    {
+                        "user_id": str(user.id),
+                        "username": user.username,
+                        "plan_ref": subscription_state.plan_ref,
+                        "pricing_mode": subscription_state.pricing_mode,
+                        "plan_price": plan_price,
+                        "daily_quota": int(subscription_state.daily_quota or 0),
+                        "expires_at": _to_utc_iso(expires_at),
+                        "remaining_days": _subscription_remaining_days(expires_at, now),
+                    }
+                )
+
+        addon_balance = int(addon_wallet.balance or 0)
+        if addon_balance > 0 and addon_wallet.expires_at is not None and addon_wallet.expires_at > now:
+            addon_active_users += 1
+            addon_balance_total += addon_balance
+
+    subscription_order_filter = or_(
+        PaymentOrder.order_kind == "subscription",
+        PaymentOrder.action.in_(["renew", "upgrade", "subscribe"]),
+    )
+    pending_subscription_row = (
+        db.query(
+            func.count(PaymentOrder.id).label("count"),
+            func.coalesce(func.sum(PaymentOrder.amount), 0.0).label("amount_total"),
+        )
+        .filter(PaymentOrder.status == "pending", subscription_order_filter)
+        .first()
+    )
+    activated_subscription_row = (
+        db.query(
+            func.count(PaymentOrder.id).label("count"),
+            func.coalesce(func.sum(PaymentOrder.amount), 0.0).label("amount_total"),
+        )
+        .filter(PaymentOrder.status == "activated", subscription_order_filter)
+        .first()
+    )
+
+    active_by_plan = sorted(
+        (
+            {
+                **group,
+                "monthly_amount": round(float(group["monthly_amount"] or 0), 2),
+            }
+            for group in plan_groups.values()
+        ),
+        key=lambda item: (-float(item["monthly_amount"]), -int(item["user_count"]), float(item["plan_price"])),
+    )
+    expiring_soon.sort(key=lambda item: (item["remaining_days"] is None, item["remaining_days"] or 999999, item["username"]))
+
+    return {
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "summary": {
+            "total_users": len(users),
+            "paid_state_users": paid_state_users,
+            "active_subscription_users": active_subscription_users,
+            "active_monthly_amount": round(active_monthly_amount, 2),
+            "active_avg_monthly_amount": round(active_monthly_amount / active_subscription_users, 2)
+            if active_subscription_users
+            else 0.0,
+            "expired_paid_users": expired_paid_users,
+            "inactive_paid_users": inactive_paid_users,
+            "expiring_7d_users": expiring_7d_users,
+            "expiring_30d_users": expiring_30d_users,
+            "addon_active_users": addon_active_users,
+            "addon_balance_total": addon_balance_total,
+            "pending_subscription_orders": int(getattr(pending_subscription_row, "count", 0) or 0),
+            "pending_subscription_amount": round(float(getattr(pending_subscription_row, "amount_total", 0.0) or 0.0), 2),
+            "activated_subscription_orders": int(getattr(activated_subscription_row, "count", 0) or 0),
+            "activated_subscription_amount_total": round(
+                float(getattr(activated_subscription_row, "amount_total", 0.0) or 0.0),
+                2,
+            ),
+        },
+        "active_by_plan": active_by_plan,
+        "expiring_soon": expiring_soon[:20],
+        "meta": {
+            "calculation": "active_monthly_amount sums each currently active paid user's monthly plan price once; prepaid future months are not multiplied.",
+            "active_rule": "status=active, plan_price>0, and expires_at is empty or later than now",
+        },
     }
 
 

@@ -124,6 +124,13 @@ class AdminOrderActivateRequest(BaseModel):
     keyword: str = Field(..., min_length=1, max_length=512)
 
 
+class AdminSupportTicketUpdateRequest(BaseModel):
+    status: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    publicReply: Optional[str] = Field(default=None, max_length=4000)
+    internalNote: Optional[str] = Field(default=None, max_length=4000)
+    markOrderHandled: bool = False
+
+
 class AdminStatsQuery(BaseModel):
     hour: Optional[str] = Field(default=None, max_length=32)
 

@@ -25,6 +25,12 @@ class PortalCreateOrderIntentRequest(BaseModel):
     guideToken: Optional[str] = Field(default=None, min_length=1, max_length=2048)
 
 
+class PortalCreateSupportTicketRequest(BaseModel):
+    subject: Optional[str] = Field(default=None, max_length=200)
+    message: Optional[str] = Field(default=None, max_length=2000)
+    category: Optional[str] = Field(default=None, max_length=32)
+
+
 class PortalBindEmailRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
     migrationToken: Optional[str] = Field(default=None, min_length=1, max_length=255)
@@ -138,6 +144,32 @@ class PortalOrderResponse(BaseModel):
     cancellable: bool = False
     activationError: str = ""
     activationErrorAt: Optional[str] = None
+    supportTicket: Optional[dict] = None
+
+
+class PortalSupportTicketResponse(BaseModel):
+    id: str
+    ticketNo: str
+    orderId: str = ""
+    orderNo: str = ""
+    outTradeNo: str = ""
+    username: str = ""
+    email: str = ""
+    category: str = "order_activation"
+    subject: str
+    description: str = ""
+    status: str
+    statusLabel: str
+    priority: str = "normal"
+    publicReply: str = ""
+    lastEventAt: Optional[str] = None
+    lastNotifiedAt: Optional[str] = None
+    resolvedAt: Optional[str] = None
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    order: Optional[dict] = None
+    attachments: List[dict] = Field(default_factory=list)
+    events: List[dict] = Field(default_factory=list)
 
 
 class PortalBillingPlanResponse(BaseModel):

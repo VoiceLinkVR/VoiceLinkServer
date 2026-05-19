@@ -121,6 +121,9 @@ class Settings(BaseSettings):
     MODEL_MANIFEST_PATH: str = f"{project_root}/data/update/models_manifest.json"
     TRANSLATION_PROFILE_MANIFEST_PATH: str = f"{project_root}/data/update/translation_profile_manifest.json"
     TRANSLATOR_RUNTIME_MANIFEST_PATH: str = f"{project_root}/data/update/translator_runtime_manifest.json"
+    SUPPORT_TICKET_ATTACHMENT_ROOT: str = f"{project_root}/data/support_ticket_attachments"
+    SUPPORT_TICKET_ATTACHMENT_MAX_FILES: int = 5
+    SUPPORT_TICKET_ATTACHMENT_MAX_MB: int = 10
     TRANSLATION_CAPABILITIES_CACHE_SECONDS: int = 1800
     TRANSLATION_CAPABILITY_TIMEOUT: float = 4.0
     LOG_LEVEL: str = "INFO"

@@ -67,6 +67,9 @@ ACTION_ALIASES = {
     "addon": "addon",
 }
 PRICE_EPSILON = 0.0001
+ORDER_ACTIVATION_FAILED_STATUS = "activation_failed"
+ORDER_MANUAL_HANDLED_STATUS = "manual_handled"
+ORDER_TERMINAL_STATUSES = {"activated", "cancelled", ORDER_ACTIVATION_FAILED_STATUS, ORDER_MANUAL_HANDLED_STATUS}
 
 
 def _is_test_user(username: str) -> bool:
@@ -876,6 +879,9 @@ def _record_order_activation_failure(
 
     order.activation_error = detail
     order.activation_error_at = _utc_now_naive()
+    if order.status not in {"activated", "cancelled", ORDER_MANUAL_HANDLED_STATUS}:
+        order.status = ORDER_ACTIVATION_FAILED_STATUS
+    order.activation_source = (source or "").strip() or order.activation_source
     order.updated_at = _utc_now_naive()
     order.raw_payload = json_dumps_safe(
         {
@@ -1001,7 +1007,7 @@ def _sync_local_order_from_remote(
         set_payment_order_remark(local_order, custom_id)
     if remote_amount is not None:
         local_order.amount = remote_amount
-    if local_order.status not in {"activated", "cancelled"}:
+    if local_order.status not in ORDER_TERMINAL_STATUSES:
         local_order.status = "pending"
     local_order.updated_at = _utc_now_naive()
     local_order.raw_payload = _build_remote_payload_snapshot(source, remote_order, source_payload)
@@ -1040,6 +1046,17 @@ async def activate_remote_afdian_order(
         db.commit()
         return {
             "message": "订单已激活，无需重复提交",
+            "idempotent": True,
+            "username": local_order.username,
+            "out_trade_no": local_order.out_trade_no,
+            "order_no": local_order.order_no,
+            "action": local_order.action,
+            "activation_source": local_order.activation_source,
+        }
+
+    if local_order.status == ORDER_MANUAL_HANDLED_STATUS:
+        return {
+            "message": "订单已手工处理，无需自动激活",
             "idempotent": True,
             "username": local_order.username,
             "out_trade_no": local_order.out_trade_no,

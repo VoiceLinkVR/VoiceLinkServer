@@ -17,6 +17,7 @@ from core.entitlement_service import (
 from core.logging_config import logger
 from core.plan_catalog import get_free_plan
 from core.v2_request_metrics import V2_METRIC_EXCLUDED_ENDPOINTS, V2_METRIC_EXCLUDED_PREFIXES
+from core.quota_service import get_daily_subscription_limit
 from db.models import (
     LegacyRequestLog,
     PaymentOrder,
@@ -24,6 +25,7 @@ from db.models import (
     V2EndpointHourlyStats,
     V2RequestAuditLog,
     V2User,
+    V2SubjectDailyUsage,
     normalize_payment_lookup_value,
     payment_lookup_digest,
 )
@@ -519,8 +521,425 @@ def get_user_detail_payload(db: Session, user_id: int) -> dict[str, Any]:
     }
 
 
-def create_user(db: Session, payload: Any) -> dict[str, Any]:
+def _usage_int(value: Any) -> int:
+    return int(value or 0)
+
+
+def _usage_day_key(value: Any) -> str:
+    return value.strftime("%Y-%m-%d") if hasattr(value, "strftime") else str(value)
+
+
+def _usage_hour_key(value: Any) -> str:
+    return value.strftime("%Y-%m-%d %H:00") if hasattr(value, "strftime") else str(value)
+
+
+def _user_log_owner_filter(log_model, user: V2User):
+    clauses = []
+    user_uuid = str(getattr(user, "user_uuid", "") or "").strip()
+    username = str(getattr(user, "username", "") or "").strip()
+    if user_uuid and hasattr(log_model, "user_uuid"):
+        clauses.append(log_model.user_uuid == user_uuid)
+    if username and hasattr(log_model, "username"):
+        clauses.append(log_model.username == username)
+    return or_(*clauses) if clauses else literal(False)
+
+
+def _user_subject_daily_filter(user: V2User):
+    clauses = []
+    user_uuid = str(getattr(user, "user_uuid", "") or "").strip()
+    username = str(getattr(user, "username", "") or "").strip()
+    subject_keys = [value for value in (user_uuid, username) if value]
+    if subject_keys:
+        clauses.append(V2SubjectDailyUsage.subject_key.in_(subject_keys))
+    if user_uuid:
+        clauses.append(V2SubjectDailyUsage.user_uuid == user_uuid)
+    if username:
+        clauses.append(V2SubjectDailyUsage.username == username)
+    return or_(*clauses) if clauses else literal(False)
+
+
+def _daily_resource_cost_case(log_model):
+    return case((log_model.quota_source == "daily", log_model.resource_cost), else_=0)
+
+
+def _addon_resource_cost_case(log_model):
+    return case((log_model.quota_source == "addon", log_model.resource_cost), else_=0)
+
+
+def _empty_daily_usage_row(day_text: str, daily_limit: Optional[int]) -> dict[str, Any]:
+    return {
+        "date": day_text,
+        "day": day_text,
+        "daily_success_count": 0,
+        "daily_failed_count": 0,
+        "daily_rate_limited_count": 0,
+        "daily_resource_cost": 0,
+        "daily_subscription_resource_cost": 0,
+        "daily_addon_resource_cost": 0,
+        "daily_deducted_request_count": 0,
+        "daily_total_count": 0,
+        "daily_success_rate": 0,
+        "daily_limit": daily_limit,
+        "remaining_daily": daily_limit,
+    }
+
+
+def _empty_hourly_usage_row(hour_text: str) -> dict[str, Any]:
+    return {
+        "hour": hour_text,
+        "hour_label": hour_text[11:16] if len(hour_text) >= 16 else hour_text,
+        "success_count": 0,
+        "failed_count": 0,
+        "rate_limited_count": 0,
+        "resource_cost": 0,
+        "subscription_resource_cost": 0,
+        "addon_resource_cost": 0,
+        "deducted_request_count": 0,
+        "total_count": 0,
+        "success_rate": 0,
+    }
+
+
+def _query_user_subject_daily_usage(
+    db: Session,
+    user: V2User,
+    *,
+    start_day,
+    end_day,
+):
+    return (
+        db.query(
+            V2SubjectDailyUsage.usage_date.label("day"),
+            func.sum(V2SubjectDailyUsage.success_count).label("success_count"),
+            func.sum(V2SubjectDailyUsage.failed_count).label("failed_count"),
+            func.sum(V2SubjectDailyUsage.rate_limited_count).label("rate_limited_count"),
+            func.sum(V2SubjectDailyUsage.resource_cost_sum).label("resource_cost"),
+            func.sum(V2SubjectDailyUsage.daily_resource_used).label("subscription_resource_cost"),
+            func.sum(V2SubjectDailyUsage.addon_resource_used).label("addon_resource_cost"),
+            func.sum(V2SubjectDailyUsage.deducted_request_count).label("deducted_request_count"),
+            func.sum(V2SubjectDailyUsage.total_count).label("total_count"),
+        )
+        .filter(
+            V2SubjectDailyUsage.usage_date >= start_day,
+            V2SubjectDailyUsage.usage_date <= end_day,
+            _user_subject_daily_filter(user),
+        )
+        .group_by(V2SubjectDailyUsage.usage_date)
+        .all()
+    )
+
+
+def _query_user_log_daily_usage(
+    db: Session,
+    user: V2User,
+    log_model,
+    *,
+    utc_start_dt: datetime,
+    utc_end_dt: datetime,
+):
+    date_expr = _get_local_date_expr(db, log_model)
+    return (
+        db.query(
+            date_expr.label("day"),
+            func.sum(case((log_model.status == "success", 1), else_=0)).label("success_count"),
+            func.sum(case((log_model.status == "failed", 1), else_=0)).label("failed_count"),
+            func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+            func.sum(log_model.resource_cost).label("resource_cost"),
+            func.sum(_daily_resource_cost_case(log_model)).label("subscription_resource_cost"),
+            func.sum(_addon_resource_cost_case(log_model)).label("addon_resource_cost"),
+            func.sum(case((log_model.resource_deducted == True, 1), else_=0)).label("deducted_request_count"),  # noqa: E712
+            func.count().label("total_count"),
+        )
+        .filter(
+            log_model.timestamp >= utc_start_dt,
+            log_model.timestamp < utc_end_dt,
+            _user_log_owner_filter(log_model, user),
+            *_endpoint_filters(log_model),
+        )
+        .group_by(date_expr)
+        .all()
+    )
+
+
+def _get_v2_audit_local_hour_expr(db: Session):
+    if db.bind.dialect.name == "sqlite":
+        return func.strftime("%Y-%m-%d %H:00", func.datetime(V2RequestAuditLog.created_at, f"+{LOCAL_TIME_OFFSET_HOURS} hours"))
+    return func.date_format(
+        func.date_add(V2RequestAuditLog.created_at, text(f"INTERVAL {LOCAL_TIME_OFFSET_HOURS} HOUR")),
+        "%Y-%m-%d %H:00",
+    )
+
+
+def _get_v2_audit_local_date_expr(db: Session):
+    if db.bind.dialect.name == "sqlite":
+        return func.date(func.datetime(V2RequestAuditLog.created_at, f"+{LOCAL_TIME_OFFSET_HOURS} hours"))
+    return func.date(func.date_add(V2RequestAuditLog.created_at, text(f"INTERVAL {LOCAL_TIME_OFFSET_HOURS} HOUR")))
+
+
+def _query_user_v2_audit_daily_usage(
+    db: Session,
+    user: V2User,
+    *,
+    utc_start_dt: datetime,
+    utc_end_dt: datetime,
+):
+    date_expr = _get_v2_audit_local_date_expr(db)
+    return (
+        db.query(
+            date_expr.label("day"),
+            func.sum(case((V2RequestAuditLog.status == "success", 1), else_=0)).label("success_count"),
+            func.sum(case((V2RequestAuditLog.status == "failed", 1), else_=0)).label("failed_count"),
+            func.sum(case((V2RequestAuditLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+            func.sum(V2RequestAuditLog.resource_cost).label("resource_cost"),
+            func.sum(_daily_resource_cost_case(V2RequestAuditLog)).label("subscription_resource_cost"),
+            func.sum(_addon_resource_cost_case(V2RequestAuditLog)).label("addon_resource_cost"),
+            func.sum(case((V2RequestAuditLog.resource_deducted == True, 1), else_=0)).label("deducted_request_count"),  # noqa: E712
+            func.count().label("total_count"),
+        )
+        .filter(
+            V2RequestAuditLog.created_at >= utc_start_dt,
+            V2RequestAuditLog.created_at < utc_end_dt,
+            _user_log_owner_filter(V2RequestAuditLog, user),
+            *_v2_audit_filters(),
+        )
+        .group_by(date_expr)
+        .all()
+    )
+
+
+def _query_user_v2_audit_hourly_usage(
+    db: Session,
+    user: V2User,
+    *,
+    utc_start_dt: datetime,
+    utc_end_dt: datetime,
+):
+    hour_expr = _get_v2_audit_local_hour_expr(db)
+    return (
+        db.query(
+            hour_expr.label("hour"),
+            func.sum(case((V2RequestAuditLog.status == "success", 1), else_=0)).label("success_count"),
+            func.sum(case((V2RequestAuditLog.status == "failed", 1), else_=0)).label("failed_count"),
+            func.sum(case((V2RequestAuditLog.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+            func.sum(V2RequestAuditLog.resource_cost).label("resource_cost"),
+            func.sum(_daily_resource_cost_case(V2RequestAuditLog)).label("subscription_resource_cost"),
+            func.sum(_addon_resource_cost_case(V2RequestAuditLog)).label("addon_resource_cost"),
+            func.sum(case((V2RequestAuditLog.resource_deducted == True, 1), else_=0)).label("deducted_request_count"),  # noqa: E712
+            func.count().label("total_count"),
+        )
+        .filter(
+            V2RequestAuditLog.created_at >= utc_start_dt,
+            V2RequestAuditLog.created_at < utc_end_dt,
+            _user_log_owner_filter(V2RequestAuditLog, user),
+            *_v2_audit_filters(),
+        )
+        .group_by(hour_expr)
+        .all()
+    )
+
+
+def _query_user_log_hourly_usage(
+    db: Session,
+    user: V2User,
+    log_model,
+    *,
+    utc_start_dt: datetime,
+    utc_end_dt: datetime,
+):
+    hour_expr = _get_local_hour_expr(db, log_model)
+    return (
+        db.query(
+            hour_expr.label("hour"),
+            func.sum(case((log_model.status == "success", 1), else_=0)).label("success_count"),
+            func.sum(case((log_model.status == "failed", 1), else_=0)).label("failed_count"),
+            func.sum(case((log_model.status == "rate_limited", 1), else_=0)).label("rate_limited_count"),
+            func.sum(log_model.resource_cost).label("resource_cost"),
+            func.sum(_daily_resource_cost_case(log_model)).label("subscription_resource_cost"),
+            func.sum(_addon_resource_cost_case(log_model)).label("addon_resource_cost"),
+            func.sum(case((log_model.resource_deducted == True, 1), else_=0)).label("deducted_request_count"),  # noqa: E712
+            func.count().label("total_count"),
+        )
+        .filter(
+            log_model.timestamp >= utc_start_dt,
+            log_model.timestamp < utc_end_dt,
+            _user_log_owner_filter(log_model, user),
+            *_endpoint_filters(log_model),
+        )
+        .group_by(hour_expr)
+        .all()
+    )
+
+
+def _merge_usage_row(target: dict[str, Any], row: Any, *, prefix: str) -> None:
+    key_prefix = f"{prefix}_" if prefix else ""
+    target[f"{key_prefix}success_count"] += _usage_int(row.success_count)
+    target[f"{key_prefix}failed_count"] += _usage_int(row.failed_count)
+    target[f"{key_prefix}rate_limited_count"] += _usage_int(row.rate_limited_count)
+    target[f"{key_prefix}resource_cost"] += _usage_int(row.resource_cost)
+    target[f"{key_prefix}subscription_resource_cost"] += _usage_int(row.subscription_resource_cost)
+    target[f"{key_prefix}addon_resource_cost"] += _usage_int(row.addon_resource_cost)
+    target[f"{key_prefix}deducted_request_count"] += _usage_int(row.deducted_request_count)
+    target[f"{key_prefix}total_count"] += _usage_int(row.total_count)
+
+
+def _finalize_daily_usage_row(row: dict[str, Any]) -> dict[str, Any]:
+    daily_total = _usage_int(row["daily_total_count"])
+    daily_success = _usage_int(row["daily_success_count"])
+    daily_limit = row.get("daily_limit")
+    subscription_used = _usage_int(row["daily_subscription_resource_cost"])
+    row["daily_success_rate"] = round((daily_success / daily_total) * 100, 2) if daily_total else 0
+    row["remaining_daily"] = None if daily_limit is None else max(0, int(daily_limit) - subscription_used)
+    return row
+
+
+def _finalize_hourly_usage_row(row: dict[str, Any]) -> dict[str, Any]:
+    total = _usage_int(row["total_count"])
+    success = _usage_int(row["success_count"])
+    row["success_rate"] = round((success / total) * 100, 2) if total else 0
+    return row
+
+
+def _summarize_daily_usage(daily_stats: list[dict[str, Any]]) -> dict[str, Any]:
+    total_count = sum(_usage_int(row["daily_total_count"]) for row in daily_stats)
+    success_count = sum(_usage_int(row["daily_success_count"]) for row in daily_stats)
+    failed_count = sum(_usage_int(row["daily_failed_count"]) for row in daily_stats)
+    rate_limited_count = sum(_usage_int(row["daily_rate_limited_count"]) for row in daily_stats)
+    resource_cost = sum(_usage_int(row["daily_resource_cost"]) for row in daily_stats)
+    subscription_resource_cost = sum(_usage_int(row["daily_subscription_resource_cost"]) for row in daily_stats)
+    addon_resource_cost = sum(_usage_int(row["daily_addon_resource_cost"]) for row in daily_stats)
+    deducted_request_count = sum(_usage_int(row["daily_deducted_request_count"]) for row in daily_stats)
+    return {
+        "total_count": total_count,
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "rate_limited_count": rate_limited_count,
+        "resource_cost": resource_cost,
+        "subscription_resource_cost": subscription_resource_cost,
+        "addon_resource_cost": addon_resource_cost,
+        "deducted_request_count": deducted_request_count,
+        "success_rate": round((success_count / total_count) * 100, 2) if total_count else 0,
+    }
+
+
+def _summarize_hourly_usage(hourly_stats: list[dict[str, Any]]) -> dict[str, Any]:
+    total_count = sum(_usage_int(row["total_count"]) for row in hourly_stats)
+    success_count = sum(_usage_int(row["success_count"]) for row in hourly_stats)
+    failed_count = sum(_usage_int(row["failed_count"]) for row in hourly_stats)
+    rate_limited_count = sum(_usage_int(row["rate_limited_count"]) for row in hourly_stats)
+    resource_cost = sum(_usage_int(row["resource_cost"]) for row in hourly_stats)
+    subscription_resource_cost = sum(_usage_int(row["subscription_resource_cost"]) for row in hourly_stats)
+    addon_resource_cost = sum(_usage_int(row["addon_resource_cost"]) for row in hourly_stats)
+    deducted_request_count = sum(_usage_int(row["deducted_request_count"]) for row in hourly_stats)
+    return {
+        "total_count": total_count,
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "rate_limited_count": rate_limited_count,
+        "resource_cost": resource_cost,
+        "subscription_resource_cost": subscription_resource_cost,
+        "addon_resource_cost": addon_resource_cost,
+        "deducted_request_count": deducted_request_count,
+        "success_rate": round((success_count / total_count) * 100, 2) if total_count else 0,
+    }
+
+
+def build_user_stats_payload(db: Session, user_id: int, *, days: int = 14) -> dict[str, Any]:
+    user = db.query(V2User).filter(V2User.id == user_id).first()
+    if user is None:
+        raise ValueError("User not found")
+
+    day_count = min(max(int(days or 14), 1), 90)
+    local_today = (datetime.utcnow() + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)).date()
+    local_start_day = local_today - timedelta(days=day_count - 1)
+    local_range_start = datetime.combine(local_start_day, time.min)
+    local_range_end_exclusive = datetime.combine(local_today + timedelta(days=1), time.min)
+    utc_range_start = local_range_start - timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
+    utc_range_end = local_range_end_exclusive - timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
+    utc_today_start = datetime.combine(local_today, time.min) - timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
+    utc_today_end = utc_today_start + timedelta(days=1)
+
+    subscription_state, _ = ensure_user_entitlement_state(db, user)
+    daily_limit = int(subscription_state.daily_quota or 0) or get_daily_subscription_limit(user)
+    if daily_limit is not None and int(daily_limit) <= 0:
+        daily_limit = None
+
+    daily_map = {
+        (local_start_day + timedelta(days=offset)).strftime("%Y-%m-%d"): _empty_daily_usage_row(
+            (local_start_day + timedelta(days=offset)).strftime("%Y-%m-%d"),
+            daily_limit,
+        )
+        for offset in range(day_count)
+    }
+    hourly_map = {
+        f"{local_today.strftime('%Y-%m-%d')} {hour:02d}:00": _empty_hourly_usage_row(f"{local_today.strftime('%Y-%m-%d')} {hour:02d}:00")
+        for hour in range(24)
+    }
+
+    v2_daily_rows = _query_user_v2_audit_daily_usage(db, user, utc_start_dt=utc_range_start, utc_end_dt=utc_range_end)
+    if not v2_daily_rows:
+        v2_daily_rows = _query_user_subject_daily_usage(db, user, start_day=local_start_day, end_day=local_today)
+
+    for row in v2_daily_rows:
+        day_key = _usage_day_key(row.day)
+        if day_key not in daily_map:
+            daily_map[day_key] = _empty_daily_usage_row(day_key, daily_limit)
+        _merge_usage_row(daily_map[day_key], row, prefix="daily")
+
+    for row in _query_user_log_daily_usage(db, user, RequestLog, utc_start_dt=utc_range_start, utc_end_dt=utc_range_end):
+        day_key = _usage_day_key(row.day)
+        if day_key not in daily_map:
+            daily_map[day_key] = _empty_daily_usage_row(day_key, daily_limit)
+        _merge_usage_row(daily_map[day_key], row, prefix="daily")
+
+    for row in _query_user_v2_audit_hourly_usage(db, user, utc_start_dt=utc_today_start, utc_end_dt=utc_today_end):
+        hour_key = _usage_hour_key(row.hour)
+        if hour_key not in hourly_map:
+            hourly_map[hour_key] = _empty_hourly_usage_row(hour_key)
+        _merge_usage_row(hourly_map[hour_key], row, prefix="")
+
+    for row in _query_user_log_hourly_usage(db, user, RequestLog, utc_start_dt=utc_today_start, utc_end_dt=utc_today_end):
+        hour_key = _usage_hour_key(row.hour)
+        if hour_key not in hourly_map:
+            hourly_map[hour_key] = _empty_hourly_usage_row(hour_key)
+        _merge_usage_row(hourly_map[hour_key], row, prefix="")
+
+    daily_stats = [_finalize_daily_usage_row(row) for _, row in sorted(daily_map.items())]
+    today_hourly_stats = [_finalize_hourly_usage_row(row) for _, row in sorted(hourly_map.items())]
+    summary = _summarize_daily_usage(daily_stats)
+    today_summary = _summarize_hourly_usage(today_hourly_stats)
+    today_remaining_daily = None if daily_limit is None else max(0, int(daily_limit) - _usage_int(today_summary["subscription_resource_cost"]))
+
+    return {
+        "user": _serialize_user_record(db, user),
+        "summary": summary,
+        "today_summary": {
+            **today_summary,
+            "daily_limit": daily_limit,
+            "remaining_daily": today_remaining_daily,
+        },
+        "daily_stats": daily_stats,
+        "today_hourly_stats": today_hourly_stats,
+        "date_filter_info": {
+            "start_date": local_start_day.strftime("%Y-%m-%d"),
+            "end_date": local_today.strftime("%Y-%m-%d"),
+            "today": local_today.strftime("%Y-%m-%d"),
+        },
+        "meta": {
+            "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "timezone": f"UTC+{LOCAL_TIME_OFFSET_HOURS}",
+            "days": day_count,
+            "daily_limit": daily_limit,
+            "log_sources": [
+                V2SubjectDailyUsage.__tablename__,
+                V2RequestAuditLog.__tablename__,
+                RequestLog.__tablename__,
+            ],
+        },
+    }
+
+
     username = payload.username.strip()
+def create_user(db: Session, payload: Any) -> dict[str, Any]:
     email = normalize_email(payload.email) if payload.email else None
     if db.query(V2User).filter(V2User.username == username).first() is not None:
         raise ValueError("Username already exists")

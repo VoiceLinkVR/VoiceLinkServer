@@ -210,6 +210,19 @@ async def get_user(user_id: int, _: V2User = Depends(get_current_admin_v2_user),
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
 
+@router.get("/users/{user_id}/stats")
+async def get_user_stats(
+    user_id: int,
+    days: int = Query(default=14, ge=1, le=90),
+    _: V2User = Depends(get_current_admin_v2_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return admin_service.build_user_stats_payload(db, user_id, days=days)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
 @router.post("/users")
 async def create_user(
     payload: AdminUserCreateRequest,

@@ -12,14 +12,14 @@ from sqlalchemy import text
 from starlette.middleware.sessions import SessionMiddleware
 
 from core.config import refresh_settings_from_override_file_if_changed, settings
-from core.dependencies import get_db, oauth2_scheme, resolve_authenticated_user
+from core.dependencies import oauth2_scheme, resolve_authenticated_user
 from core.identity import host_matches, normalize_host
 from core.logging_config import logger, reset_request_id, set_request_id
 from core.quota_service import commit_quota_allocation, is_new_quota_mode_enabled
 from core.rate_limiter import RateLimitExceeded, get_client_ip, is_website_rate_limit_exempt_path, rate_limiter
 from core.schema_upgrade import run_schema_upgrade
 from core.security_policy import normalize_cookie_samesite, validate_secret_strength
-from core.services import init_supported_languages, load_filter_config, update_filter_config
+from core.services import ClientDisconnectedError, init_supported_languages, load_filter_config, update_filter_config
 from core.update_service import refresh_translation_capabilities_cache
 from core.v2_request_metrics import V2RequestMetricRecord, record_v2_request_metrics, utcnow_naive
 from core.v2_dependencies import fallback_expired_v2_user_to_free, resolve_authenticated_v2_user
@@ -468,36 +468,32 @@ async def request_logging_middleware(request: Request, call_next):
     request_host = _resolve_request_host(request)
     is_v2_request = request.scope.get("path", "").startswith("/v2/") or host_matches(request_host, settings.api_v2_hosts)
 
-    db_gen = None
-    db = None
     response = None
     response_status_code = 500
     rate_limit_triggered = False
     authenticated_user = None
-
-    try:
-        db_gen = get_db()
-        db = next(db_gen)
-    except Exception as db_exc:
-        logger.error("[DB-ERROR] Failed to get database session: %s", db_exc)
+    authenticated_user_is_v2 = False
 
     try:
         token = await oauth2_scheme(request)
-        if db:
+        auth_db = None
+        try:
+            auth_db = SessionLocal()
             if is_v2_request:
                 authenticated_v2_user = resolve_authenticated_v2_user(
                     request,
-                    db,
+                    auth_db,
                     token=token,
                     allow_inactive=True,
                     allow_expired=True,
                 )
                 if authenticated_v2_user is not None:
                     authenticated_user = authenticated_v2_user
+                    authenticated_user_is_v2 = True
             if authenticated_user is None and not is_v2_request:
                 authenticated_user = resolve_authenticated_user(
                     request,
-                    db,
+                    auth_db,
                     token=token,
                     allow_inactive=True,
                     allow_expired=True,
@@ -514,6 +510,11 @@ async def request_logging_middleware(request: Request, call_next):
                     actor_type = "authenticated"
                     rate_limit_scope = "user"
                     quota_scope = "user"
+        except Exception as db_exc:
+            logger.error("[DB-ERROR] Failed to resolve request user: %s", db_exc)
+        finally:
+            if auth_db is not None:
+                auth_db.close()
         logger.info(
             "[API-START] user=%s ip=%s endpoint=%s method=%s",
             current_user,
@@ -573,6 +574,19 @@ async def request_logging_middleware(request: Request, call_next):
             },
         )
 
+    except ClientDisconnectedError as disconnect_exc:
+        response_status_code = 499
+        log_data["duration"] = time.time() - start_time
+        log_data["status"] = "client_disconnected"
+        logger.info(
+            "[CLIENT-DISCONNECT] user=%s endpoint=%s stage=%s duration=%.3fs",
+            current_user,
+            request.url.path,
+            disconnect_exc,
+            log_data["duration"],
+        )
+        response = JSONResponse(status_code=499, content={"detail": "Client Closed Request"})
+
     except Exception as exc:
         response_status_code = 500
         log_data["duration"] = time.time() - start_time
@@ -584,7 +598,7 @@ async def request_logging_middleware(request: Request, call_next):
     finally:
         session_for_log = None
         try:
-            session_for_log = db or SessionLocal()
+            session_for_log = SessionLocal()
             status_for_limits = response_status_code or 500
 
             pending_quota = getattr(request.state, "pending_quota_allocation", None)
@@ -660,7 +674,7 @@ async def request_logging_middleware(request: Request, call_next):
                             extra_payload=getattr(request.state, "audit_payload", None),
                         ),
                     )
-                if not is_v2_request or (authenticated_user is not None and not isinstance(authenticated_user, V2User)):
+                if not is_v2_request or (authenticated_user is not None and not authenticated_user_is_v2):
                     log = RequestLog(
                         username=current_user if current_user != "anonymous" else None,
                         user_uuid=current_user_uuid,
@@ -684,10 +698,8 @@ async def request_logging_middleware(request: Request, call_next):
         finally:
             if response is not None:
                 response.headers["X-Request-ID"] = request_id
-            if db is None and session_for_log is not None:
+            if session_for_log is not None:
                 session_for_log.close()
-            if db_gen is not None:
-                db_gen.close()
             reset_request_id(request_id_token)
 
     return response

@@ -362,7 +362,7 @@ async def get_order(order_id: int, _: V2User = Depends(get_current_admin_v2_user
 @router.get("/tickets")
 async def list_support_tickets(
     search: str | None = Query(default=None, max_length=255),
-    ticket_status: str | None = Query(default="all", alias="status", max_length=32),
+    ticket_status: str | None = Query(default="active", alias="status", max_length=32),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
     _: V2User = Depends(get_current_admin_v2_user),

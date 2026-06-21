@@ -87,6 +87,16 @@ LABEL_OVERRIDES = {
     "FIRERED_ASR_HOST": "FireRedASR2S 主机",
     "FIRERED_ASR_PORT": "FireRedASR2S 端口",
     "FIRERED_ASR_TIMEOUT": "FireRedASR2S 超时",
+    "FIRERED_LID_ENABLED": "FireRedLID 启用开关",
+    "FIRERED_LID_HOST": "FireRedLID 主机",
+    "FIRERED_LID_PORT": "FireRedLID 端口",
+    "FIRERED_LID_TIMEOUT": "FireRedLID 超时",
+    "FIRERED_LID_MAX_CONCURRENCY": "FireRedLID 最大并发",
+    "FIRERED_LID_QUEUE_TIMEOUT": "FireRedLID 排队超时",
+    "FIRERED_LID_GLOBAL_MIN_INTERVAL": "FireRedLID 全局冷却秒数",
+    "FIRERED_LID_HIGH_CONFIDENCE": "FireRedLID 高置信阈值",
+    "FIRERED_LID_LOW_CONFIDENCE": "FireRedLID 低置信阈值",
+    "FIRERED_LID_MIN_AUDIO_SECONDS": "FireRedLID 最短音频秒数",
     "WHISPER_APIKEY": "Whisper API Key",
     "JWT_SECRET_KEY": "JWT 密钥",
     "SESSION_SECRET_KEY": "会话密钥",
@@ -109,10 +119,18 @@ LABEL_OVERRIDES = {
     "TTS_TOKEN": "Edge TTS 令牌",
     "EDGE_TTS_TIMEOUT": "Edge TTS 超时",
     "EDGE_TTS_MAX_INPUT_CHARS": "Edge TTS 最大输入字符数",
+    "VOICE_SYNTHESIS_LEGACY_TRANSPORT_COMPAT": "语音合成旧客户端传输兼容",
     "QWEN_TTS_ENABLED": "Qwen TTS 启用开关",
     "QWEN_TTS_BUILTIN_VOICES_ENABLED": "Qwen 内置音色启用开关",
     "QWEN_TTS_BASE_URL": "Qwen TTS 地址",
     "QWEN_TTS_TOKEN": "Qwen TTS 令牌",
+    "QWEN_TTS_CLONE_MAX_CONCURRENCY": "Qwen 克隆最大上游并发",
+    "QWEN_TTS_CLONE_QUEUE_SIZE": "Qwen 克隆等待队列大小",
+    "QWEN_TTS_CLONE_QUEUE_TIMEOUT": "Qwen 克隆排队超时",
+    "QWEN_TTS_CLONE_RETRY_ATTEMPTS": "Qwen 克隆 429 重试次数",
+    "QWEN_TTS_CLONE_RETRY_DELAY": "Qwen 克隆 429 重试退避",
+    "QWEN_TTS_CLONE_GLOBAL_LOCK_ENABLED": "Qwen 克隆跨进程全局锁",
+    "QWEN_TTS_CLONE_GLOBAL_LOCK_PATH": "Qwen 克隆跨进程锁文件",
     "MOSS_TTS_ENABLED": "MOSS TTS 启用开关",
     "MOSS_TTS_BASE_URL": "MOSS TTS 地址",
     "MOSS_TTS_TOKEN": "MOSS TTS 令牌",
@@ -236,7 +254,7 @@ URL_KEYS = {
 }
 REDIS_URL_KEYS = {"LIMITER_REDIS_URL"}
 EMAIL_KEYS = {"SMTP_USERNAME", "SMTP_FROM_EMAIL", "DEFAULT_TEST_USER_EMAIL"}
-HOST_KEYS = {"WHISPER_HOST", "WHISPER_TRT_HOST", "SENSEVOICE_HOST", "FIRERED_ASR_HOST", "SMTP_HOST"}
+HOST_KEYS = {"WHISPER_HOST", "WHISPER_TRT_HOST", "SENSEVOICE_HOST", "FIRERED_ASR_HOST", "FIRERED_LID_HOST", "SMTP_HOST"}
 HOST_PORT_KEYS = {"GEMMA_TRANSLATE_URL"}
 PATH_KEYS = {
     "UPDATE_STATIC_ROOT",
@@ -245,12 +263,15 @@ PATH_KEYS = {
     "TRANSLATION_PROFILE_MANIFEST_PATH",
     "TRANSLATOR_RUNTIME_MANIFEST_PATH",
     "PLAN_CATALOG_PATH",
+    "QWEN_TTS_CLONE_GLOBAL_LOCK_PATH",
 }
 POSITIVE_INT_KEYS = {
     "WHISPER_PORT",
     "WHISPER_TRT_PORT",
     "SENSEVOICE_PORT",
     "FIRERED_ASR_PORT",
+    "FIRERED_LID_PORT",
+    "FIRERED_LID_MAX_CONCURRENCY",
     "SMTP_PORT",
     "EMAIL_CODE_LENGTH",
     "EMAIL_CODE_TTL_MINUTES",
@@ -276,16 +297,27 @@ POSITIVE_INT_KEYS = {
     "GEMMA_TRANSLATE_MAX_TOKENS",
     "EDGE_TTS_MAX_INPUT_CHARS",
     "QWEN_TTS_MAX_INPUT_CHARS",
+    "QWEN_TTS_CLONE_MAX_CONCURRENCY",
+    "QWEN_TTS_CLONE_QUEUE_SIZE",
+    "QWEN_TTS_CLONE_RETRY_ATTEMPTS",
     "MOSS_TTS_MAX_INPUT_CHARS",
     "OMNIVOICE_TTS_MAX_INPUT_CHARS",
 }
 POSITIVE_FLOAT_KEYS = {
     "TRANSLATION_TIMEOUT",
     "FIRERED_ASR_TIMEOUT",
+    "FIRERED_LID_TIMEOUT",
+    "FIRERED_LID_QUEUE_TIMEOUT",
+    "FIRERED_LID_GLOBAL_MIN_INTERVAL",
+    "FIRERED_LID_HIGH_CONFIDENCE",
+    "FIRERED_LID_LOW_CONFIDENCE",
+    "FIRERED_LID_MIN_AUDIO_SECONDS",
     "GEMMA_TRANSLATE_TIMEOUT",
     "OCR_IMAGE_TRANSLATE_TIMEOUT",
     "EDGE_TTS_TIMEOUT",
     "QWEN_TTS_TIMEOUT",
+    "QWEN_TTS_CLONE_QUEUE_TIMEOUT",
+    "QWEN_TTS_CLONE_RETRY_DELAY",
     "MOSS_TTS_TIMEOUT",
     "OMNIVOICE_TTS_TIMEOUT",
     "TRANSLATION_CAPABILITY_TIMEOUT",
@@ -313,7 +345,7 @@ SAFE_SIMPLE_TEXT_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX
 
 
 def _infer_group(key: str) -> str:
-    if key.startswith(("ASR_", "FIRERED_ASR_", "WHISPER_", "SENSEVOICE_")):
+    if key.startswith(("ASR_", "FIRERED_ASR_", "FIRERED_LID_", "WHISPER_", "SENSEVOICE_")):
         return "speech"
     if key.startswith(("JWT_", "SESSION_", "AUTH_LOGIN_", "LEGACY_LOGIN_", "ADMIN_LOGIN_")):
         return "security"
@@ -337,7 +369,7 @@ def _infer_group(key: str) -> str:
         return "routing"
     if key.startswith(("DEFAULT_TEST_", "GUEST_")):
         return "test_user"
-    if key.startswith(("EDGE_TTS_", "TTS_", "QWEN_TTS_", "MOSS_TTS_", "OMNIVOICE_TTS_")):
+    if key.startswith(("EDGE_TTS_", "TTS_", "QWEN_TTS_", "MOSS_TTS_", "OMNIVOICE_TTS_", "VOICE_SYNTHESIS_")):
         return "tts"
     return "runtime"
 
@@ -686,7 +718,13 @@ def _post_validate_value(spec: ConfigSpec, value: Any) -> Any:
         raise ValueError(f"{spec.key} 必须大于 0")
     if spec.key in POSITIVE_FLOAT_KEYS and float(value) <= 0:
         raise ValueError(f"{spec.key} 必须大于 0")
-    if spec.key in {"WHISPER_PORT", "WHISPER_TRT_PORT", "SENSEVOICE_PORT", "FIRERED_ASR_PORT", "SMTP_PORT"} and int(value) > 65535:
+    if spec.key in {"FIRERED_LID_HIGH_CONFIDENCE", "FIRERED_LID_LOW_CONFIDENCE"} and not 0 < float(value) <= 1:
+        raise ValueError(f"{spec.key} 必须在 0 到 1 之间")
+    if spec.key == "FIRERED_LID_HIGH_CONFIDENCE" and float(value) < float(settings.FIRERED_LID_LOW_CONFIDENCE):
+        raise ValueError(f"{spec.key} 必须大于等于 FIRERED_LID_LOW_CONFIDENCE")
+    if spec.key == "FIRERED_LID_LOW_CONFIDENCE" and float(value) > float(settings.FIRERED_LID_HIGH_CONFIDENCE):
+        raise ValueError(f"{spec.key} 必须小于等于 FIRERED_LID_HIGH_CONFIDENCE")
+    if spec.key in {"WHISPER_PORT", "WHISPER_TRT_PORT", "SENSEVOICE_PORT", "FIRERED_ASR_PORT", "FIRERED_LID_PORT", "SMTP_PORT"} and int(value) > 65535:
         raise ValueError(f"{spec.key} 端口超出范围")
     return value
 

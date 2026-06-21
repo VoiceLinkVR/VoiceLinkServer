@@ -386,6 +386,7 @@ class SupportTicketAttachment(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     ticket_id = Column(Integer, nullable=False, index=True)
+    event_id = Column(Integer, nullable=True, index=True)
     storage_path = Column(String(512), nullable=False)
     original_filename = Column(String(255), nullable=False)
     content_type = Column(String(100), nullable=False)

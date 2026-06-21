@@ -5,8 +5,14 @@ import os
 import html
 import traceback
 import struct
+import time
 import wave
 import re
+import unicodedata
+from contextlib import contextmanager, suppress
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Deque, Optional, TypeVar
 
 from fastapi import HTTPException
 from io import BytesIO
@@ -14,13 +20,312 @@ from openai import OpenAI, AsyncOpenAI
 import opuslib
 import emoji
 from core.config import settings, WHISPER_URL
-from core.gemma_translate_service import gemma_translate, is_gemma_translation_supported
+from core.gemma_translate_service import async_gemma_translate, gemma_translate, is_gemma_translation_supported
 from core.logging_config import logger
 from core.text_compressor import compress_repeated_chars
 from core.update_service import get_translation_capabilities
 
 # 延迟导入translators，避免初始化时的网络问题
 translators = None
+
+CancelCheck = Callable[[], Awaitable[None]]
+T = TypeVar("T")
+
+
+class ClientDisconnectedError(Exception):
+    """Raised when the caller has gone away and downstream work should stop."""
+
+
+ASR_QUEUE_LIMIT_ENABLED = os.getenv("ASR_QUEUE_LIMIT_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+ASR_QUEUE_DEFAULT_MAX_CONCURRENCY = max(int(os.getenv("ASR_QUEUE_MAX_CONCURRENCY", "4")), 1)
+ASR_QUEUE_DEFAULT_MAX_WAITING = max(int(os.getenv("ASR_QUEUE_MAX_WAITING", "20")), 0)
+ASR_QUEUE_DEFAULT_TIMEOUT_SECONDS = max(float(os.getenv("ASR_QUEUE_TIMEOUT_SECONDS", "3")), 0.05)
+ASR_QUEUE_DEFAULT_RETRY_AFTER_SECONDS = max(float(os.getenv("ASR_QUEUE_RETRY_AFTER_SECONDS", "2")), 1.0)
+ASR_QUEUE_SLOW_LOG_SECONDS = max(float(os.getenv("ASR_QUEUE_SLOW_LOG_SECONDS", "15")), 0.1)
+ASR_QUEUE_LATENCY_WINDOW = max(int(os.getenv("ASR_QUEUE_LATENCY_WINDOW", "64")), 4)
+
+
+@dataclass(frozen=True)
+class AsrQueueConfig:
+    max_concurrency: int
+    max_waiting: int
+    timeout_seconds: float
+    retry_after_seconds: float
+
+
+@dataclass
+class AsrEndpointQueue:
+    condition: asyncio.Condition
+    active: int = 0
+    waiting: int = 0
+    completed_latencies: Deque[float] | None = None
+
+
+@dataclass(frozen=True)
+class AsrQueuePermit:
+    endpoint: str
+    language: str
+    queued_seconds: float
+    started_at: float
+    config: AsrQueueConfig
+    enabled: bool = True
+
+
+_asr_endpoint_queues: dict[str, AsrEndpointQueue] = {}
+
+
+async def _run_cancel_check(cancel_check: Optional[CancelCheck]) -> None:
+    if cancel_check is not None:
+        await cancel_check()
+
+
+async def _watch_cancel(cancel_check: CancelCheck, interval_seconds: float = 0.25) -> None:
+    while True:
+        await cancel_check()
+        await asyncio.sleep(interval_seconds)
+
+
+async def _await_with_cancel(
+    awaitable: Awaitable[T],
+    cancel_check: Optional[CancelCheck],
+    label: str,
+) -> T:
+    if cancel_check is None:
+        return await awaitable
+
+    worker = asyncio.create_task(awaitable)
+    watcher = asyncio.create_task(_watch_cancel(cancel_check))
+    try:
+        done, pending = await asyncio.wait(
+            {worker, watcher},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if watcher in done:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+            logger.info("[%s] cancelled because client disconnected", label)
+            await watcher
+        watcher.cancel()
+        return await worker
+    finally:
+        watcher.cancel()
+        with suppress(asyncio.CancelledError, ClientDisconnectedError):
+            await watcher
+
+
+async def _post_with_cancel(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    cancel_check: Optional[CancelCheck] = None,
+    label: str,
+    **kwargs,
+) -> httpx.Response:
+    await _run_cancel_check(cancel_check)
+    response = await _await_with_cancel(
+        client.post(url, **kwargs),
+        cancel_check,
+        label,
+    )
+    await _run_cancel_check(cancel_check)
+    return response
+
+
+def _asr_endpoint_env_prefix(endpoint: str) -> str:
+    return endpoint.upper().replace("-", "_")
+
+
+def _asr_endpoint_int_env(endpoint: str, name: str, default_value: int) -> int:
+    specific_key = f"ASR_QUEUE_{_asr_endpoint_env_prefix(endpoint)}_{name}"
+    return max(int(os.getenv(specific_key, str(default_value))), 0)
+
+
+def _asr_endpoint_float_env(endpoint: str, name: str, default_value: float) -> float:
+    specific_key = f"ASR_QUEUE_{_asr_endpoint_env_prefix(endpoint)}_{name}"
+    return max(float(os.getenv(specific_key, str(default_value))), 0.0)
+
+
+def _asr_queue_config(endpoint: str) -> AsrQueueConfig:
+    max_concurrency = max(_asr_endpoint_int_env(endpoint, "MAX_CONCURRENCY", ASR_QUEUE_DEFAULT_MAX_CONCURRENCY), 1)
+    max_waiting = _asr_endpoint_int_env(endpoint, "MAX_WAITING", ASR_QUEUE_DEFAULT_MAX_WAITING)
+    timeout_seconds = max(_asr_endpoint_float_env(endpoint, "TIMEOUT_SECONDS", ASR_QUEUE_DEFAULT_TIMEOUT_SECONDS), 0.05)
+    retry_after_seconds = max(_asr_endpoint_float_env(endpoint, "RETRY_AFTER_SECONDS", ASR_QUEUE_DEFAULT_RETRY_AFTER_SECONDS), 1.0)
+    return AsrQueueConfig(
+        max_concurrency=max_concurrency,
+        max_waiting=max_waiting,
+        timeout_seconds=timeout_seconds,
+        retry_after_seconds=retry_after_seconds,
+    )
+
+
+def _asr_endpoint_queue(endpoint: str) -> AsrEndpointQueue:
+    queue = _asr_endpoint_queues.get(endpoint)
+    if queue is None:
+        queue = AsrEndpointQueue(
+            condition=asyncio.Condition(),
+            completed_latencies=deque(maxlen=ASR_QUEUE_LATENCY_WINDOW),
+        )
+        _asr_endpoint_queues[endpoint] = queue
+    return queue
+
+
+def _asr_queue_rejection(
+    endpoint: str,
+    language: str,
+    reason: str,
+    config: AsrQueueConfig,
+    active: int,
+    waiting: int,
+) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": reason,
+            "engine": endpoint,
+            "language": language,
+            "active": active,
+            "waiting": waiting,
+            "maxConcurrency": config.max_concurrency,
+            "maxWaiting": config.max_waiting,
+            "queueTimeoutSeconds": config.timeout_seconds,
+        },
+        headers={"Retry-After": str(max(1, int(config.retry_after_seconds + 0.999)))},
+    )
+
+
+async def _acquire_asr_endpoint_slot(
+    endpoint: str,
+    language: str,
+    cancel_check: Optional[CancelCheck],
+) -> AsrQueuePermit:
+    if not ASR_QUEUE_LIMIT_ENABLED:
+        return AsrQueuePermit(
+            endpoint=endpoint,
+            language=language,
+            queued_seconds=0.0,
+            started_at=time.perf_counter(),
+            config=_asr_queue_config(endpoint),
+            enabled=False,
+        )
+
+    await _run_cancel_check(cancel_check)
+    config = _asr_queue_config(endpoint)
+    queue = _asr_endpoint_queue(endpoint)
+    queued_at = time.perf_counter()
+    counted_waiting = False
+
+    async with queue.condition:
+        if queue.active < config.max_concurrency:
+            queue.active += 1
+            return AsrQueuePermit(endpoint, language, 0.0, time.perf_counter(), config)
+
+        if queue.waiting >= config.max_waiting:
+            logger.warning(
+                "[ASR_QUEUE_LIMIT] reject request because queue is full. endpoint=%s language=%s active=%s waiting=%s max_concurrency=%s max_waiting=%s",
+                endpoint,
+                language,
+                queue.active,
+                queue.waiting,
+                config.max_concurrency,
+                config.max_waiting,
+            )
+            raise _asr_queue_rejection(endpoint, language, "asr_queue_full", config, queue.active, queue.waiting)
+
+        queue.waiting += 1
+        counted_waiting = True
+
+        try:
+            while queue.active >= config.max_concurrency:
+                remaining = config.timeout_seconds - (time.perf_counter() - queued_at)
+                if remaining <= 0:
+                    logger.warning(
+                        "[ASR_QUEUE_LIMIT] reject request because queue wait timed out. endpoint=%s language=%s active=%s waiting=%s max_concurrency=%s max_waiting=%s timeout=%.3fs",
+                        endpoint,
+                        language,
+                        queue.active,
+                        queue.waiting,
+                        config.max_concurrency,
+                        config.max_waiting,
+                        config.timeout_seconds,
+                    )
+                    raise _asr_queue_rejection(endpoint, language, "asr_queue_timeout", config, queue.active, queue.waiting)
+
+                try:
+                    await asyncio.wait_for(queue.condition.wait(), timeout=min(remaining, 0.25))
+                except asyncio.TimeoutError:
+                    pass
+                await _run_cancel_check(cancel_check)
+
+            queue.waiting -= 1
+            counted_waiting = False
+            queue.active += 1
+            queued_seconds = time.perf_counter() - queued_at
+            if queued_seconds >= 0.25:
+                logger.info(
+                    "[ASR_QUEUE_LIMIT] acquired queued slot. endpoint=%s language=%s queued=%.3fs active=%s waiting=%s max_concurrency=%s max_waiting=%s",
+                    endpoint,
+                    language,
+                    queued_seconds,
+                    queue.active,
+                    queue.waiting,
+                    config.max_concurrency,
+                    config.max_waiting,
+                )
+            return AsrQueuePermit(endpoint, language, queued_seconds, time.perf_counter(), config)
+        finally:
+            if counted_waiting:
+                queue.waiting = max(0, queue.waiting - 1)
+                queue.condition.notify(1)
+
+
+async def _release_asr_endpoint_slot(permit: AsrQueuePermit, *, record_latency: bool) -> None:
+    if not permit.enabled:
+        return
+
+    finished_at = time.perf_counter()
+    elapsed = finished_at - permit.started_at
+    queue = _asr_endpoint_queue(permit.endpoint)
+    async with queue.condition:
+        queue.active = max(0, queue.active - 1)
+        if record_latency and queue.completed_latencies is not None:
+            queue.completed_latencies.append(elapsed)
+        queue.condition.notify(1)
+
+        active = queue.active
+        waiting = queue.waiting
+
+    if elapsed >= ASR_QUEUE_SLOW_LOG_SECONDS:
+        logger.warning(
+            "[ASR_QUEUE_LIMIT] slow ASR request completed. endpoint=%s language=%s elapsed=%.3fs queued=%.3fs active=%s waiting=%s max_concurrency=%s max_waiting=%s",
+            permit.endpoint,
+            permit.language,
+            elapsed,
+            permit.queued_seconds,
+            active,
+            waiting,
+            permit.config.max_concurrency,
+            permit.config.max_waiting,
+        )
+
+
+async def _run_asr_endpoint(
+    endpoint: str,
+    language: str,
+    operation: Callable[[], Awaitable[T]],
+    cancel_check: Optional[CancelCheck] = None,
+) -> T:
+    permit = await _acquire_asr_endpoint_slot(endpoint, language, cancel_check)
+    record_latency = True
+    try:
+        return await operation()
+    except ClientDisconnectedError:
+        record_latency = False
+        raise
+    finally:
+        await _release_asr_endpoint_slot(permit, record_latency=record_latency)
 
 def get_translators():
     global translators
@@ -41,6 +346,7 @@ async_whisperclient = AsyncOpenAI(api_key=settings.WHISPER_APIKEY, base_url=WHIS
 
 glm_client = OpenAI(api_key="4c3d963619884fc69e3a02c581925691.mgFDmvFyfDWmGvub", base_url="https://open.bigmodel.cn/api/paas/v4/")
 errorFilter = {}
+whisperHallucinationFilterExact: dict[str, set[str]] = {}
 # 硬编码的支持语言列表，不再动态从LibreTranslate获取
 supportedLanguagesList = [
     "ar", "az", "bg", "bn", "ca", "cs", "da", "de", "el", "en",
@@ -74,8 +380,224 @@ ASR_ENGINE_ALIASES = {
 }
 
 CHINESE_ASR_LANGUAGES = {"zh", "zt"}
-CHINESE_ONLY_ASR_ENGINES = {"firered", "sensevoice"}
+ASR_ENGINE_LANGUAGE_SUPPORT = {
+    "firered": {"zh", "en"},
+    "sensevoice": {"zh", "en", "ja", "ko"},
+}
+MULTILINGUAL_ASR_LANGUAGE = "multilingual"
 FIRERED_MIN_AUDIO_SECONDS = 0.6
+ASR_EMPTY_AUDIO_MARKERS = frozenset({"<sil>", "<blank>"})
+ASR_SPECIAL_TOKEN_PATTERN = re.compile(r"<[^<>\s]+>")
+ASR_MARKER_PADDING_PATTERN = re.compile(
+    r"[\s\.,，。!！?？;；:：、'\"“”‘’()\[\]{}<>/\\|`~\-_=+]*"
+)
+WHISPER_HALLUCINATION_PUNCT_PATTERN = re.compile(
+    r"[\s\.,，。!！?？;；:：、'\"“”‘’()\[\]{}<>/\\|`~\-_=+*@#$%^&]+"
+)
+WHISPER_HALLUCINATION_CJK_PATTERN = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+WHISPER_HALLUCINATION_LANG_ALIASES = {
+    "zh-cn": "zh",
+    "zh-hans": "zh",
+    "zh-tw": "zh",
+    "zh-hant": "zh",
+    "zt": "zh",
+}
+FIRERED_LID_CHINESE_LANGUAGE_TOKENS = frozenset(
+    {"zh", "mandarin", "xinan", "min", "wu", "xiang", "yue", "north"}
+)
+FIRERED_LID_LANGUAGE_ALIASES = {
+    "iw": "he",
+    "zh mandarin": "zh",
+    "zh north": "zh",
+}
+_firered_lid_semaphore: asyncio.Semaphore | None = None
+FIRERED_LID_GLOBAL_LOCK_PATH = "/tmp/voicelink_firered_lid.lock"
+
+
+@dataclass(frozen=True)
+class FireRedLidResult:
+    language: str
+    raw_language: str
+    confidence: float
+    duration_seconds: float | None = None
+    is_multilingual: bool = False
+    language_count: int = 1
+    languages: tuple[str, ...] = ()
+    raw_languages: tuple[str, ...] = ()
+    segments: tuple[dict[str, Any], ...] = ()
+    language_details: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def high_confidence(self) -> bool:
+        return self.confidence >= float(settings.FIRERED_LID_HIGH_CONFIDENCE)
+
+    @property
+    def low_confidence(self) -> bool:
+        return self.confidence < float(settings.FIRERED_LID_LOW_CONFIDENCE)
+
+
+def is_asr_empty_audio_marker_text(text: str | None) -> bool:
+    if not isinstance(text, str):
+        return False
+
+    normalized = text.strip()
+    if not normalized:
+        return False
+
+    lowered = normalized.lower()
+    special_tokens = [match.group(0).lower() for match in ASR_SPECIAL_TOKEN_PATTERN.finditer(lowered)]
+    if not special_tokens:
+        return False
+
+    if any(token in ASR_EMPTY_AUDIO_MARKERS for token in special_tokens):
+        return True
+
+    without_special_tokens = ASR_SPECIAL_TOKEN_PATTERN.sub("", lowered)
+    return ASR_MARKER_PADDING_PATTERN.sub("", without_special_tokens) == ""
+
+
+def normalize_whisper_hallucination_text(text: str | None) -> str:
+    if not isinstance(text, str):
+        return ""
+
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = WHISPER_HALLUCINATION_PUNCT_PATTERN.sub(" ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _canonical_whisper_hallucination_language(language: str | None) -> str:
+    normalized = (language or "").strip().lower()
+    return WHISPER_HALLUCINATION_LANG_ALIASES.get(normalized, normalized)
+
+
+def _should_load_whisper_hallucination_phrase(phrase: str, count: int) -> bool:
+    if count < max(1, int(settings.WHISPER_HALLUCINATION_FILTER_MIN_COUNT or 1)):
+        return False
+
+    if WHISPER_HALLUCINATION_CJK_PATTERN.search(phrase):
+        return len(phrase) >= max(1, int(settings.WHISPER_HALLUCINATION_FILTER_CJK_MIN_CHARS or 1))
+
+    return len(phrase) >= max(1, int(settings.WHISPER_HALLUCINATION_FILTER_MIN_CHARS or 1))
+
+
+def is_whisper_hallucination_text(text: str | None, language: str | None = None) -> bool:
+    if not settings.WHISPER_HALLUCINATION_FILTER_ENABLED:
+        return False
+
+    normalized = normalize_whisper_hallucination_text(text)
+    if not normalized:
+        return False
+
+    language_key = _canonical_whisper_hallucination_language(language)
+    if language_key:
+        return normalized in whisperHallucinationFilterExact.get(language_key, set())
+
+    return any(normalized in phrases for phrases in whisperHallucinationFilterExact.values())
+
+
+def normalize_firered_lid_language(language: str | None) -> str:
+    raw = re.sub(r"\s+", " ", (language or "").strip().lower().replace("_", " ").replace("-", " "))
+    if not raw:
+        return ""
+    if raw in FIRERED_LID_LANGUAGE_ALIASES:
+        return FIRERED_LID_LANGUAGE_ALIASES[raw]
+
+    tokens = [token for token in raw.split(" ") if token]
+    if any(token in FIRERED_LID_CHINESE_LANGUAGE_TOKENS for token in tokens):
+        return "zh"
+
+    first_token = tokens[0] if tokens else raw
+    return FIRERED_LID_LANGUAGE_ALIASES.get(first_token, first_token)
+
+
+def is_firered_lid_chinese_language(language: str | None) -> bool:
+    return normalize_firered_lid_language(language) == "zh"
+
+
+def _normalize_firered_lid_language_list(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    languages: list[str] = []
+    for item in value:
+        normalized = normalize_firered_lid_language(str(item or ""))
+        if normalized and normalized not in languages:
+            languages.append(normalized)
+    return tuple(languages)
+
+
+def _normalize_firered_lid_raw_language_list(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    raw_languages: list[str] = []
+    for item in value:
+        raw = str(item or "").strip()
+        if raw and raw not in raw_languages:
+            raw_languages.append(raw)
+    return tuple(raw_languages)
+
+
+def _safe_lid_dict_tuple(value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, dict))
+
+
+def _get_firered_lid_semaphore() -> asyncio.Semaphore:
+    global _firered_lid_semaphore
+    if _firered_lid_semaphore is None:
+        _firered_lid_semaphore = asyncio.Semaphore(max(1, int(settings.FIRERED_LID_MAX_CONCURRENCY or 1)))
+    return _firered_lid_semaphore
+
+
+@contextmanager
+def _firered_lid_global_gate():
+    lock_file = None
+    try:
+        import fcntl  # Linux-only; production containers run Linux.
+
+        lock_file = open(FIRERED_LID_GLOBAL_LOCK_PATH, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.debug("[FIRERED_LID] global detector busy; skip language detection")
+            yield False
+            return
+
+        lock_file.seek(0)
+        last_finished_text = lock_file.read().strip()
+        try:
+            last_finished_at = float(last_finished_text or "0")
+        except ValueError:
+            last_finished_at = 0.0
+
+        min_interval = max(0.0, float(settings.FIRERED_LID_GLOBAL_MIN_INTERVAL or 0.0))
+        elapsed = time.time() - last_finished_at
+        if min_interval and elapsed < min_interval:
+            logger.debug(
+                "[FIRERED_LID] global cooldown active; skip language detection elapsed=%.3fs min=%.3fs",
+                elapsed,
+                min_interval,
+            )
+            yield False
+            return
+
+        try:
+            yield True
+        finally:
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(str(time.time()))
+            lock_file.flush()
+            os.fsync(lock_file.fileno())
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except ImportError:
+        yield True
+    except Exception as exc:
+        logger.warning("[FIRERED_LID] global gate failed open: %s", exc)
+        yield True
+    finally:
+        if lock_file is not None:
+            lock_file.close()
 
 
 def normalize_asr_engine(engine: str | None = None) -> str:
@@ -97,9 +619,21 @@ def _is_chinese_asr_language(language: str) -> bool:
     return _canonical_lang_code(language) in CHINESE_ASR_LANGUAGES
 
 
+def _asr_engine_supports_language(engine: str, language: str) -> bool:
+    normalized_language = (language or "").strip().lower()
+    if normalized_language == MULTILINGUAL_ASR_LANGUAGE:
+        return engine == "whisper"
+    supported_languages = ASR_ENGINE_LANGUAGE_SUPPORT.get(engine)
+    if not supported_languages:
+        return True
+    return _canonical_lang_code(language) in supported_languages
+
+
 def resolve_asr_engine_for_language(engine: str | None, language: str) -> str:
     selected_engine = normalize_asr_engine(engine)
-    if selected_engine in CHINESE_ONLY_ASR_ENGINES and not _is_chinese_asr_language(language):
+    if (language or "").strip().lower() == MULTILINGUAL_ASR_LANGUAGE:
+        return "whisper"
+    if not _asr_engine_supports_language(selected_engine, language):
         return _default_whisper_engine()
     return selected_engine
 
@@ -112,6 +646,18 @@ def _whisper_trt_base_url() -> str:
     return f"http://{settings.WHISPER_TRT_HOST}:{settings.WHISPER_TRT_PORT}"
 
 
+def _whisper_base_url() -> str:
+    return WHISPER_URL.rstrip("/")
+
+
+def _whisper_transcription_url() -> str:
+    return f"{_whisper_base_url()}/audio/transcriptions"
+
+
+def _whisper_translation_url() -> str:
+    return f"{_whisper_base_url()}/audio/translations"
+
+
 def _sensevoice_transcription_url() -> str:
     return f"http://{settings.SENSEVOICE_HOST}:{settings.SENSEVOICE_PORT}/v1/audio/transcriptions"
 
@@ -120,12 +666,33 @@ def _firered_asr_base_url() -> str:
     return f"http://{settings.FIRERED_ASR_HOST}:{settings.FIRERED_ASR_PORT}"
 
 
+def _firered_lid_base_url() -> str:
+    return f"http://{settings.FIRERED_LID_HOST}:{settings.FIRERED_LID_PORT}"
+
+
 def _extract_asr_text(result: dict, log_prefix: str) -> str:
     text = result.get("text", "")
     if not isinstance(text, str):
         logger.warning("[%s] Unexpected text payload type: %s", log_prefix, type(text))
         return ""
     return text
+
+
+def _extract_asr_response_text(response: httpx.Response, log_prefix: str) -> str:
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type:
+        return _extract_asr_text(response.json(), log_prefix)
+    return response.text
+
+
+def _lid_segments_form_value(lid_metadata: Optional[dict[str, object]]) -> str | None:
+    if not lid_metadata:
+        return None
+
+    segments = lid_metadata.get("lidSegments")
+    if isinstance(segments, list) and segments:
+        return json.dumps(segments, ensure_ascii=False)
+    return None
 
 
 def _get_wav_duration_seconds(audio_file: bytes) -> float | None:
@@ -156,6 +723,112 @@ def _raise_if_firered_audio_too_short(audio_file: bytes) -> None:
         FIRERED_MIN_AUDIO_SECONDS,
     )
     raise HTTPException(status_code=400, detail="音频过短")
+
+
+async def detect_language_firered_lid(
+    audio_file: bytes,
+    filename: str = "audio.wav",
+    cancel_check: Optional[CancelCheck] = None,
+) -> FireRedLidResult | None:
+    await _run_cancel_check(cancel_check)
+    if not settings.FIRERED_LID_ENABLED:
+        return None
+
+    duration_seconds = _get_wav_duration_seconds(audio_file)
+    if duration_seconds is not None and duration_seconds < float(settings.FIRERED_LID_MIN_AUDIO_SECONDS):
+        logger.info(
+            "[FIRERED_LID] Skip short audio: %.3fs < %.3fs",
+            duration_seconds,
+            settings.FIRERED_LID_MIN_AUDIO_SECONDS,
+        )
+        return None
+
+    with _firered_lid_global_gate() as global_gate_allowed:
+        if not global_gate_allowed:
+            return None
+
+        semaphore = _get_firered_lid_semaphore()
+        try:
+            await asyncio.wait_for(
+                semaphore.acquire(),
+                timeout=max(0.001, float(settings.FIRERED_LID_QUEUE_TIMEOUT or 0.001)),
+            )
+        except asyncio.TimeoutError:
+            logger.debug("[FIRERED_LID] detector busy; skip language detection")
+            return None
+
+        try:
+            async with httpx.AsyncClient(timeout=settings.FIRERED_LID_TIMEOUT) as client:
+                files = {"files": (filename or "audio.wav", audio_file, "audio/wav")}
+                response = await _post_with_cancel(
+                    client,
+                    f"{_firered_lid_base_url()}/predict",
+                    files=files,
+                    cancel_check=cancel_check,
+                    label="FIRERED_LID",
+                )
+                response.raise_for_status()
+                payload = response.json()
+                await _run_cancel_check(cancel_check)
+
+            results = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(results, list) or not results:
+                logger.warning("[FIRERED_LID] Unexpected response payload: %s", payload)
+                return None
+
+            result = results[0]
+            if not isinstance(result, dict):
+                logger.warning("[FIRERED_LID] Unexpected result payload: %s", result)
+                return None
+
+            raw_language = str(result.get("lang") or "").strip()
+            normalized_language = normalize_firered_lid_language(raw_language)
+            confidence = float(result.get("confidence") or 0.0)
+            detected_duration = result.get("dur_s")
+            if detected_duration is not None:
+                duration_seconds = float(detected_duration)
+            detected_languages = _normalize_firered_lid_language_list(result.get("languages"))
+            raw_languages = _normalize_firered_lid_raw_language_list(result.get("languages"))
+            language_details = _safe_lid_dict_tuple(result.get("language_details"))
+            segments = _safe_lid_dict_tuple(result.get("segments"))
+            if not detected_languages and normalized_language:
+                detected_languages = (normalized_language,)
+            language_count = int(result.get("language_count") or len(detected_languages) or (1 if normalized_language else 0))
+            is_multilingual = bool(result.get("is_multilingual")) or language_count > 1
+
+            if not normalized_language:
+                logger.info("[FIRERED_LID] Empty language result. raw=%r confidence=%.3f", raw_language, confidence)
+                return None
+
+            lid_result = FireRedLidResult(
+                language=normalized_language,
+                raw_language=raw_language,
+                confidence=confidence,
+                duration_seconds=duration_seconds,
+                is_multilingual=is_multilingual,
+                language_count=language_count,
+                languages=detected_languages,
+                raw_languages=raw_languages,
+                segments=segments,
+                language_details=language_details,
+            )
+            logger.info(
+                "[FIRERED_LID] detected language=%s raw=%r confidence=%.3f duration=%s multilingual=%s languages=%s",
+                lid_result.language,
+                lid_result.raw_language,
+                lid_result.confidence,
+                lid_result.duration_seconds,
+                lid_result.is_multilingual,
+                list(lid_result.languages),
+            )
+            return lid_result
+        except ClientDisconnectedError:
+            raise
+        except Exception as e:
+            logger.warning("[FIRERED_LID] language detection failed, falling back to requested source language: %s", e)
+            return None
+        finally:
+            semaphore.release()
 
 LANG_CANONICAL_MAPPING = {
     "zh": "zh",
@@ -192,6 +865,10 @@ def _is_same_translation_lang(source_lang: str, target_lang: str) -> bool:
 
 def _is_auto_translation_lang(lang: str) -> bool:
     return (lang or "").strip().lower() == "auto"
+
+
+def _is_dynamic_source_translation_lang(lang: str) -> bool:
+    return (lang or "").strip().lower() in {"auto", MULTILINGUAL_ASR_LANGUAGE}
 
 
 def normalize_translation_language_code(lang: str) -> str:
@@ -370,6 +1047,62 @@ def detect_translation_source_language(text: str, allowed_languages: list[str] |
     return next(iter(allowed), "en")
 
 
+def _load_whisper_hallucination_filter_config():
+    if not settings.WHISPER_HALLUCINATION_FILTER_ENABLED:
+        whisperHallucinationFilterExact.clear()
+        logger.info("Whisper hallucination filter disabled.")
+        return
+
+    filter_path = os.path.join(os.path.dirname(__file__), '..', 'filter_whisper_hallucinations.json')
+    loaded_filter: dict[str, set[str]] = {}
+    total_phrases = 0
+
+    try:
+        with open(filter_path, 'r', encoding='utf-8') as f:
+            local_config = json.load(f)
+
+        exact_config = local_config.get("exact", {})
+        if not isinstance(exact_config, dict):
+            raise ValueError("invalid exact filter config")
+
+        for raw_lang, entries in exact_config.items():
+            language_key = _canonical_whisper_hallucination_language(raw_lang)
+            if not language_key or not isinstance(entries, list):
+                continue
+
+            phrase_set = loaded_filter.setdefault(language_key, set())
+            for entry in entries:
+                if isinstance(entry, dict):
+                    raw_phrase = entry.get("phrase")
+                    count = int(entry.get("count") or 1)
+                else:
+                    raw_phrase = entry
+                    count = 1
+
+                normalized_phrase = normalize_whisper_hallucination_text(raw_phrase)
+                if not normalized_phrase:
+                    continue
+                if not _should_load_whisper_hallucination_phrase(normalized_phrase, count):
+                    continue
+                phrase_set.add(normalized_phrase)
+
+        loaded_filter = {lang: phrases for lang, phrases in loaded_filter.items() if phrases}
+        total_phrases = sum(len(phrases) for phrases in loaded_filter.values())
+        whisperHallucinationFilterExact.clear()
+        whisperHallucinationFilterExact.update(loaded_filter)
+        logger.info(
+            "Loaded Whisper hallucination filter. languages=%s phrases=%s min_count=%s min_chars=%s cjk_min_chars=%s",
+            len(whisperHallucinationFilterExact),
+            total_phrases,
+            settings.WHISPER_HALLUCINATION_FILTER_MIN_COUNT,
+            settings.WHISPER_HALLUCINATION_FILTER_MIN_CHARS,
+            settings.WHISPER_HALLUCINATION_FILTER_CJK_MIN_CHARS,
+        )
+    except Exception as e:
+        whisperHallucinationFilterExact.clear()
+        logger.error(f"Failed to load Whisper hallucination filter config: {e}")
+
+
 # --- 初始化函数 ---
 def load_filter_config():
     global errorFilter
@@ -400,6 +1133,7 @@ def load_filter_config():
                     errorFilter.update(merged_config)
                     
                     logger.info("Successfully merged filter config from web and local.")
+                    _load_whisper_hallucination_filter_config()
                     return
             except Exception as e:
                 logger.warning(f"Failed to load filter from web, using local config. Error: {e}")
@@ -413,6 +1147,8 @@ def load_filter_config():
         # 设置默认空配置
         errorFilter = {"errorResultDict": [], "errorKeyString": []}
         logger.warning("Using empty filter config due to load failure.")
+
+    _load_whisper_hallucination_filter_config()
 
 def update_filter_config():
     """定时更新filter配置的函数"""
@@ -437,10 +1173,16 @@ def init_supported_languages():
 
 # --- 异步Whisper函数 ---
 
-async def async_transcribe(audio_file: bytes, language: str = 'zh') -> str:
+async def async_transcribe(
+    audio_file: bytes,
+    language: str = "zh",
+    filename: str = "audio.wav",
+    cancel_check: Optional[CancelCheck] = None,
+    lid_metadata: Optional[dict[str, object]] = None,
+) -> str:
     """
     异步语音转文字（ASR）
-    使用AsyncOpenAI客户端，避免阻塞事件循环
+    使用非标准 HTTP 调用 faster-whisper 后端，允许传递 LID 分段等扩展字段。
 
     Args:
         audio_file: 音频文件字节数据
@@ -449,22 +1191,49 @@ async def async_transcribe(audio_file: bytes, language: str = 'zh') -> str:
     Returns:
         识别出的文本
     """
+    async def operation() -> str:
+        data = {
+            "model": settings.WHISPER_MODEL,
+            "response_format": "json",
+            "without_timestamps": "true",
+        }
+        if (language or "").strip().lower() != MULTILINGUAL_ASR_LANGUAGE:
+            data["language"] = language
+
+        lid_segments = _lid_segments_form_value(lid_metadata)
+        if lid_segments:
+            data["lid_segments"] = lid_segments
+
+        async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
+            files = {"file": (filename or "audio.wav", audio_file, "audio/wav")}
+            response = await _post_with_cancel(
+                client,
+                _whisper_transcription_url(),
+                files=files,
+                data=data,
+                cancel_check=cancel_check,
+                label="ASYNC_TRANSCRIBE",
+            )
+            response.raise_for_status()
+            return _extract_asr_response_text(response, "ASYNC_TRANSCRIBE")
+
     try:
-        res = await async_whisperclient.audio.transcriptions.create(
-            model=settings.WHISPER_MODEL,
-            file=audio_file,
-            language=language
-        )
-        return res.text
+        return await _run_asr_endpoint("whisper", language, operation, cancel_check=cancel_check)
+    except ClientDisconnectedError:
+        raise
     except Exception as e:
         logger.error(f"[ASYNC_TRANSCRIBE] 语音识别失败: {e}")
         raise
 
 
-async def async_translate_audio(audio_file: bytes) -> str:
+async def async_translate_audio(
+    audio_file: bytes,
+    filename: str = "audio.wav",
+    cancel_check: Optional[CancelCheck] = None,
+) -> str:
     """
     异步音频翻译（翻译为英文）
-    使用AsyncOpenAI客户端，避免阻塞事件循环
+    使用非标准 HTTP 调用 faster-whisper 后端，避免 OpenAI SDK 字段限制。
 
     Args:
         audio_file: 音频文件字节数据
@@ -472,38 +1241,77 @@ async def async_translate_audio(audio_file: bytes) -> str:
     Returns:
         翻译后的英文文本
     """
+    async def operation() -> str:
+        async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
+            files = {"file": (filename or "audio.wav", audio_file, "audio/wav")}
+            data = {
+                "model": settings.WHISPER_MODEL,
+                "response_format": "json",
+            }
+            response = await _post_with_cancel(
+                client,
+                _whisper_translation_url(),
+                files=files,
+                data=data,
+                cancel_check=cancel_check,
+                label="ASYNC_TRANSLATE_AUDIO",
+            )
+            response.raise_for_status()
+            return _extract_asr_response_text(response, "ASYNC_TRANSLATE_AUDIO")
+
     try:
-        res = await async_whisperclient.audio.translations.create(
-            model=settings.WHISPER_MODEL,
-            file=audio_file
-        )
-        return res.text
+        return await _run_asr_endpoint("whisper", "translate-en", operation, cancel_check=cancel_check)
+    except ClientDisconnectedError:
+        raise
     except Exception as e:
         logger.error(f"[ASYNC_TRANSLATE_AUDIO] 音频翻译失败: {e}")
         raise
 
 
-async def async_transcribe_sensevoice(audio_file: bytes, filename: str = "audio.wav") -> str:
-    try:
+async def async_transcribe_sensevoice(audio_file: bytes, filename: str = "audio.wav", cancel_check: Optional[CancelCheck] = None) -> str:
+    async def operation() -> str:
         async with httpx.AsyncClient(timeout=30.0) as client:
             files = {'file': (filename or 'audio.wav', audio_file, 'audio/wav')}
-            response = await client.post(_sensevoice_transcription_url(), files=files)
+            response = await _post_with_cancel(
+                client,
+                _sensevoice_transcription_url(),
+                files=files,
+                cancel_check=cancel_check,
+                label="ASYNC_TRANSCRIBE_SENSEVOICE",
+            )
             response.raise_for_status()
             return _extract_asr_text(response.json(), "ASYNC_TRANSCRIBE_SENSEVOICE")
+
+    try:
+        return await _run_asr_endpoint("sensevoice", "zh", operation, cancel_check=cancel_check)
+    except ClientDisconnectedError:
+        raise
     except Exception as e:
         logger.error(f"[ASYNC_TRANSCRIBE_SENSEVOICE] SenseVoice璇煶璇嗗埆澶辫触: {e}")
         raise
 
 
-async def async_transcribe_firered(audio_file: bytes, filename: str = "audio.wav") -> str:
-    try:
-        _raise_if_firered_audio_too_short(audio_file)
+async def async_transcribe_firered(audio_file: bytes, filename: str = "audio.wav", cancel_check: Optional[CancelCheck] = None) -> str:
+    _raise_if_firered_audio_too_short(audio_file)
+
+    async def operation() -> str:
         async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
             files = {'file': (filename or 'audio.wav', audio_file, 'application/octet-stream')}
-            response = await client.post(f"{_firered_asr_base_url()}/transcribe", files=files)
+            response = await _post_with_cancel(
+                client,
+                f"{_firered_asr_base_url()}/transcribe",
+                files=files,
+                cancel_check=cancel_check,
+                label="ASYNC_TRANSCRIBE_FIRERED",
+            )
             response.raise_for_status()
             return _extract_asr_text(response.json(), "ASYNC_TRANSCRIBE_FIRERED")
+
+    try:
+        return await _run_asr_endpoint("firered", "zh", operation, cancel_check=cancel_check)
     except HTTPException:
+        raise
+    except ClientDisconnectedError:
         raise
     except Exception as e:
         logger.error(f"[ASYNC_TRANSCRIBE_FIRERED] FireRedASR2S璇煶璇嗗埆澶辫触: {e}")
@@ -519,27 +1327,36 @@ def _normalize_target_language_for_trt(language: str) -> str:
     return normalized
 
 
-async def async_transcribe_trt(audio_file: bytes, language: str = 'zh') -> str:
+async def async_transcribe_trt(audio_file: bytes, language: str = 'zh', cancel_check: Optional[CancelCheck] = None) -> str:
     """
     使用 WhisperLive-TRT 后端进行语音识别（含自动翻译）。
 
     TRT 的 language 参数语义是目标语言，不支持 auto。
     """
     target_language = _normalize_target_language_for_trt(language)
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+
+    async def operation() -> str:
+        async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
             files = {'file': ('audio.wav', audio_file, 'audio/wav')}
             data = {
                 'language': target_language,
                 'response_format': 'json',
             }
-            response = await client.post(
+            response = await _post_with_cancel(
+                client,
                 f"{_whisper_trt_base_url()}/v1/audio/transcriptions",
                 files=files,
                 data=data,
+                cancel_check=cancel_check,
+                label="ASYNC_TRANSCRIBE_TRT",
             )
             response.raise_for_status()
             return _extract_asr_text(response.json(), "ASYNC_TRANSCRIBE_TRT")
+
+    try:
+        return await _run_asr_endpoint("whisper-trt", target_language, operation, cancel_check=cancel_check)
+    except ClientDisconnectedError:
+        raise
     except Exception as e:
         logger.error(f"[ASYNC_TRANSCRIBE_TRT] TRT语音识别失败: {e}")
         raise
@@ -550,7 +1367,10 @@ async def do_transcribe(
     language: str = "zh",
     engine: str | None = None,
     filename: str = "audio.wav",
+    cancel_check: Optional[CancelCheck] = None,
+    lid_metadata: Optional[dict[str, object]] = None,
 ) -> str:
+    await _run_cancel_check(cancel_check)
     requested_engine = normalize_asr_engine(engine)
     selected_engine = resolve_asr_engine_for_language(engine, language)
     if selected_engine != requested_engine:
@@ -564,81 +1384,53 @@ async def do_transcribe(
         logger.info("[ASR] engine selected: effective=%s language=%s", selected_engine, language)
     if selected_engine == "firered":
         try:
-            return await async_transcribe_firered(audio_file, filename=filename)
+            return await async_transcribe_firered(audio_file, filename=filename, cancel_check=cancel_check)
         except HTTPException:
+            raise
+        except ClientDisconnectedError:
             raise
         except Exception as exc:
             logger.warning(
                 "[ASR] FireRed failed; falling back to SenseVoice for this request: %s",
                 exc,
             )
-            return await async_transcribe_sensevoice(audio_file, filename=filename)
+            return await async_transcribe_sensevoice(audio_file, filename=filename, cancel_check=cancel_check)
     if selected_engine == "sensevoice":
-        return await async_transcribe_sensevoice(audio_file, filename=filename)
+        return await async_transcribe_sensevoice(audio_file, filename=filename, cancel_check=cancel_check)
     if selected_engine == "whisper-trt":
-        return await async_transcribe_trt(audio_file, language=language)
-    return await async_transcribe(audio_file, language=language)
+        return await async_transcribe_trt(audio_file, language=language, cancel_check=cancel_check)
+    return await async_transcribe(
+        audio_file,
+        language=language,
+        filename=filename,
+        cancel_check=cancel_check,
+        lid_metadata=lid_metadata,
+    )
 
 
 async def do_translate_audio(
     audio_file: bytes,
     engine: str | None = None,
     filename: str = "audio.wav",
+    cancel_check: Optional[CancelCheck] = None,
 ) -> str:
+    await _run_cancel_check(cancel_check)
     selected_engine = normalize_asr_engine(engine)
     if selected_engine == "whisper-trt":
-        return await async_transcribe_trt(audio_file, language="en")
+        return await async_transcribe_trt(audio_file, language="en", cancel_check=cancel_check)
     if selected_engine == "whisper":
-        return await async_translate_audio(audio_file)
+        return await async_translate_audio(audio_file, filename=filename, cancel_check=cancel_check)
 
-    text = await do_transcribe(audio_file, language="zh", engine=selected_engine, filename=filename)
+    text = await do_transcribe(audio_file, language="zh", engine=selected_engine, filename=filename, cancel_check=cancel_check)
     if not text:
         return ""
     detected_source = detect_translation_source_language(text)
     if _is_same_translation_lang(detected_source, "en"):
         return text
-    return do_translate(text, from_=detected_source, to="en")
+    return await async_do_translate(text, from_=detected_source, to="en", cancel_check=cancel_check)
 
 
-def do_translate(text: str, from_: str, to: str):
-    """
-    同步翻译函数，多供应商支持故障转移和超时控制
-    使用translator库的timeout参数实现超时控制
-    """
-    # 获取供应商列表
-    if not text or not text.strip():
-        return ""
-
-    if _is_auto_translation_lang(from_) or _is_auto_translation_lang(to):
-        raise ValueError("Translation no longer supports source/target language 'auto'")
-
-    if _is_same_translation_lang(from_, to):
-        logger.info(
-            "[TRANSLATE] Skip translation for same language pair: source=%s, target=%s",
-            from_,
-            to,
-        )
-        return text
-
-    if settings.GEMMA_TRANSLATE_ENABLED:
-        if is_gemma_translation_supported(from_, to):
-            logger.info(f"[TRANSLATE] Trying TranslateGemma first - source={from_}, target={to}")
-            gemma_result = gemma_translate(text, source_lang=from_, target_lang=to)
-            if gemma_result is not None:
-                logger.info("[TRANSLATE] TranslateGemma succeeded")
-                return gemma_result
-
-            logger.warning("[TRANSLATE] TranslateGemma failed")
-            if not settings.GEMMA_TRANSLATE_FALLBACK:
-                logger.error("[TRANSLATE] Fallback disabled, returning source text")
-                return text
-        else:
-            logger.info(
-                "[TRANSLATE] Skip TranslateGemma due to unsupported language pair: source=%s, target=%s",
-                from_,
-                to,
-            )
-
+def _do_web_translate(text: str, from_: str, to: str) -> str:
     services_list = [s.strip() for s in settings.TRANSLATOR_SERVICES_LIST.split(',')]
 
     translators_module = get_translators()
@@ -683,6 +1475,103 @@ def do_translate(text: str, from_: str, to: str):
     # 所有供应商都失败，返回原文
     logger.error(f"[TRANSLATE] 翻译失败，所有供应商不可用 - 返回原文")
     return text
+
+
+def do_translate(text: str, from_: str, to: str):
+    """
+    同步翻译函数，多供应商支持故障转移和超时控制
+    使用translator库的timeout参数实现超时控制
+    """
+    if not text or not text.strip():
+        return ""
+
+    if _is_auto_translation_lang(to):
+        raise ValueError("Translation no longer supports target language 'auto'")
+
+    if _is_same_translation_lang(from_, to):
+        logger.info(
+            "[TRANSLATE] Skip translation for same language pair: source=%s, target=%s",
+            from_,
+            to,
+        )
+        return text
+
+    if settings.GEMMA_TRANSLATE_ENABLED:
+        if is_gemma_translation_supported(from_, to):
+            logger.info(f"[TRANSLATE] Trying TranslateGemma first - source={from_}, target={to}")
+            gemma_result = gemma_translate(text, source_lang=from_, target_lang=to)
+            if gemma_result is not None:
+                logger.info("[TRANSLATE] TranslateGemma succeeded")
+                return gemma_result
+
+            logger.warning("[TRANSLATE] TranslateGemma failed")
+            if not settings.GEMMA_TRANSLATE_FALLBACK:
+                logger.error("[TRANSLATE] Fallback disabled, returning source text")
+                return text
+        else:
+            logger.info(
+                "[TRANSLATE] Skip TranslateGemma due to unsupported language pair: source=%s, target=%s",
+                from_,
+                to,
+            )
+
+    web_source_lang = "auto" if _is_dynamic_source_translation_lang(from_) else from_
+    return _do_web_translate(text, web_source_lang, to)
+
+
+async def async_do_translate(
+    text: str,
+    from_: str,
+    to: str,
+    cancel_check: Optional[CancelCheck] = None,
+) -> str:
+    await _run_cancel_check(cancel_check)
+    if not text or not text.strip():
+        return ""
+
+    if _is_auto_translation_lang(to):
+        raise ValueError("Translation no longer supports target language 'auto'")
+
+    if _is_same_translation_lang(from_, to):
+        logger.info(
+            "[TRANSLATE] Skip translation for same language pair: source=%s, target=%s",
+            from_,
+            to,
+        )
+        return text
+
+    if settings.GEMMA_TRANSLATE_ENABLED:
+        if is_gemma_translation_supported(from_, to):
+            logger.info(f"[TRANSLATE] Trying async TranslateGemma first - source={from_}, target={to}")
+            gemma_result = await _await_with_cancel(
+                async_gemma_translate(text, source_lang=from_, target_lang=to),
+                cancel_check,
+                "GEMMA_TRANSLATE",
+            )
+            await _run_cancel_check(cancel_check)
+            if gemma_result is not None:
+                logger.info("[TRANSLATE] TranslateGemma succeeded")
+                return gemma_result
+
+            logger.warning("[TRANSLATE] TranslateGemma failed")
+            if not settings.GEMMA_TRANSLATE_FALLBACK:
+                logger.error("[TRANSLATE] Fallback disabled, returning source text")
+                return text
+        else:
+            logger.info(
+                "[TRANSLATE] Skip TranslateGemma due to unsupported language pair: source=%s, target=%s",
+                from_,
+                to,
+            )
+
+    web_source_lang = "auto" if _is_dynamic_source_translation_lang(from_) else from_
+    result = await _await_with_cancel(
+        asyncio.to_thread(_do_web_translate, text, web_source_lang, to),
+        cancel_check,
+        "WEB_TRANSLATE",
+    )
+    await _run_cancel_check(cancel_check)
+    return result
 
 
 def packaged_opus_stream_to_wav_bytes(packaged_opus_data: bytes, sample_rate: int) -> bytes:

@@ -1,5 +1,6 @@
 import emoji
 import httpx
+import json
 import re
 from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form, Body, Response, Request, Query
@@ -31,15 +32,22 @@ from core.identity import has_bound_email
 from core.v2_dependencies import resolve_authenticated_v2_user
 from db.models import User, RequestLog, V2User
 from core.services import (
+    ClientDisconnectedError,
+    async_do_translate,
     errorFilter, do_translate,
     supportedLanguagesList, whisperSupportedLanguageList, packaged_opus_stream_to_wav_bytes,
     compress_repeated_chars, do_transcribe, do_translate_audio,
     normalize_asr_engine, asr_engine_supports_direct_translation,
+    MULTILINGUAL_ASR_LANGUAGE,
     resolve_asr_engine_for_language,
     get_runtime_translation_source_languages, get_runtime_translation_target_languages,
     is_runtime_translation_source_supported, is_runtime_translation_target_supported,
     normalize_translation_language_code,
     detect_translation_source_language,
+    is_asr_empty_audio_marker_text,
+    is_whisper_hallucination_text,
+    detect_language_firered_lid,
+    is_firered_lid_chinese_language,
 )
 from core.image_translate_service import translate_image_to_targets_async
 from core.logging_config import logger
@@ -60,6 +68,13 @@ USAGE_EXCLUDED_PREFIXES = (
     "/v2/api/content",
     "/v2/adminapi",
 )
+
+
+async def _raise_if_client_disconnected(request: Request, stage: str) -> None:
+    if await request.is_disconnected():
+        request_id = getattr(request.state, "request_id", "")
+        logger.info("[CLIENT-DISCONNECT] request_id=%s path=%s stage=%s", request_id, request.url.path, stage)
+        raise ClientDisconnectedError(stage)
 
 
 async def get_current_api_user_for_status(
@@ -124,6 +139,32 @@ def _apply_effective_resource_cost(request: Request, cost: int) -> None:
     _apply_resource_cost(request, _get_compat_resource_cost(cost))
 
 
+def _filtered_response() -> dict[str, str]:
+    return {"text": "", "message": "filtered"}
+
+
+def _is_filtered_transcription_text(
+    text: str,
+    language: Optional[str] = None,
+    include_multilingual: bool = False,
+) -> bool:
+    if (text in errorFilter.get("errorResultDict", [])) or any(
+        key in text for key in errorFilter.get("errorKeyString", [])
+    ):
+        return True
+
+    return include_multilingual and is_whisper_hallucination_text(text, language)
+
+
+def _empty_marker_filtered_response(request: Request, text: str, log_prefix: str) -> Optional[dict[str, str]]:
+    if not is_asr_empty_audio_marker_text(text):
+        return None
+
+    _apply_effective_resource_cost(request, 1)
+    logger.info("[%s] ASR non-content marker transcript filtered: %r", log_prefix, text)
+    return _filtered_response()
+
+
 def _reject_auto_language(field_name: str, language: str) -> None:
     if (language or "").strip().lower() == "auto":
         raise HTTPException(status_code=400, detail=f"{field_name} 'auto' is no longer supported")
@@ -181,6 +222,47 @@ def _default_whisper_route_engine() -> str:
     return "whisper-trt" if settings.WHISPER_BACKEND == "whisper-trt" else "whisper"
 
 
+def _default_chinese_route_engine() -> str:
+    try:
+        selected_engine = normalize_asr_engine(settings.ASR_DEFAULT_ENGINE)
+    except ValueError:
+        selected_engine = "firered"
+    return selected_engine if selected_engine in CHINESE_ROUTE_ASR_ENGINES else "firered"
+
+
+def _configured_chinese_route_engine(requested_engine: Optional[str]) -> str:
+    if requested_engine in CHINESE_ROUTE_ASR_ENGINES:
+        return requested_engine
+    return _default_chinese_route_engine()
+
+
+def _is_chinese_source_language(language: str) -> bool:
+    return normalize_translation_language_code(language) == "zh"
+
+
+def _is_multilingual_source_language(language: str) -> bool:
+    return (language or "").strip().lower() == MULTILINGUAL_ASR_LANGUAGE
+
+
+def _translation_source_language_for_text(language: str) -> str:
+    if _is_multilingual_source_language(language):
+        return "auto"
+    return language
+
+
+def _normalize_lid_language_list(languages: object, fallback: str) -> list[str]:
+    raw_items = list(languages) if isinstance(languages, (list, tuple)) else []
+    if fallback:
+        raw_items.append(fallback)
+
+    normalized_languages: list[str] = []
+    for item in raw_items:
+        normalized = normalize_translation_language_code(str(item or ""))
+        if normalized and normalized not in normalized_languages:
+            normalized_languages.append(normalized)
+    return normalized_languages
+
+
 def _resolve_chinese_asr_engine(
     engine: Optional[str],
     asr_engine: Optional[str],
@@ -205,7 +287,7 @@ def _resolve_non_chinese_asr_engine(
     if not (requested or "").strip():
         selected_engine = _default_whisper_route_engine()
         logger.info(
-            "[%s] non-Chinese source uses default Whisper ASR chain: effective=%s sourceLanguage=%s",
+            "[%s] non-Chinese source uses default Whisper ASR engine: effective=%s sourceLanguage=%s",
             endpoint,
             selected_engine,
             source_language,
@@ -219,7 +301,7 @@ def _resolve_non_chinese_asr_engine(
     effective_engine = _default_whisper_route_engine()
     if effective_engine != selected_engine:
         logger.info(
-            "[%s] non-Chinese source uses full Whisper ASR chain: requested=%s effective=%s sourceLanguage=%s",
+            "[%s] non-Chinese source uses Whisper ASR engine: requested=%s effective=%s sourceLanguage=%s",
             endpoint,
             selected_engine,
             effective_engine,
@@ -237,6 +319,99 @@ def _resolve_source_asr_engine(
     if normalize_translation_language_code(source_language) == "zh":
         return _resolve_chinese_asr_engine(engine, asr_engine, endpoint)
     return _resolve_non_chinese_asr_engine(engine, asr_engine, source_language, endpoint)
+
+
+async def _resolve_lid_audio_route(
+    audio_file: bytes,
+    *,
+    requested_source_language: str,
+    requested_asr_engine: str,
+    requested_chinese_asr_engine: Optional[str] = None,
+    endpoint: str,
+    filename: str = "audio.wav",
+    cancel_check=None,
+) -> tuple[str, str, str, Optional[dict[str, object]]]:
+    if cancel_check is not None:
+        await cancel_check()
+    effective_source_language = normalize_translation_language_code(requested_source_language)
+    effective_asr_engine = requested_asr_engine
+    route_reason = "requested_language"
+
+    lid_result = await detect_language_firered_lid(audio_file, filename=filename, cancel_check=cancel_check)
+    if cancel_check is not None:
+        await cancel_check()
+
+    if lid_result is None:
+        return effective_source_language, effective_asr_engine, route_reason, None
+
+    detected_language = normalize_translation_language_code(lid_result.language)
+    detected_languages = _normalize_lid_language_list(lid_result.languages, detected_language)
+    language_count = max(lid_result.language_count, len(detected_languages))
+    is_multilingual_audio = lid_result.is_multilingual or language_count >= 2
+
+    if is_multilingual_audio:
+        effective_source_language = MULTILINGUAL_ASR_LANGUAGE
+        effective_asr_engine = "whisper"
+        route_reason = "lid_multilingual_auto_whisper"
+    elif lid_result.high_confidence:
+        if is_firered_lid_chinese_language(detected_language):
+            effective_source_language = "zh"
+            effective_asr_engine = _configured_chinese_route_engine(requested_chinese_asr_engine)
+            route_reason = "lid_high_confidence_chinese"
+        elif detected_language in whisperSupportedLanguageList:
+            effective_source_language = detected_language
+            effective_asr_engine = (
+                requested_asr_engine
+                if requested_asr_engine in WHISPER_ROUTE_ASR_ENGINES
+                else _default_whisper_route_engine()
+            )
+            route_reason = (
+                "lid_high_confidence_match"
+                if detected_language == normalize_translation_language_code(requested_source_language)
+                else "lid_high_confidence_override"
+            )
+        else:
+            route_reason = "lid_high_confidence_unsupported"
+            logger.info(
+                "[%s] LID detected unsupported ASR language; keep requested source. detected=%s raw=%r confidence=%.3f",
+                endpoint,
+                detected_language,
+                lid_result.raw_language,
+                lid_result.confidence,
+            )
+    else:
+        route_reason = "lid_low_confidence_keep_requested" if lid_result.low_confidence else "lid_mid_confidence_keep_requested"
+
+    logger.info(
+        "[%s] LID route decision requested=%s detected=%s languages=%s raw=%r confidence=%.3f effective=%s engine=%s reason=%s",
+        endpoint,
+        normalize_translation_language_code(requested_source_language),
+        detected_language,
+        detected_languages,
+        lid_result.raw_language,
+        lid_result.confidence,
+        effective_source_language,
+        effective_asr_engine,
+        route_reason,
+    )
+    return (
+        effective_source_language,
+        effective_asr_engine,
+        route_reason,
+        {
+            "detectedSourceLanguage": detected_language,
+            "detectedSourceLanguageRaw": lid_result.raw_language,
+            "detectedSourceLanguageConfidence": lid_result.confidence,
+            "detectedLanguages": detected_languages,
+            "detectedLanguageCount": language_count,
+            "isMultilingualAudio": is_multilingual_audio,
+            "lidLanguageDetails": list(lid_result.language_details),
+            "lidSegments": list(lid_result.segments),
+            "effectiveSourceLanguage": effective_source_language,
+            "effectiveAsrEngine": effective_asr_engine,
+            "lidRouteReason": route_reason,
+        },
+    )
 
 
 def _resolve_audio_translation_asr_engine(
@@ -285,6 +460,11 @@ def _validate_audio_target_language(
         status_code=400,
         detail=f"{field_name} error, please use following languages: {str(target_languages)}",
     )
+
+
+def _should_use_text_translation() -> bool:
+    return settings.ENABLE_WEB_TRANSLATORS or settings.GEMMA_TRANSLATE_ENABLED
+
 
 # --- API 路由 ---
 
@@ -630,12 +810,20 @@ async def whisper_transcriptions(
     asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit),
 ):
+    async def cancel_check() -> None:
+        await _raise_if_client_disconnected(request, "WHISPER_TRANSCRIPTIONS")
+
     asr_engine = _resolve_chinese_asr_engine(engine, asrEngine, "WHISPER_TRANSCRIPTIONS")
     _apply_effective_resource_cost(request, 1)
+    await _raise_if_client_disconnected(request, "WHISPER_TRANSCRIPTIONS.read_audio.before")
     audio_file = await file.read()
-    text = await do_transcribe(audio_file, language='zh', engine=asr_engine, filename=file.filename or "audio.wav")
-    if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
-        return {"text": "", "message": "filtered"}
+    await _raise_if_client_disconnected(request, "WHISPER_TRANSCRIPTIONS.read_audio.after")
+    text = await do_transcribe(audio_file, language='zh', engine=asr_engine, filename=file.filename or "audio.wav", cancel_check=cancel_check)
+    filtered_response = _empty_marker_filtered_response(request, text, "WHISPER_TRANSCRIPTIONS")
+    if filtered_response is not None:
+        return filtered_response
+    if _is_filtered_transcription_text(text):
+        return _filtered_response()
     # 压缩重复字符
     if settings.ENABLE_TEXT_COMPRESSION:
         text = compress_repeated_chars(text, settings.TEXT_COMPRESSION_MIN_REPEAT)
@@ -649,12 +837,17 @@ async def whisper_translations(
     asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit),
 ):
+    async def cancel_check() -> None:
+        await _raise_if_client_disconnected(request, "WHISPER_TRANSLATIONS")
+
     asr_engine = _resolve_audio_translation_asr_engine(engine, asrEngine, "WHISPER_TRANSLATIONS")
     _apply_effective_resource_cost(request, 2)
+    await _raise_if_client_disconnected(request, "WHISPER_TRANSLATIONS.read_audio.before")
     audio_file = await file.read()
-    text = await do_translate_audio(audio_file, engine=asr_engine, filename=file.filename or "audio.wav")
-    if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
-        return {"text": "", "message": "filtered"}
+    await _raise_if_client_disconnected(request, "WHISPER_TRANSLATIONS.read_audio.after")
+    text = await do_translate_audio(audio_file, engine=asr_engine, filename=file.filename or "audio.wav", cancel_check=cancel_check)
+    if _is_filtered_transcription_text(text):
+        return _filtered_response()
     # 压缩重复字符
     if settings.ENABLE_TEXT_COMPRESSION:
         text = compress_repeated_chars(text, settings.TEXT_COMPRESSION_MIN_REPEAT)
@@ -668,19 +861,30 @@ async def translate_to_english(
     asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit),
 ):
+    async def cancel_check() -> None:
+        await _raise_if_client_disconnected(request, "TRANSLATE_TO_ENGLISH")
+
     asr_engine = _resolve_chinese_asr_engine(engine, asrEngine, "TRANSLATE_TO_ENGLISH")
-    _apply_effective_resource_cost(request, 2)
+    full_resource_cost = 2
+    _apply_effective_resource_cost(request, 1)
+    await _raise_if_client_disconnected(request, "TRANSLATE_TO_ENGLISH.read_audio.before")
     audio_file = await file.read()
-    text = await do_transcribe(audio_file, language='zh', engine=asr_engine, filename=file.filename or "audio.wav")
-    if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
-        return {"text": "", "message": "filtered"}
+    await _raise_if_client_disconnected(request, "TRANSLATE_TO_ENGLISH.read_audio.after")
+    text = await do_transcribe(audio_file, language='zh', engine=asr_engine, filename=file.filename or "audio.wav", cancel_check=cancel_check)
+    filtered_response = _empty_marker_filtered_response(request, text, "TRANSLATE_TO_ENGLISH")
+    if filtered_response is not None:
+        return filtered_response
+    if _is_filtered_transcription_text(text):
+        _apply_effective_resource_cost(request, full_resource_cost)
+        return _filtered_response()
     # 压缩重复字符
     if settings.ENABLE_TEXT_COMPRESSION:
         text = compress_repeated_chars(text, settings.TEXT_COMPRESSION_MIN_REPEAT)
-    if settings.ENABLE_WEB_TRANSLATORS:
-        translated_text = do_translate(text, from_='zh', to="en")
+    _apply_effective_resource_cost(request, full_resource_cost)
+    if _should_use_text_translation():
+        translated_text = await async_do_translate(text, from_='zh', to="en", cancel_check=cancel_check)
     else:
-        translated_text = await do_translate_audio(audio_file, engine=asr_engine, filename=file.filename or "audio.wav")
+        translated_text = await do_translate_audio(audio_file, engine=asr_engine, filename=file.filename or "audio.wav", cancel_check=cancel_check)
     return {"text": text, "translatedText": translated_text}
 
 @router.post("/func/translateToOtherLanguage")
@@ -692,25 +896,37 @@ async def translate_to_other_language(
     asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit),
 ):
+    async def cancel_check() -> None:
+        await _raise_if_client_disconnected(request, "TRANSLATE_TO_OTHER_LANGUAGE")
+
     asr_engine = _resolve_chinese_asr_engine(engine, asrEngine, "TRANSLATE_TO_OTHER_LANGUAGE")
     targetLanguage = _validate_audio_target_language("targetLanguage", targetLanguage, asr_engine=asr_engine)
-    _apply_effective_resource_cost(request, 2)
+    full_resource_cost = 2
+    _apply_effective_resource_cost(request, 1)
+    await _raise_if_client_disconnected(request, "TRANSLATE_TO_OTHER_LANGUAGE.read_audio.before")
     audio_file = await file.read()
-    text = await do_transcribe(audio_file, language='zh', engine=asr_engine, filename=file.filename or "audio.wav")
-    if (text in errorFilter.get("errorResultDict", [])) or any(key in text for key in errorFilter.get("errorKeyString", [])):
-        return {"text": "", "message": "filtered"}
+    await _raise_if_client_disconnected(request, "TRANSLATE_TO_OTHER_LANGUAGE.read_audio.after")
+    text = await do_transcribe(audio_file, language='zh', engine=asr_engine, filename=file.filename or "audio.wav", cancel_check=cancel_check)
+    filtered_response = _empty_marker_filtered_response(request, text, "TRANSLATE_TO_OTHER_LANGUAGE")
+    if filtered_response is not None:
+        return filtered_response
+    if _is_filtered_transcription_text(text):
+        _apply_effective_resource_cost(request, full_resource_cost)
+        return _filtered_response()
 
-    if asr_engine_supports_direct_translation(asr_engine) and not settings.ENABLE_WEB_TRANSLATORS:
-        trans_text = await do_transcribe(audio_file, language=targetLanguage, engine=asr_engine, filename=file.filename or "audio.wav")
-    elif settings.ENABLE_WEB_TRANSLATORS:
-        trans_text = do_translate(text, from_='zh', to=targetLanguage)
+    _apply_effective_resource_cost(request, full_resource_cost)
+
+    if asr_engine_supports_direct_translation(asr_engine) and not _should_use_text_translation():
+        trans_text = await do_transcribe(audio_file, language=targetLanguage, engine=asr_engine, filename=file.filename or "audio.wav", cancel_check=cancel_check)
+    elif _should_use_text_translation():
+        trans_text = await async_do_translate(text, from_='zh', to=targetLanguage, cancel_check=cancel_check)
     else:
-        translated_text = await do_translate_audio(audio_file, engine=asr_engine, filename=file.filename or "audio.wav")
+        translated_text = await do_translate_audio(audio_file, engine=asr_engine, filename=file.filename or "audio.wav", cancel_check=cancel_check)
         if targetLanguage == 'en':
             trans_text = translated_text
         else:
             logger.info("[TRANSLATE] LibreTranslate 已移除，回退至 Web 翻译服务")
-            trans_text = do_translate(translated_text, from_="en", to=targetLanguage)
+            trans_text = await async_do_translate(translated_text, from_="en", to=targetLanguage, cancel_check=cancel_check)
     return {"text": text, "translatedText": trans_text}
 
 @router.post("/func/multitranslateToOtherLanguage")
@@ -726,6 +942,9 @@ async def multitranslate_to_other_language(
     asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit)
 ):
+    async def cancel_check() -> None:
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE")
+
     # supportedLanguagesList 现在是硬编码的固定列表，不需要动态初始化
     logger.info(f"[MULTITRANSLATE] 开始多语言翻译请求 - 用户: {current_user.username}, 文件: {file.filename}, 大小: {len(file.file.read()) if hasattr(file, 'file') else 'unknown'} bytes")
     file.file.seek(0)  # 重置文件指针
@@ -742,6 +961,7 @@ async def multitranslate_to_other_language(
         # 参数错误返回400，避免客户端误判为token过期
         raise HTTPException(status_code=400, detail="sourceLanguage error")
 
+    requested_chinese_asr_engine = _resolve_asr_engine(engine, asrEngine)
     source_asr_engine = _resolve_source_asr_engine(engine, asrEngine, sourceLanguage, "MULTITRANSLATE")
     logger.info("[MULTITRANSLATE] effective ASR engine: %s", source_asr_engine)
     targetLanguage = _validate_audio_target_language("targetLanguage", targetLanguage, asr_engine=source_asr_engine)
@@ -749,44 +969,100 @@ async def multitranslate_to_other_language(
     targetLanguage3 = _validate_audio_target_language("targetLanguage3", targetLanguage3, allow_none=True, asr_engine=source_asr_engine)
 
     translation_count = 1 + int(targetLanguage2 != "none") + int(targetLanguage3 != "none")
-    _apply_effective_resource_cost(request, 1 + translation_count)
+    full_resource_cost = 1 + translation_count
+    _apply_effective_resource_cost(request, 1)
 
     logger.info(f"[MULTITRANSLATE] 开始处理音频文件 - content_type: {file.content_type}")
+    await _raise_if_client_disconnected(request, "MULTITRANSLATE.read_audio.before")
     audio_file = await file.read()
+    await _raise_if_client_disconnected(request, "MULTITRANSLATE.read_audio.after")
     logger.info(f"[MULTITRANSLATE] 音频文件读取完成 - 大小: {len(audio_file)} bytes")
 
     if file.content_type == 'audio/opus':
         logger.info(f"[MULTITRANSLATE] 检测到opus格式，开始转换为wav")
         audio_file = packaged_opus_stream_to_wav_bytes(audio_file, 16000)
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.opus_decode.after")
         logger.info(f"[MULTITRANSLATE] opus转换完成 - 新大小: {len(audio_file)} bytes")
 
+    await _raise_if_client_disconnected(request, "MULTITRANSLATE.lid.before")
+    effective_source_language, source_asr_engine, lid_route_reason, lid_metadata = await _resolve_lid_audio_route(
+        audio_file,
+        requested_source_language=sourceLanguage,
+        requested_asr_engine=source_asr_engine,
+        requested_chinese_asr_engine=requested_chinese_asr_engine,
+        endpoint="MULTITRANSLATE",
+        filename="audio.wav",
+        cancel_check=cancel_check,
+    )
+    await _raise_if_client_disconnected(request, "MULTITRANSLATE.lid.after")
+
     stext = ""
-    if sourceLanguage == 'zh':
-        logger.info("[MULTITRANSLATE] using Chinese ASR engine for zh transcription: %s", source_asr_engine)
-        stext = await do_transcribe(audio_file, language=sourceLanguage, engine=source_asr_engine, filename="audio.wav")
+    if _is_chinese_source_language(effective_source_language):
+        logger.info(
+            "[MULTITRANSLATE] using Chinese ASR engine for source transcription: language=%s engine=%s route=%s",
+            effective_source_language,
+            source_asr_engine,
+            lid_route_reason,
+        )
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.asr.before")
+        stext = await do_transcribe(
+            audio_file,
+            language=effective_source_language,
+            engine=source_asr_engine,
+            filename="audio.wav",
+            cancel_check=cancel_check,
+            lid_metadata=lid_metadata,
+        )
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.asr.after")
         logger.info("[MULTITRANSLATE] ASR result: %s", stext)
+        filtered_response = _empty_marker_filtered_response(request, stext, "MULTITRANSLATE")
+        if filtered_response is not None:
+            return filtered_response
         if emojiOutput == 'true':
             stext = emoji.replace_emoji(stext, replace='')
         if stext == '。' or stext == '':
-            return {"text": "", "message": "filtered"}
+            _apply_effective_resource_cost(request, full_resource_cost)
+            return _filtered_response()
+        if _is_filtered_transcription_text(stext, effective_source_language, include_multilingual=True):
+            logger.warning(
+                "[MULTITRANSLATE] zh transcription filtered by hallucination rules. text=%r",
+                stext,
+            )
+            _apply_effective_resource_cost(request, full_resource_cost)
+            return _filtered_response()
         if settings.ENABLE_TEXT_COMPRESSION:
             stext = compress_repeated_chars(stext, settings.TEXT_COMPRESSION_MIN_REPEAT)
         logger.info("[MULTITRANSLATE] zh transcription completed by engine=%s", source_asr_engine)
     else:
         logger.info(
-            "[MULTITRANSLATE] using full Whisper ASR chain for sourceLanguage=%s engine=%s",
-            sourceLanguage,
+            "[MULTITRANSLATE] using single ASR pass for sourceLanguage=%s engine=%s route=%s",
+            effective_source_language,
             source_asr_engine,
+            lid_route_reason,
         )
-        logger.debug(f"[MULTITRANSLATE] 先进行Whisper中文过滤检测")
-        filter_text = await do_transcribe(audio_file, language="zh", engine=source_asr_engine, filename="audio.wav")
-        logger.info(f"[MULTITRANSLATE] 中文过滤检测结果: '{filter_text}'")
-        if (filter_text in errorFilter.get("errorResultDict", [])) or any(key in filter_text for key in errorFilter.get("errorKeyString", [])):
-            logger.warning(f"[MULTITRANSLATE] 内容被过滤规则拦截 检测内容: '{filter_text}'")
-            return {"text": "", "message": "filtered"}
-        logger.debug(f"[MULTITRANSLATE] 进行{sourceLanguage}语言识别")
-        stext = await do_transcribe(audio_file, language=sourceLanguage, engine=source_asr_engine, filename="audio.wav")
-        logger.info(f"[MULTITRANSLATE] {sourceLanguage}语音识别结果: '{stext}'")
+        logger.debug(f"[MULTITRANSLATE] 进行{effective_source_language}语言识别")
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.asr.before")
+        stext = await do_transcribe(
+            audio_file,
+            language=effective_source_language,
+            engine=source_asr_engine,
+            filename="audio.wav",
+            cancel_check=cancel_check,
+            lid_metadata=lid_metadata,
+        )
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.asr.after")
+        logger.info(f"[MULTITRANSLATE] {effective_source_language}语音识别结果: '{stext}'")
+        filtered_response = _empty_marker_filtered_response(request, stext, "MULTITRANSLATE_SOURCE")
+        if filtered_response is not None:
+            return filtered_response
+        if _is_filtered_transcription_text(stext, effective_source_language, include_multilingual=True):
+            logger.warning(
+                "[MULTITRANSLATE] source transcription filtered by hallucination rules. language=%s text=%r",
+                effective_source_language,
+                stext,
+            )
+            _apply_effective_resource_cost(request, full_resource_cost)
+            return _filtered_response()
         # 压缩重复字符
         if settings.ENABLE_TEXT_COMPRESSION:
             original_stext = stext
@@ -795,34 +1071,53 @@ async def multitranslate_to_other_language(
                 logger.info(f"[MULTITRANSLATE] 压缩重复字符 - 原始: '{original_stext}' -> 处理后: '{stext}'")
 
     transText, transText2, transText3 = '', '', ''
-    logger.info(f"[MULTITRANSLATE] 开始翻译流程 - ENABLE_WEB_TRANSLATORS: {settings.ENABLE_WEB_TRANSLATORS}")
+    logger.info(
+        "[MULTITRANSLATE] 开始翻译流程 - ENABLE_WEB_TRANSLATORS=%s GEMMA_TRANSLATE_ENABLED=%s",
+        settings.ENABLE_WEB_TRANSLATORS,
+        settings.GEMMA_TRANSLATE_ENABLED,
+    )
+    _apply_effective_resource_cost(request, full_resource_cost)
 
-    if settings.ENABLE_WEB_TRANSLATORS:
-        translate_source_lang = sourceLanguage
-        logger.info(f"[MULTITRANSLATE] 使用网页翻译服务 - 源语言: {translate_source_lang}")
+    if _should_use_text_translation():
+        translate_source_lang = _translation_source_language_for_text(effective_source_language)
+        logger.info(f"[MULTITRANSLATE] 使用文本翻译服务 - 源语言: {translate_source_lang}")
         logger.debug(f"[MULTITRANSLATE] 开始翻译到目标语言: {targetLanguage}")
-        transText = do_translate(stext, from_=translate_source_lang, to=targetLanguage)
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.translate1.before")
+        transText = await async_do_translate(stext, from_=translate_source_lang, to=targetLanguage, cancel_check=cancel_check)
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.translate1.after")
         logger.info(f"[MULTITRANSLATE] 主目标语言翻译完成: '{transText}'")
 
         if targetLanguage2 != "none":
             logger.debug(f"[MULTITRANSLATE] 开始翻译到第二目标语言: {targetLanguage2}")
-            transText2 = do_translate(stext, from_=translate_source_lang, to=targetLanguage2)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.translate2.before")
+            transText2 = await async_do_translate(stext, from_=translate_source_lang, to=targetLanguage2, cancel_check=cancel_check)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.translate2.after")
             logger.info(f"[MULTITRANSLATE] 第二目标语言翻译完成: '{transText2}'")
         if targetLanguage3 != "none":
             logger.debug(f"[MULTITRANSLATE] 开始翻译到第三目标语言: {targetLanguage3}")
-            transText3 = do_translate(stext, from_=translate_source_lang, to=targetLanguage3)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.translate3.before")
+            transText3 = await async_do_translate(stext, from_=translate_source_lang, to=targetLanguage3, cancel_check=cancel_check)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.translate3.after")
             logger.info(f"[MULTITRANSLATE] 第三目标语言翻译完成: '{transText3}'")
     elif asr_engine_supports_direct_translation(source_asr_engine):
         logger.info("[MULTITRANSLATE] 使用 WhisperLive-TRT 内置翻译")
-        transText = await do_transcribe(audio_file, language=targetLanguage, engine=source_asr_engine, filename="audio.wav")
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.direct_translate1.before")
+        transText = await do_transcribe(audio_file, language=targetLanguage, engine=source_asr_engine, filename="audio.wav", cancel_check=cancel_check)
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.direct_translate1.after")
         if targetLanguage2 != "none":
-            transText2 = await do_transcribe(audio_file, language=targetLanguage2, engine=source_asr_engine, filename="audio.wav")
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.direct_translate2.before")
+            transText2 = await do_transcribe(audio_file, language=targetLanguage2, engine=source_asr_engine, filename="audio.wav", cancel_check=cancel_check)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.direct_translate2.after")
         if targetLanguage3 != "none":
-            transText3 = await do_transcribe(audio_file, language=targetLanguage3, engine=source_asr_engine, filename="audio.wav")
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.direct_translate3.before")
+            transText3 = await do_transcribe(audio_file, language=targetLanguage3, engine=source_asr_engine, filename="audio.wav", cancel_check=cancel_check)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.direct_translate3.after")
     else:
         logger.info(f"[MULTITRANSLATE] 使用Whisper翻译服务")
         logger.debug(f"[MULTITRANSLATE] 创建Whisper翻译请求")
-        translated_text = await do_translate_audio(audio_file, engine=source_asr_engine, filename="audio.wav")
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.audio_translate.before")
+        translated_text = await do_translate_audio(audio_file, engine=source_asr_engine, filename="audio.wav", cancel_check=cancel_check)
+        await _raise_if_client_disconnected(request, "MULTITRANSLATE.audio_translate.after")
         logger.info(f"[MULTITRANSLATE] Whisper翻译结果: '{translated_text}'")
 
         if targetLanguage == 'en':
@@ -830,21 +1125,39 @@ async def multitranslate_to_other_language(
             logger.info(f"[MULTITRANSLATE] 目标语言为英文，直接使用Whisper翻译结果")
         else:
             logger.debug(f"[MULTITRANSLATE] LibreTranslate已移除，使用网页翻译从英文到{targetLanguage}")
-            transText = do_translate(translated_text, from_="en", to=targetLanguage)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.audio_translate_text1.before")
+            transText = await async_do_translate(translated_text, from_="en", to=targetLanguage, cancel_check=cancel_check)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.audio_translate_text1.after")
             logger.info(f"[MULTITRANSLATE] 网页翻译完成: '{transText}'")
 
         if targetLanguage2 != "none":
             logger.debug(f"[MULTITRANSLATE] 翻译到第二目标语言: {targetLanguage2}")
-            transText2 = do_translate(translated_text, from_='en', to=targetLanguage2)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.audio_translate_text2.before")
+            transText2 = await async_do_translate(translated_text, from_='en', to=targetLanguage2, cancel_check=cancel_check)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.audio_translate_text2.after")
             logger.info(f"[MULTITRANSLATE] 第二目标语言翻译完成: '{transText2}'")
         if targetLanguage3 != "none":
             logger.debug(f"[MULTITRANSLATE] 翻译到第三目标语言: {targetLanguage3}")
-            transText3 = do_translate(translated_text, from_='en', to=targetLanguage3)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.audio_translate_text3.before")
+            transText3 = await async_do_translate(translated_text, from_='en', to=targetLanguage3, cancel_check=cancel_check)
+            await _raise_if_client_disconnected(request, "MULTITRANSLATE.audio_translate_text3.after")
             logger.info(f"[MULTITRANSLATE] 第三目标语言翻译完成: '{transText3}'")
 
-    logger.info(f"[MULTITRANSLATE] 多语言翻译请求处理完成 - 用户: {current_user.username}  原文: '{stext}', 主译文: '{transText}', 第二译文: '{transText2}', 第三译文: '{transText3}'")
+    logger.info(
+        "[MULTITRANSLATE] 多语言翻译请求处理完成 - 用户: %s requestedSource=%s effectiveSource=%s 原文: %r, 主译文: %r, 第二译文: %r, 第三译文: %r",
+        current_user.username,
+        sourceLanguage,
+        effective_source_language,
+        stext,
+        transText,
+        transText2,
+        transText3,
+    )
 
-    return {'text': stext, 'translatedText': transText, 'translatedText2': transText2, 'translatedText3': transText3}
+    response_payload = {'text': stext, 'translatedText': transText, 'translatedText2': transText2, 'translatedText3': transText3}
+    if lid_metadata is not None:
+        response_payload.update(lid_metadata)
+    return response_payload
 
 @router.post("/whisper/multitranscription")
 async def multitranscription(
@@ -856,28 +1169,96 @@ async def multitranscription(
     asrEngine: Optional[str] = Form(None),
     current_user: User = Depends(enforce_user_rate_limit)
 ):
+    async def cancel_check() -> None:
+        await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION")
+
     _apply_effective_resource_cost(request, 1)
     _reject_auto_language("sourceLanguage", sourceLanguage)
     if sourceLanguage not in whisperSupportedLanguageList:
         raise HTTPException(status_code=400, detail="sourceLanguage error")
 
+    requested_chinese_asr_engine = _resolve_asr_engine(engine, asrEngine)
     source_asr_engine = _resolve_source_asr_engine(engine, asrEngine, sourceLanguage, "MULTITRANSCRIPTION")
+    await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION.read_audio.before")
     audio_file = await file.read()
+    await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION.read_audio.after")
     if file.content_type == 'audio/opus':
         audio_file = packaged_opus_stream_to_wav_bytes(audio_file, 16000)
+        await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION.opus_decode.after")
+
+    await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION.lid.before")
+    effective_source_language, source_asr_engine, lid_route_reason, lid_metadata = await _resolve_lid_audio_route(
+        audio_file,
+        requested_source_language=sourceLanguage,
+        requested_asr_engine=source_asr_engine,
+        requested_chinese_asr_engine=requested_chinese_asr_engine,
+        endpoint="MULTITRANSCRIPTION",
+        filename="audio.wav",
+        cancel_check=cancel_check,
+    )
+    await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION.lid.after")
 
     text_to_return = ""
-    if sourceLanguage != 'zh':
-        filter_text = await do_transcribe(audio_file, language="zh", engine=source_asr_engine, filename="audio.wav")
-        if (filter_text in errorFilter.get("errorResultDict", [])) or any(key in filter_text for key in errorFilter.get("errorKeyString", [])):
-            return {"text": "", "message": "filtered"}
-        text_to_return = await do_transcribe(audio_file, language=sourceLanguage, engine=source_asr_engine, filename="audio.wav")
+    if not _is_chinese_source_language(effective_source_language):
+        logger.info(
+            "[MULTITRANSCRIPTION] using single ASR pass for sourceLanguage=%s engine=%s route=%s",
+            effective_source_language,
+            source_asr_engine,
+            lid_route_reason,
+        )
+        await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION.asr.before")
+        text_to_return = await do_transcribe(
+            audio_file,
+            language=effective_source_language,
+            engine=source_asr_engine,
+            filename="audio.wav",
+            cancel_check=cancel_check,
+            lid_metadata=lid_metadata,
+        )
+        await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION.asr.after")
+        filtered_response = _empty_marker_filtered_response(request, text_to_return, "MULTITRANSCRIPTION_SOURCE")
+        if filtered_response is not None:
+            return filtered_response
+        if _is_filtered_transcription_text(text_to_return, effective_source_language, include_multilingual=True):
+            logger.warning(
+                "[MULTITRANSCRIPTION] source transcription filtered by hallucination rules. language=%s text=%r",
+                effective_source_language,
+                text_to_return,
+            )
+            return _filtered_response()
     else:
-        text_to_return = await do_transcribe(audio_file, language=sourceLanguage, engine=source_asr_engine, filename="audio.wav")
+        logger.info(
+            "[MULTITRANSCRIPTION] using Chinese ASR engine for source transcription: language=%s engine=%s route=%s",
+            effective_source_language,
+            source_asr_engine,
+            lid_route_reason,
+        )
+        await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION.asr.before")
+        text_to_return = await do_transcribe(
+            audio_file,
+            language=effective_source_language,
+            engine=source_asr_engine,
+            filename="audio.wav",
+            cancel_check=cancel_check,
+            lid_metadata=lid_metadata,
+        )
+        await _raise_if_client_disconnected(request, "MULTITRANSCRIPTION.asr.after")
+        filtered_response = _empty_marker_filtered_response(request, text_to_return, "MULTITRANSCRIPTION")
+        if filtered_response is not None:
+            return filtered_response
         if emojiOutput == 'true': text_to_return = emoji.replace_emoji(text_to_return, replace='')
-        if text_to_return == '。' or text_to_return == '': return {"text": "", "message": "filtered"}
+        if text_to_return == '。' or text_to_return == '': return _filtered_response()
+        if _is_filtered_transcription_text(text_to_return, effective_source_language, include_multilingual=True):
+            logger.warning(
+                "[MULTITRANSCRIPTION] zh transcription filtered by hallucination rules. text=%r",
+                text_to_return,
+            )
+            return _filtered_response()
 
-    return {"text": text_to_return}
+    response_payload = {"text": text_to_return}
+    if lid_metadata is not None:
+        response_payload.update(lid_metadata)
+    return response_payload
 
 
 @router.post("/func/photoTranslate")
@@ -935,6 +1316,35 @@ class TTSRequest(BaseModel):
     volume: Optional[float] = None
 
 
+VOICE_SYNTHESIS_UPGRADE_MESSAGE = "请升级新版客户端以支持 Opus 流式语音合成。"
+
+
+def _voice_synthesis_upgrade_response() -> Response:
+    return Response(
+        content=json.dumps(
+            {
+                "detail": {
+                    "code": "tts_client_upgrade_required",
+                    "message": VOICE_SYNTHESIS_UPGRADE_MESSAGE,
+                    "display_hint": "main_top_banner",
+                    "severity": "upgrade_required",
+                    "required_response_format": "opus",
+                    "required_audio_encoding": "length_prefixed_opus",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+        status_code=426,
+        headers={
+            "X-Client-Upgrade-Required": "true",
+            "X-Client-Upgrade-Code": "tts_client_upgrade_required",
+            "X-Client-Upgrade-Display": "main_top_banner",
+            "X-Required-Audio-Encoding": "length_prefixed_opus",
+        },
+    )
+
+
 def _validate_tts_volume(value: Optional[float]) -> Optional[float]:
     if value is None:
         return None
@@ -973,6 +1383,9 @@ async def tts_proxy(
     data: TTSRequest,
     current_user: User = Depends(enforce_user_rate_limit),
 ):
+    if not settings.VOICE_SYNTHESIS_LEGACY_TRANSPORT_COMPAT:
+        return _voice_synthesis_upgrade_response()
+
     _apply_effective_resource_cost(request, 1)
     text = _validate_edge_tts_input(data.input)
     volume = _validate_tts_volume(data.volume)

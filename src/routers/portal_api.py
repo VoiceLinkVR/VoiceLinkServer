@@ -1264,8 +1264,12 @@ async def portal_orders(db: Session = Depends(get_db), current_user: V2User = De
 
 
 @router.get("/account/tickets", response_model=list[PortalSupportTicketResponse])
-async def portal_support_tickets(db: Session = Depends(get_db), current_user: V2User = Depends(get_current_v2_user)):
-    return support_ticket_service.list_user_tickets(db, current_user)
+async def portal_support_tickets(
+    include_closed: bool = Query(default=True),
+    db: Session = Depends(get_db),
+    current_user: V2User = Depends(get_current_v2_user),
+):
+    return support_ticket_service.list_user_tickets(db, current_user, include_closed=include_closed)
 
 
 @router.post("/account/tickets", response_model=PortalSupportTicketResponse)
@@ -1286,6 +1290,33 @@ async def portal_create_support_ticket(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.post("/account/tickets/{ticket_id}/messages", response_model=PortalSupportTicketResponse)
+async def portal_add_support_ticket_message(
+    ticket_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: V2User = Depends(get_current_v2_user),
+):
+    payload, attachments = await _read_support_ticket_payload(request)
+    try:
+        return await support_ticket_service.add_user_ticket_message(
+            db,
+            ticket_id=ticket_id,
+            current_user=current_user,
+            message=payload.message,
+            attachments=attachments,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "Ticket not found":
+            status_code = status.HTTP_404_NOT_FOUND
+        elif detail == "Ticket is closed":
+            status_code = status.HTTP_409_CONFLICT
+        else:
+            status_code = status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @router.get("/account/tickets/{ticket_id}/attachments/{attachment_id}")

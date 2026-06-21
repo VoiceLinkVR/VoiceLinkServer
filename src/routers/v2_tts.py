@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import os
+import struct
+import threading
+import time
 import wave
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
+import opuslib
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -79,6 +85,34 @@ QWEN_UNSUPPORTED_OFFICIAL_VOICE_FALLBACKS = {
     "sunny": "Serena",
 }
 SUPPORTED_RESPONSE_FORMATS = {"wav", "pcm", "mp3"}
+SUPPORTED_MOSS_RESPONSE_FORMATS = {"wav", "pcm"}
+SUPPORTED_OMNIVOICE_RESPONSE_FORMATS = {"wav", "pcm", "f32"}
+OPUS_RESPONSE_FORMAT_ALIASES = {
+    "opus",
+    "audio/opus",
+    "length_prefixed_opus",
+    "length-prefixed-opus",
+    "packaged_opus",
+    "packaged-opus",
+    "vrcls_opus",
+    "vrcls-opus",
+}
+SUPPORTED_QWEN_RESPONSE_FORMATS = SUPPORTED_RESPONSE_FORMATS | {"opus"}
+OPUS_SUPPORTED_SAMPLE_RATES = {8000, 12000, 16000, 24000, 48000}
+OPUS_FRAME_MS = 20
+OPUS_BITRATE = 48000
+EDGE_OPUS_DEFAULT_SAMPLE_RATE = 24000
+EDGE_OPUS_DEFAULT_CHANNELS = 1
+MOSS_OPUS_DEFAULT_SAMPLE_RATE = 48000
+MOSS_OPUS_DEFAULT_CHANNELS = 2
+OMNIVOICE_OPUS_DEFAULT_SAMPLE_RATE = 24000
+OMNIVOICE_OPUS_DEFAULT_CHANNELS = 1
+QWEN_OPUS_SAMPLE_RATES = OPUS_SUPPORTED_SAMPLE_RATES
+QWEN_OPUS_DEFAULT_SAMPLE_RATE = 24000
+QWEN_OPUS_DEFAULT_CHANNELS = 1
+QWEN_OPUS_FRAME_MS = OPUS_FRAME_MS
+QWEN_OPUS_BITRATE = OPUS_BITRATE
+VOICE_SYNTHESIS_UPGRADE_MESSAGE = "请升级新版客户端以支持 Opus 流式语音合成。"
 MOSS_PROMPT_AUDIO_FIELDS = {"prompt_audio", "prompt_speech", "reference_audio", "file"}
 MOSS_STABLE_SAMPLE_MODE = "fixed"
 MOSS_STABLE_DO_SAMPLE = True
@@ -104,6 +138,7 @@ QWEN_CLONE_REF_AUDIO_MIN_SECONDS = 3.0
 QWEN_CLONE_REF_AUDIO_RECOMMENDED_MIN_SECONDS = 10.0
 QWEN_CLONE_REF_AUDIO_RECOMMENDED_MAX_SECONDS = 20.0
 QWEN_CLONE_REF_AUDIO_MAX_SECONDS = 60.0
+QWEN_CLONE_RETRY_STATUSES = {429}
 QWEN_CLONE_PACKAGED_OPUS_ENCODINGS = {
     "length_prefixed_opus",
     "length-prefixed-opus",
@@ -112,6 +147,12 @@ QWEN_CLONE_PACKAGED_OPUS_ENCODINGS = {
     "vrcls_opus",
     "vrcls-opus",
 }
+QWEN_CLONE_DEFAULT_GLOBAL_LOCK_PATH = "/tmp/voicelink_qwen_clone.lock"
+_qwen_clone_semaphore: asyncio.Semaphore | None = None
+_qwen_clone_semaphore_limit: int | None = None
+_qwen_clone_state_lock = threading.Lock()
+_qwen_clone_inflight = 0
+_qwen_clone_global_lock_unavailable_logged = False
 MOSS_BUILTIN_VOICE_ALIASES = {
     "sakura": "Soyo",
     "yui": "Saki",
@@ -324,12 +365,19 @@ def _omnivoice_base_url() -> str:
 
 def _tts_engine_status() -> dict[str, Any]:
     return {
+        "audio_transport": {
+            "legacy_compat": bool(settings.VOICE_SYNTHESIS_LEGACY_TRANSPORT_COMPAT),
+            "opus_streaming_supported": True,
+            "opus_encoding": "length_prefixed_opus",
+            "upgrade_required_when_legacy_compat_false": True,
+        },
         "engines": {
             "edge": {
                 "enabled": _edge_tts_available(),
                 "speech_path": "/v2/api/tts/edge",
                 "v1_speech_path": "/v1/api/func/tts",
                 "supports_clone": False,
+                "supports_opus": True,
             },
             "qwen": {
                 "enabled": _qwen_builtin_voices_available(),
@@ -340,6 +388,7 @@ def _tts_engine_status() -> dict[str, Any]:
                 "speech_path": "/v2/api/tts/qwen",
                 "clone_path": "/v2/api/clone/qwen",
                 "supports_clone": True,
+                "supports_opus": True,
             },
             "moss": {
                 "enabled": _moss_tts_available(),
@@ -347,6 +396,7 @@ def _tts_engine_status() -> dict[str, Any]:
                 "clone_path": "/v2/api/clone/moss",
                 "voices_path": "/v2/api/tts/moss/voices",
                 "supports_clone": True,
+                "supports_opus": True,
             },
             "omnivoice": {
                 "enabled": _omnivoice_tts_available(),
@@ -354,6 +404,7 @@ def _tts_engine_status() -> dict[str, Any]:
                 "clone_path": "/v2/api/clone/omnivoice",
                 "languages_path": "/v2/api/tts/omnivoice/languages",
                 "supports_clone": True,
+                "supports_opus": True,
             },
         },
     }
@@ -414,31 +465,307 @@ def _omnivoice_timeout() -> httpx.Timeout:
     return _timeout_from_value(settings.OMNIVOICE_TTS_TIMEOUT)
 
 
-def _normalize_response_format(response_format: str) -> str:
+def _request_id(request: Request) -> str:
+    return str(getattr(request.state, "request_id", "") or "-")
+
+
+def _qwen_clone_max_concurrency() -> int:
+    return max(1, int(settings.QWEN_TTS_CLONE_MAX_CONCURRENCY or 1))
+
+
+def _qwen_clone_queue_size() -> int:
+    return max(0, int(settings.QWEN_TTS_CLONE_QUEUE_SIZE or 0))
+
+
+def _qwen_clone_queue_timeout() -> float:
+    return max(0.1, float(settings.QWEN_TTS_CLONE_QUEUE_TIMEOUT or 0.1))
+
+
+def _qwen_clone_retry_attempts() -> int:
+    return max(0, int(settings.QWEN_TTS_CLONE_RETRY_ATTEMPTS or 0))
+
+
+def _qwen_clone_retry_delay() -> float:
+    return max(0.0, float(settings.QWEN_TTS_CLONE_RETRY_DELAY or 0.0))
+
+
+def _qwen_clone_global_lock_path() -> str:
+    return (
+        str(getattr(settings, "QWEN_TTS_CLONE_GLOBAL_LOCK_PATH", "") or "").strip()
+        or QWEN_CLONE_DEFAULT_GLOBAL_LOCK_PATH
+    )
+
+
+def _get_qwen_clone_semaphore() -> asyncio.Semaphore:
+    global _qwen_clone_semaphore, _qwen_clone_semaphore_limit
+    limit = _qwen_clone_max_concurrency()
+    if _qwen_clone_semaphore is None or _qwen_clone_semaphore_limit != limit:
+        _qwen_clone_semaphore = asyncio.Semaphore(limit)
+        _qwen_clone_semaphore_limit = limit
+    return _qwen_clone_semaphore
+
+
+def _reserve_qwen_clone_queue_slot() -> int:
+    global _qwen_clone_inflight
+    max_allowed = _qwen_clone_max_concurrency() + _qwen_clone_queue_size()
+    with _qwen_clone_state_lock:
+        if _qwen_clone_inflight >= max_allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Qwen clone queue is full; please retry shortly",
+            )
+        _qwen_clone_inflight += 1
+        return _qwen_clone_inflight
+
+
+def _release_qwen_clone_queue_slot() -> int:
+    global _qwen_clone_inflight
+    with _qwen_clone_state_lock:
+        _qwen_clone_inflight = max(0, _qwen_clone_inflight - 1)
+        return _qwen_clone_inflight
+
+
+async def _raise_if_client_disconnected(request: Request, request_id: str) -> None:
+    try:
+        disconnected = await request.is_disconnected()
+    except RuntimeError:
+        disconnected = False
+    if disconnected:
+        logger.info("[V2-TTS] Qwen clone client disconnected while queued request_id=%s", request_id)
+        raise HTTPException(status_code=499, detail="client disconnected")
+
+
+async def _acquire_qwen_clone_semaphore(
+    semaphore: asyncio.Semaphore,
+    *,
+    deadline: float,
+    request: Request,
+    request_id: str,
+) -> None:
+    while True:
+        await _raise_if_client_disconnected(request, request_id)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HTTPException(status_code=429, detail="Qwen clone queue wait timeout")
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=min(0.2, remaining))
+            return
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _acquire_qwen_clone_global_lock(
+    *,
+    deadline: float,
+    request: Request,
+    request_id: str,
+):
+    global _qwen_clone_global_lock_unavailable_logged
+    if not bool(settings.QWEN_TTS_CLONE_GLOBAL_LOCK_ENABLED):
+        return None
+    try:
+        import fcntl  # Linux-only; production containers run Linux.
+    except ImportError:
+        if not _qwen_clone_global_lock_unavailable_logged:
+            logger.warning("[V2-TTS] Qwen clone global lock unavailable on this platform")
+            _qwen_clone_global_lock_unavailable_logged = True
+        return None
+
+    lock_path = _qwen_clone_global_lock_path()
+    lock_dir = os.path.dirname(lock_path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    try:
+        while True:
+            await _raise_if_client_disconnected(request, request_id)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HTTPException(status_code=429, detail="Qwen clone queue wait timeout")
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lock_file
+            except BlockingIOError:
+                await asyncio.sleep(min(0.2, remaining))
+    except Exception:
+        lock_file.close()
+        raise
+
+
+class _QwenCloneLease:
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        semaphore: asyncio.Semaphore,
+        lock_file: Any,
+        queued_at: float,
+        acquired_at: float,
+    ) -> None:
+        self.request_id = request_id
+        self._semaphore = semaphore
+        self._lock_file = lock_file
+        self._queued_at = queued_at
+        self._acquired_at = acquired_at
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._lock_file is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            except Exception as exc:
+                logger.warning("[V2-TTS] Qwen clone global lock release failed request_id=%s error=%s", self.request_id, exc)
+            finally:
+                try:
+                    self._lock_file.close()
+                except Exception:
+                    pass
+        self._semaphore.release()
+        inflight = _release_qwen_clone_queue_slot()
+        logger.info(
+            "[V2-TTS] Qwen clone upstream slot released request_id=%s held_s=%.3f total_s=%.3f inflight=%s",
+            self.request_id,
+            time.monotonic() - self._acquired_at,
+            time.monotonic() - self._queued_at,
+            inflight,
+        )
+
+
+async def _acquire_qwen_clone_lease(request: Request) -> _QwenCloneLease:
+    request_id = _request_id(request)
+    queued_at = time.monotonic()
+    inflight = _reserve_qwen_clone_queue_slot()
+    semaphore = _get_qwen_clone_semaphore()
+    semaphore_acquired = False
+    lock_file = None
+    deadline = queued_at + _qwen_clone_queue_timeout()
+    try:
+        await _acquire_qwen_clone_semaphore(
+            semaphore,
+            deadline=deadline,
+            request=request,
+            request_id=request_id,
+        )
+        semaphore_acquired = True
+        lock_file = await _acquire_qwen_clone_global_lock(
+            deadline=deadline,
+            request=request,
+            request_id=request_id,
+        )
+        acquired_at = time.monotonic()
+        logger.info(
+            "[V2-TTS] Qwen clone upstream slot acquired request_id=%s queue_wait_s=%.3f inflight=%s max_concurrency=%s queue_size=%s global_lock=%s",
+            request_id,
+            acquired_at - queued_at,
+            inflight,
+            _qwen_clone_max_concurrency(),
+            _qwen_clone_queue_size(),
+            bool(lock_file is not None),
+        )
+        return _QwenCloneLease(
+            request_id=request_id,
+            semaphore=semaphore,
+            lock_file=lock_file,
+            queued_at=queued_at,
+            acquired_at=acquired_at,
+        )
+    except Exception:
+        if lock_file is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            finally:
+                lock_file.close()
+        if semaphore_acquired:
+            semaphore.release()
+        _release_qwen_clone_queue_slot()
+        raise
+
+
+def _normalize_response_format(response_format: str, *, allow_opus: bool = False) -> str:
     fmt = (response_format or "wav").strip().lower()
-    if fmt not in SUPPORTED_RESPONSE_FORMATS:
-        raise HTTPException(status_code=400, detail="response_format must be one of wav, pcm, mp3")
+    if allow_opus and fmt in OPUS_RESPONSE_FORMAT_ALIASES:
+        return "opus"
+    allowed = SUPPORTED_RESPONSE_FORMATS | ({"opus"} if allow_opus else set())
+    if fmt not in allowed:
+        formats = "wav, pcm, mp3, opus" if allow_opus else "wav, pcm, mp3"
+        raise HTTPException(status_code=400, detail=f"response_format must be one of {formats}")
     return fmt
+
+
+def _normalize_edge_response_format(response_format: str) -> str:
+    return _normalize_response_format(response_format, allow_opus=True)
+
+
+def _normalize_qwen_response_format(response_format: str) -> str:
+    fmt = (response_format or "wav").strip().lower()
+    if fmt in OPUS_RESPONSE_FORMAT_ALIASES:
+        return "opus"
+    if fmt not in SUPPORTED_QWEN_RESPONSE_FORMATS:
+        raise HTTPException(status_code=400, detail="response_format must be one of wav, pcm, mp3, opus")
+    return fmt
+
+
+def _pcm_upstream_response_format(response_format: str) -> str:
+    return "pcm" if response_format == "opus" else response_format
+
+
+def _qwen_upstream_response_format(response_format: str) -> str:
+    return _pcm_upstream_response_format(response_format)
 
 
 def _normalize_moss_response_format(response_format: str) -> str:
     fmt = (response_format or "wav").strip().lower()
+    if fmt in OPUS_RESPONSE_FORMAT_ALIASES:
+        return "opus"
     if fmt in {"wav", "wave", "audio/wav"}:
         return "wav"
     if fmt in {"pcm", "pcm16", "pcm_s16le", "s16le", "raw"}:
         return "pcm"
-    raise HTTPException(status_code=400, detail="response_format must be one of wav, pcm")
+    raise HTTPException(status_code=400, detail="response_format must be one of wav, pcm, opus")
 
 
 def _normalize_omnivoice_response_format(response_format: str) -> str:
     fmt = (response_format or "wav").strip().lower()
+    if fmt in OPUS_RESPONSE_FORMAT_ALIASES:
+        return "opus"
     if fmt in {"wav", "wave", "audio/wav"}:
         return "wav"
     if fmt in {"pcm", "pcm16", "pcm_s16le", "s16le", "raw"}:
         return "pcm"
     if fmt in {"f32", "float32", "float"}:
         return "f32"
-    raise HTTPException(status_code=400, detail="response_format must be one of wav, pcm, f32")
+    raise HTTPException(status_code=400, detail="response_format must be one of wav, pcm, f32, opus")
+
+
+def _ensure_voice_synthesis_transport_allowed(response_format: str) -> None:
+    if settings.VOICE_SYNTHESIS_LEGACY_TRANSPORT_COMPAT or response_format == "opus":
+        return
+    raise HTTPException(
+        status_code=426,
+        detail={
+            "code": "tts_client_upgrade_required",
+            "message": VOICE_SYNTHESIS_UPGRADE_MESSAGE,
+            "display_hint": "main_top_banner",
+            "severity": "upgrade_required",
+            "required_response_format": "opus",
+            "required_audio_encoding": "length_prefixed_opus",
+        },
+        headers={
+            "X-Client-Upgrade-Required": "true",
+            "X-Client-Upgrade-Code": "tts_client_upgrade_required",
+            "X-Client-Upgrade-Display": "main_top_banner",
+            "X-Required-Audio-Encoding": "length_prefixed_opus",
+        },
+    )
 
 
 def _normalize_moss_voice(voice: Any) -> str:
@@ -679,6 +1006,20 @@ def _upstream_error_detail(body: bytes) -> Any:
         return text[:1000]
 
 
+def _reset_upstream_files(files: dict[str, Any] | None) -> None:
+    if not files:
+        return
+    for value in files.values():
+        file_obj = value
+        if isinstance(value, (tuple, list)) and len(value) >= 2:
+            file_obj = value[1]
+        if hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(0)
+            except Exception as exc:
+                logger.debug("[V2-TTS] failed to reset upstream file stream error=%s", exc)
+
+
 async def _open_upstream_stream(
     *,
     method: str,
@@ -688,35 +1029,68 @@ async def _open_upstream_stream(
     files: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     timeout: httpx.Timeout | None = None,
+    retry_statuses: set[int] | None = None,
+    retry_attempts: int = 0,
+    retry_delay: float = 0.0,
+    retry_label: str = "TTS upstream",
 ) -> tuple[httpx.AsyncClient, httpx.Response]:
-    client = httpx.AsyncClient(timeout=timeout or _timeout())
-    try:
-        request = client.build_request(
-            method,
-            url,
-            headers=_auth_headers() if headers is None else headers,
-            json=json_payload,
-            data=data,
-            files=files,
-        )
-        response = await client.send(request, stream=True)
-    except httpx.TimeoutException as exc:
-        await client.aclose()
-        logger.warning("[V2-TTS] upstream timeout url=%s error=%s", url, exc)
-        raise HTTPException(status_code=504, detail="TTS upstream timeout") from exc
-    except httpx.HTTPError as exc:
-        await client.aclose()
-        logger.warning("[V2-TTS] upstream unavailable url=%s error=%s", url, exc)
-        raise HTTPException(status_code=503, detail="TTS upstream unavailable") from exc
+    statuses = retry_statuses or set()
+    max_attempts = max(1, int(retry_attempts or 0) + 1)
+    delay_base = max(0.0, float(retry_delay or 0.0))
+    for attempt in range(1, max_attempts + 1):
+        client = httpx.AsyncClient(timeout=timeout or _timeout())
+        try:
+            _reset_upstream_files(files)
+            request = client.build_request(
+                method,
+                url,
+                headers=_auth_headers() if headers is None else headers,
+                json=json_payload,
+                data=data,
+                files=files,
+            )
+            response = await client.send(request, stream=True)
+        except httpx.TimeoutException as exc:
+            await client.aclose()
+            logger.warning("[V2-TTS] upstream timeout url=%s attempt=%s/%s error=%s", url, attempt, max_attempts, exc)
+            raise HTTPException(status_code=504, detail="TTS upstream timeout") from exc
+        except httpx.HTTPError as exc:
+            await client.aclose()
+            logger.warning("[V2-TTS] upstream unavailable url=%s attempt=%s/%s error=%s", url, attempt, max_attempts, exc)
+            raise HTTPException(status_code=503, detail="TTS upstream unavailable") from exc
 
-    if response.status_code >= 400:
+        if response.status_code < 400:
+            return client, response
+
         body = await response.aread()
         await response.aclose()
         await client.aclose()
-        logger.warning("[V2-TTS] upstream failed status=%s body=%s", response.status_code, body[:300])
+        should_retry = response.status_code in statuses and attempt < max_attempts
+        if should_retry:
+            delay = delay_base * attempt
+            logger.warning(
+                "[V2-TTS] upstream failed status=%s attempt=%s/%s retrying_after=%.3fs label=%s body=%s",
+                response.status_code,
+                attempt,
+                max_attempts,
+                delay,
+                retry_label,
+                body[:300],
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+            continue
+        logger.warning(
+            "[V2-TTS] upstream failed status=%s attempt=%s/%s label=%s body=%s",
+            response.status_code,
+            attempt,
+            max_attempts,
+            retry_label,
+            body[:300],
+        )
         raise HTTPException(status_code=response.status_code, detail=_upstream_error_detail(body))
 
-    return client, response
+    raise HTTPException(status_code=503, detail="TTS upstream unavailable")
 
 
 async def _iter_upstream_bytes(client: httpx.AsyncClient, response: httpx.Response):
@@ -729,6 +1103,290 @@ async def _iter_upstream_bytes(client: httpx.AsyncClient, response: httpx.Respon
         await client.aclose()
 
 
+async def _iter_with_finalizer(iterator: Any, finalizer: Callable[[], None]):
+    try:
+        async for chunk in iterator:
+            yield chunk
+    finally:
+        finalizer()
+
+
+def _response_header_int(response: httpx.Response, names: tuple[str, ...], default: int) -> int:
+    for name in names:
+        value = response.headers.get(name)
+        if not value:
+            continue
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            logger.warning("[V2-TTS] invalid integer audio header name=%s value=%s", name, value)
+            break
+    return default
+
+
+def _resolve_pcm_stream_format(
+    response: httpx.Response,
+    *,
+    engine_name: str,
+    default_sample_rate: int,
+    default_channels: int,
+) -> tuple[int, int]:
+    sample_rate = _response_header_int(
+        response,
+        ("X-Audio-Sample-Rate", "X-Sample-Rate"),
+        default_sample_rate,
+    )
+    channels = _response_header_int(
+        response,
+        ("X-Audio-Channels",),
+        default_channels,
+    )
+    if sample_rate not in OPUS_SUPPORTED_SAMPLE_RATES:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{engine_name} PCM sample rate {sample_rate} cannot be encoded as Opus",
+        )
+    if channels not in {1, 2}:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{engine_name} PCM channel count {channels} cannot be encoded as Opus",
+        )
+    return sample_rate, channels
+
+
+def _is_wave_media_type(value: str | None) -> bool:
+    normalized = (value or "").strip().lower()
+    return "wav" in normalized or "wave" in normalized
+
+
+async def _iter_pcm_as_packaged_opus(
+    client: httpx.AsyncClient,
+    response: httpx.Response,
+    *,
+    engine_name: str,
+    sample_rate: int,
+    channels: int,
+    frame_ms: int = OPUS_FRAME_MS,
+    bitrate: int = OPUS_BITRATE,
+):
+    frame_size = int(sample_rate * frame_ms / 1000)
+    frame_bytes = frame_size * channels * 2
+    pending = bytearray()
+    encoded_packets = 0
+    input_bytes = 0
+    output_bytes = 0
+    encoder = opuslib.Encoder(sample_rate, channels, "audio")
+    encoder.bitrate = bitrate
+    encoder.vbr = True
+    encoder.complexity = 10
+
+    try:
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            input_bytes += len(chunk)
+            pending.extend(chunk)
+            while len(pending) >= frame_bytes:
+                pcm_frame = bytes(pending[:frame_bytes])
+                del pending[:frame_bytes]
+                opus_packet = encoder.encode(pcm_frame, frame_size)
+                encoded_packets += 1
+                output_bytes += 4 + len(opus_packet)
+                yield struct.pack(">I", len(opus_packet))
+                yield opus_packet
+
+        if pending:
+            pending.extend(b"\x00" * (frame_bytes - len(pending)))
+            opus_packet = encoder.encode(bytes(pending), frame_size)
+            encoded_packets += 1
+            output_bytes += 4 + len(opus_packet)
+            yield struct.pack(">I", len(opus_packet))
+            yield opus_packet
+    finally:
+        logger.info(
+            "[V2-TTS] %s PCM encoded to packaged Opus input_bytes=%s output_bytes=%s packets=%s sample_rate=%s channels=%s bitrate=%s",
+            engine_name,
+            input_bytes,
+            output_bytes,
+            encoded_packets,
+            sample_rate,
+            channels,
+            bitrate,
+        )
+        await response.aclose()
+        await client.aclose()
+
+
+def _iter_pcm_buffer_as_packaged_opus(
+    pcm_data: bytes,
+    *,
+    engine_name: str,
+    sample_rate: int,
+    channels: int,
+    frame_ms: int = OPUS_FRAME_MS,
+    bitrate: int = OPUS_BITRATE,
+):
+    frame_size = int(sample_rate * frame_ms / 1000)
+    frame_bytes = frame_size * channels * 2
+    pending = bytearray(pcm_data or b"")
+    encoded_packets = 0
+    output_bytes = 0
+    encoder = opuslib.Encoder(sample_rate, channels, "audio")
+    encoder.bitrate = bitrate
+    encoder.vbr = True
+    encoder.complexity = 10
+
+    while len(pending) >= frame_bytes:
+        pcm_frame = bytes(pending[:frame_bytes])
+        del pending[:frame_bytes]
+        opus_packet = encoder.encode(pcm_frame, frame_size)
+        encoded_packets += 1
+        output_bytes += 4 + len(opus_packet)
+        yield struct.pack(">I", len(opus_packet))
+        yield opus_packet
+
+    if pending:
+        pending.extend(b"\x00" * (frame_bytes - len(pending)))
+        opus_packet = encoder.encode(bytes(pending), frame_size)
+        encoded_packets += 1
+        output_bytes += 4 + len(opus_packet)
+        yield struct.pack(">I", len(opus_packet))
+        yield opus_packet
+
+    logger.info(
+        "[V2-TTS] %s WAV PCM encoded to packaged Opus input_bytes=%s output_bytes=%s packets=%s sample_rate=%s channels=%s bitrate=%s",
+        engine_name,
+        len(pcm_data or b""),
+        output_bytes,
+        encoded_packets,
+        sample_rate,
+        channels,
+        bitrate,
+    )
+
+
+def _opus_headers(response: httpx.Response, sample_rate: int, channels: int) -> dict[str, str]:
+    headers = _audio_headers(response)
+    headers.update(
+        {
+            "X-Audio-Encoding": "length_prefixed_opus",
+            "X-Audio-Format": "opus",
+            "X-Audio-Sample-Rate": str(sample_rate),
+            "X-Audio-Channels": str(channels),
+            "X-Audio-Sample-Format": "s16le",
+            "X-Audio-Frame-Ms": str(OPUS_FRAME_MS),
+            "X-Audio-Opus-Bitrate": str(OPUS_BITRATE),
+            "X-Accel-Buffering": "no",
+        }
+    )
+    headers.setdefault("Cache-Control", "no-store")
+    return headers
+
+
+async def _wave_opus_streaming_response(
+    client: httpx.AsyncClient,
+    response: httpx.Response,
+    *,
+    engine_name: str,
+    on_close: Callable[[], None] | None = None,
+) -> StreamingResponse:
+    try:
+        try:
+            wav_data = await response.aread()
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+        try:
+            with wave.open(io.BytesIO(wav_data), "rb") as wav_file:
+                sample_rate = wav_file.getframerate()
+                channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                pcm_data = wav_file.readframes(wav_file.getnframes())
+        except (EOFError, wave.Error) as exc:
+            raise HTTPException(status_code=502, detail=f"{engine_name} upstream returned invalid WAV for Opus streaming") from exc
+
+        if sample_width != 2:
+            raise HTTPException(
+                status_code=502,
+                detail=f"{engine_name} WAV sample width {sample_width * 8} cannot be encoded as Opus",
+            )
+        if sample_rate not in OPUS_SUPPORTED_SAMPLE_RATES:
+            raise HTTPException(
+                status_code=502,
+                detail=f"{engine_name} WAV sample rate {sample_rate} cannot be encoded as Opus",
+            )
+        if channels not in {1, 2}:
+            raise HTTPException(
+                status_code=502,
+                detail=f"{engine_name} WAV channel count {channels} cannot be encoded as Opus",
+            )
+    except Exception:
+        if on_close is not None:
+            on_close()
+        raise
+    else:
+        if on_close is not None:
+            on_close()
+
+    return StreamingResponse(
+        _iter_pcm_buffer_as_packaged_opus(
+            pcm_data,
+            engine_name=engine_name,
+            sample_rate=sample_rate,
+            channels=channels,
+        ),
+        media_type="audio/opus",
+        headers=_opus_headers(response, sample_rate, channels),
+        status_code=response.status_code,
+    )
+
+
+async def _opus_streaming_response(
+    client: httpx.AsyncClient,
+    response: httpx.Response,
+    *,
+    engine_name: str,
+    default_sample_rate: int,
+    default_channels: int,
+    on_close: Callable[[], None] | None = None,
+) -> StreamingResponse:
+    content_type = response.headers.get("content-type", "")
+    if _is_wave_media_type(content_type):
+        return await _wave_opus_streaming_response(client, response, engine_name=engine_name, on_close=on_close)
+
+    try:
+        sample_rate, channels = _resolve_pcm_stream_format(
+            response,
+            engine_name=engine_name,
+            default_sample_rate=default_sample_rate,
+            default_channels=default_channels,
+        )
+    except Exception:
+        await response.aclose()
+        await client.aclose()
+        if on_close is not None:
+            on_close()
+        raise
+
+    body_iterator = _iter_pcm_as_packaged_opus(
+        client,
+        response,
+        engine_name=engine_name,
+        sample_rate=sample_rate,
+        channels=channels,
+    )
+    if on_close is not None:
+        body_iterator = _iter_with_finalizer(body_iterator, on_close)
+
+    return StreamingResponse(
+        body_iterator,
+        media_type="audio/opus",
+        headers=_opus_headers(response, sample_rate, channels),
+        status_code=response.status_code,
+    )
+
+
 def _media_type(response: httpx.Response, fallback_format: str) -> str:
     content_type = response.headers.get("content-type", "")
     if content_type:
@@ -737,6 +1395,7 @@ def _media_type(response: httpx.Response, fallback_format: str) -> str:
         "wav": "audio/wav",
         "pcm": "audio/pcm",
         "mp3": "audio/mpeg",
+        "opus": "audio/opus",
         "f32": "application/octet-stream",
     }[fallback_format]
 
@@ -753,6 +1412,9 @@ def _audio_headers(response: httpx.Response) -> dict[str, str]:
         "X-MOSS-TTS-Backend",
         "X-Sample-Rate",
         "X-Audio-Format",
+        "X-Audio-Encoding",
+        "X-Audio-Frame-Ms",
+        "X-Audio-Opus-Bitrate",
         "Cache-Control",
         "X-Accel-Buffering",
     ):
@@ -1052,7 +1714,9 @@ async def v2_edge_tts(
 ):
     del current_user
     text = _validate_edge_tts_input(payload.input)
-    response_format = _normalize_response_format(payload.response_format)
+    response_format = _normalize_edge_response_format(payload.response_format)
+    _ensure_voice_synthesis_transport_allowed(response_format)
+    upstream_response_format = _pcm_upstream_response_format(response_format)
 
     effective_cost = _apply_effective_resource_cost(request, EDGE_TTS_RESOURCE_COST)
     request.state.audit_payload = {
@@ -1060,6 +1724,7 @@ async def v2_edge_tts(
         "engine": "edge",
         "resource_cost": effective_cost,
         "response_format": response_format,
+        "upstream_response_format": upstream_response_format,
         "voice": payload.voice,
         "volume": payload.volume,
     }
@@ -1068,7 +1733,7 @@ async def v2_edge_tts(
         "model": "tts-1",
         "input": text,
         "voice": payload.voice,
-        "response_format": response_format,
+        "response_format": upstream_response_format,
         "speed": payload.speed,
     }
     if payload.language:
@@ -1076,15 +1741,25 @@ async def v2_edge_tts(
     if payload.volume is not None:
         upstream_payload["volume"] = payload.volume
 
-    async with httpx.AsyncClient(timeout=_edge_timeout()) as client:
-        response = await client.post(
-            _edge_tts_url(),
-            json=upstream_payload,
-            headers=_edge_auth_headers(),
+    client, response = await _open_upstream_stream(
+        method="POST",
+        url=_edge_tts_url(),
+        json_payload=upstream_payload,
+        headers=_edge_auth_headers(),
+        timeout=_edge_timeout(),
+    )
+    if response_format == "opus":
+        return await _opus_streaming_response(
+            client,
+            response,
+            engine_name="Edge TTS",
+            default_sample_rate=EDGE_OPUS_DEFAULT_SAMPLE_RATE,
+            default_channels=EDGE_OPUS_DEFAULT_CHANNELS,
         )
+
     return StreamingResponse(
-        iter([response.content]),
-        media_type=response.headers.get("Content-Type", _media_type(response, response_format)),
+        _iter_upstream_bytes(client, response),
+        media_type=_media_type(response, response_format),
         headers=_audio_headers(response),
         status_code=response.status_code,
     )
@@ -1099,7 +1774,9 @@ async def v2_tts(
     del current_user
     _ensure_qwen_builtin_voices_enabled()
     text = _validate_tts_input(payload.input)
-    response_format = _normalize_response_format(payload.response_format)
+    response_format = _normalize_qwen_response_format(payload.response_format)
+    _ensure_voice_synthesis_transport_allowed(response_format)
+    upstream_response_format = _qwen_upstream_response_format(response_format)
     chunk_size = _validate_chunk_size(payload.chunk_size)
     qwen_voice = _normalize_qwen_voice(payload.voice)
 
@@ -1109,6 +1786,7 @@ async def v2_tts(
         "engine": "qwen",
         "resource_cost": effective_cost,
         "response_format": response_format,
+        "upstream_response_format": upstream_response_format,
         "voice": qwen_voice,
         "requested_voice": payload.voice,
         "temperature": payload.temperature,
@@ -1119,7 +1797,7 @@ async def v2_tts(
         "model": "tts-1",
         "input": text,
         "voice": qwen_voice,
-        "response_format": response_format,
+        "response_format": upstream_response_format,
         "speed": payload.speed,
     }
     if chunk_size is not None:
@@ -1137,6 +1815,15 @@ async def v2_tts(
         url=_upstream_url("/v1/audio/speech"),
         json_payload=upstream_payload,
     )
+    if response_format == "opus":
+        return await _opus_streaming_response(
+            client,
+            response,
+            engine_name="Qwen",
+            default_sample_rate=QWEN_OPUS_DEFAULT_SAMPLE_RATE,
+            default_channels=QWEN_OPUS_DEFAULT_CHANNELS,
+        )
+
     return StreamingResponse(
         _iter_upstream_bytes(client, response),
         media_type=_media_type(response, response_format),
@@ -1158,6 +1845,8 @@ async def v2_moss_tts(
     response_format = _normalize_moss_response_format(
         str(_payload_get(raw_payload, "response_format", "format", default="wav") or "wav")
     )
+    _ensure_voice_synthesis_transport_allowed(response_format)
+    upstream_response_format = _pcm_upstream_response_format(response_format)
     stream_enabled = _coerce_bool(_payload_get(raw_payload, "stream", default=True), True)
     volume = _validate_optional_volume(_payload_get(raw_payload, "volume", default=None))
     if volume is not None:
@@ -1177,6 +1866,7 @@ async def v2_moss_tts(
         "engine": "moss",
         "resource_cost": effective_cost,
         "response_format": response_format,
+        "upstream_response_format": upstream_response_format,
         "stream": stream_enabled,
         "language": _payload_get(raw_payload, "language", "lang", default=""),
         "voice": _payload_get(raw_payload, "voice", default=""),
@@ -1187,7 +1877,7 @@ async def v2_moss_tts(
     upstream_payload = _build_moss_payload(
         raw_payload,
         text=text,
-        response_format=response_format,
+        response_format=upstream_response_format,
         stream_enabled=stream_enabled,
         as_form=prompt_audio is not None or is_form_request,
         has_prompt_audio=has_prompt_audio,
@@ -1218,6 +1908,15 @@ async def v2_moss_tts(
             json_payload=upstream_payload,
             headers=_moss_auth_headers(),
             timeout=_moss_timeout(),
+        )
+
+    if response_format == "opus":
+        return await _opus_streaming_response(
+            client,
+            response,
+            engine_name="MOSS",
+            default_sample_rate=MOSS_OPUS_DEFAULT_SAMPLE_RATE,
+            default_channels=MOSS_OPUS_DEFAULT_CHANNELS,
         )
 
     return StreamingResponse(
@@ -1269,6 +1968,8 @@ async def v2_omnivoice_tts(
     del current_user
     text = _validate_omnivoice_tts_input(payload.input or payload.text or "")
     response_format = _normalize_omnivoice_response_format(payload.response_format)
+    _ensure_voice_synthesis_transport_allowed(response_format)
+    upstream_response_format = _pcm_upstream_response_format(response_format)
     language = _normalize_omnivoice_language(payload.language)
 
     effective_cost = _apply_effective_resource_cost(request, OMNIVOICE_TTS_RESOURCE_COST)
@@ -1277,6 +1978,7 @@ async def v2_omnivoice_tts(
         "engine": "omnivoice",
         "resource_cost": effective_cost,
         "response_format": response_format,
+        "upstream_response_format": upstream_response_format,
         "stream": payload.stream,
         "language": language or "",
         "voice": payload.voice or "",
@@ -1290,12 +1992,21 @@ async def v2_omnivoice_tts(
         json_payload=_build_omnivoice_speech_payload(
             payload,
             text=text,
-            response_format=response_format,
+            response_format=upstream_response_format,
             language=language,
         ),
         headers=_omnivoice_auth_headers(),
         timeout=_omnivoice_timeout(),
     )
+    if response_format == "opus":
+        return await _opus_streaming_response(
+            client,
+            response,
+            engine_name="OmniVoice",
+            default_sample_rate=OMNIVOICE_OPUS_DEFAULT_SAMPLE_RATE,
+            default_channels=OMNIVOICE_OPUS_DEFAULT_CHANNELS,
+        )
+
     return StreamingResponse(
         _iter_upstream_bytes(client, response),
         media_type=_media_type(response, response_format),
@@ -1369,6 +2080,8 @@ async def v2_omnivoice_clone(
     del current_user
     text = _validate_omnivoice_tts_input(input or text_input or "")
     response_format = _normalize_omnivoice_response_format(response_format)
+    _ensure_voice_synthesis_transport_allowed(response_format)
+    upstream_response_format = _pcm_upstream_response_format(response_format)
     volume = _validate_optional_volume(volume)
     resolved_language = _resolve_optional_omnivoice_language(
         target_language,
@@ -1386,6 +2099,7 @@ async def v2_omnivoice_clone(
         "engine": "omnivoice",
         "resource_cost": effective_cost,
         "response_format": response_format,
+        "upstream_response_format": upstream_response_format,
         "stream": stream,
         "language": resolved_language or "",
         "has_ref_text": bool((ref_text or "").strip()),
@@ -1395,7 +2109,7 @@ async def v2_omnivoice_clone(
 
     data: dict[str, Any] = {
         "text": text,
-        "response_format": response_format,
+        "response_format": upstream_response_format,
         "stream": stream,
         "num_step": num_step,
         "guidance_scale": guidance_scale,
@@ -1436,6 +2150,15 @@ async def v2_omnivoice_clone(
         headers=_omnivoice_auth_headers(),
         timeout=_omnivoice_timeout(),
     )
+    if response_format == "opus":
+        return await _opus_streaming_response(
+            client,
+            response,
+            engine_name="OmniVoice clone",
+            default_sample_rate=OMNIVOICE_OPUS_DEFAULT_SAMPLE_RATE,
+            default_channels=OMNIVOICE_OPUS_DEFAULT_CHANNELS,
+        )
+
     return StreamingResponse(
         _iter_upstream_bytes(client, response),
         media_type=_media_type(response, response_format),
@@ -1490,6 +2213,8 @@ async def v2_moss_clone(
     _ensure_moss_tts_enabled()
     text = _validate_moss_tts_input(input)
     response_format = _normalize_moss_response_format(response_format)
+    _ensure_voice_synthesis_transport_allowed(response_format)
+    upstream_response_format = _pcm_upstream_response_format(response_format)
     volume = _validate_optional_volume(volume)
     selected_prompt_audio = prompt_audio or ref_audio
     selected_prompt_path = (prompt_audio_path or prompt_speech or reference_audio_path or "").strip()
@@ -1512,6 +2237,7 @@ async def v2_moss_clone(
         "engine": "moss",
         "resource_cost": effective_cost,
         "response_format": response_format,
+        "upstream_response_format": upstream_response_format,
         "stream": stream,
         "language": resolved_language or "",
         "has_prompt_audio": selected_prompt_audio is not None,
@@ -1522,7 +2248,7 @@ async def v2_moss_clone(
 
     raw_payload: dict[str, Any] = {
         "input": text,
-        "response_format": response_format,
+        "response_format": upstream_response_format,
         "stream": stream,
     }
     if resolved_language:
@@ -1560,7 +2286,7 @@ async def v2_moss_clone(
     upstream_payload = _build_moss_payload(
         raw_payload,
         text=text,
-        response_format=response_format,
+        response_format=upstream_response_format,
         stream_enabled=stream,
         as_form=True,
         has_prompt_audio=selected_prompt_audio is not None or bool(selected_prompt_path),
@@ -1586,6 +2312,15 @@ async def v2_moss_clone(
         headers=_moss_auth_headers(),
         timeout=_moss_timeout(),
     )
+    if response_format == "opus":
+        return await _opus_streaming_response(
+            client,
+            response,
+            engine_name="MOSS clone",
+            default_sample_rate=MOSS_OPUS_DEFAULT_SAMPLE_RATE,
+            default_channels=MOSS_OPUS_DEFAULT_CHANNELS,
+        )
+
     return StreamingResponse(
         _iter_upstream_bytes(client, response),
         media_type=_media_type(response, response_format),
@@ -1629,7 +2364,9 @@ async def v2_clone(
     if ref_text and len(ref_text.strip()) > max(1, int(settings.QWEN_TTS_MAX_INPUT_CHARS or 500)):
         raise HTTPException(status_code=400, detail="ref_text is too long")
 
-    response_format = _normalize_response_format(response_format)
+    response_format = _normalize_qwen_response_format(response_format)
+    _ensure_voice_synthesis_transport_allowed(response_format)
+    upstream_response_format = _qwen_upstream_response_format(response_format)
     normalized_chunk_size = _validate_chunk_size(chunk_size) or 8
     resolved_language = _resolve_clone_synthesis_language(
         target_language,
@@ -1648,6 +2385,7 @@ async def v2_clone(
         "engine": "qwen",
         "resource_cost": effective_cost,
         "response_format": response_format,
+        "upstream_response_format": upstream_response_format,
         "language": resolved_language,
         "ref_language": resolved_ref_language,
         "xvec_only": xvec_only,
@@ -1661,7 +2399,7 @@ async def v2_clone(
         "input": text,
         "ref_text": ref_text,
         "language": resolved_language,
-        "response_format": response_format,
+        "response_format": upstream_response_format,
         "chunk_size": str(normalized_chunk_size),
         "xvec_only": "true" if xvec_only else "false",
         "append_silence": "true" if append_silence else "false",
@@ -1684,14 +2422,33 @@ async def v2_clone(
             ref_audio_sample_rate,
         )
     }
-    client, response = await _open_upstream_stream(
-        method="POST",
-        url=_upstream_url("/v1/audio/voice-clone"),
-        data=data,
-        files=files,
-    )
+    lease = await _acquire_qwen_clone_lease(request)
+    try:
+        client, response = await _open_upstream_stream(
+            method="POST",
+            url=_upstream_url("/v1/audio/voice-clone"),
+            data=data,
+            files=files,
+            retry_statuses=QWEN_CLONE_RETRY_STATUSES,
+            retry_attempts=_qwen_clone_retry_attempts(),
+            retry_delay=_qwen_clone_retry_delay(),
+            retry_label="Qwen clone",
+        )
+    except Exception:
+        lease.release()
+        raise
+    if response_format == "opus":
+        return await _opus_streaming_response(
+            client,
+            response,
+            engine_name="Qwen clone",
+            default_sample_rate=QWEN_OPUS_DEFAULT_SAMPLE_RATE,
+            default_channels=QWEN_OPUS_DEFAULT_CHANNELS,
+            on_close=lease.release,
+        )
+
     return StreamingResponse(
-        _iter_upstream_bytes(client, response),
+        _iter_with_finalizer(_iter_upstream_bytes(client, response), lease.release),
         media_type=_media_type(response, response_format),
         headers=_audio_headers(response),
         status_code=response.status_code,

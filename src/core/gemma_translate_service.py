@@ -90,6 +90,10 @@ def is_auto_lang_code(lang_code: str) -> bool:
     return (lang_code or "").strip().lower() == "auto"
 
 
+def is_dynamic_source_lang_code(lang_code: str) -> bool:
+    return (lang_code or "").strip().lower() in {"auto", "multilingual"}
+
+
 def _map_lang_code(lang_code: str) -> str:
     raw = (lang_code or "").strip().lower()
     return LANG_CODE_MAPPING.get(raw, raw)
@@ -108,8 +112,11 @@ def _normalize_lang_code(lang_code: str) -> str:
 
 
 def is_gemma_translation_supported(source_lang: str, target_lang: str) -> bool:
-    if is_auto_lang_code(source_lang) or is_auto_lang_code(target_lang):
+    if is_auto_lang_code(target_lang) or is_dynamic_source_lang_code(target_lang):
         return False
+
+    if is_dynamic_source_lang_code(source_lang):
+        return _normalize_lang_code(target_lang) in GEMMA_SUPPORTED_LANG_CODES
 
     source = _normalize_lang_code(source_lang)
     target = _normalize_lang_code(target_lang)
@@ -209,16 +216,27 @@ def _build_openai_payload(
     max_new_tokens: Optional[int],
     extra_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    target_name = _language_name(target_lang)
+    mapped_target = _map_lang_code(target_lang)
+    if is_dynamic_source_lang_code(source_lang):
+        content = (
+            f"You are a professional multilingual translator. Detect the source language or languages in the text, "
+            f"then translate all meaningful content into {target_name} ({mapped_target}). Preserve names, numbers, "
+            f"and intent. Produce only the {target_name} translation, without explanations or commentary.\n\n{text}"
+        )
+    else:
+        content = text
+
     payload: Dict[str, Any] = {
         "messages": [
             {
                 "role": "user",
-                "content": text,
+                "content": content,
             }
         ],
         "chat_template_kwargs": {
-            "source_lang_code": _map_lang_code(source_lang),
-            "target_lang_code": _map_lang_code(target_lang),
+            "source_lang_code": "auto" if is_dynamic_source_lang_code(source_lang) else _map_lang_code(source_lang),
+            "target_lang_code": mapped_target,
         },
         "max_tokens": _resolve_max_new_tokens(text, max_new_tokens),
         "temperature": 0.2,
@@ -236,6 +254,17 @@ def _build_completion_prompt(text: str, source_lang: str, target_lang: str) -> s
     mapped_target = _map_lang_code(target_lang)
     source_name = _language_name(source_lang)
     target_name = _language_name(target_lang)
+    if is_dynamic_source_lang_code(source_lang):
+        return (
+            f"<start_of_turn>user\n"
+            f"You are a professional multilingual translator. Detect the source language or languages in the text, "
+            f"then translate all meaningful content into {target_name} ({mapped_target}). Preserve names, numbers, "
+            f"and intent. Produce only the {target_name} translation, without explanations or commentary. "
+            f"Translate the following text:\n\n\n"
+            f"{text}<end_of_turn>\n"
+            f"<start_of_turn>model\n"
+        )
+
     return (
         f"<start_of_turn>user\n"
         f"You are a professional {source_name} ({mapped_source}) to {target_name} ({mapped_target}) translator. "

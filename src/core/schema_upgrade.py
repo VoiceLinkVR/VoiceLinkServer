@@ -169,6 +169,19 @@ def _ensure_table_columns(db: Session) -> None:
         _add_column_if_missing(db, columns, column_name, ddl)
 
 
+def _ensure_support_ticket_columns(db: Session) -> None:
+    table_names = set(_table_names(db))
+    if "v2_support_ticket_attachment" not in table_names:
+        return
+    columns = _table_columns(db, "v2_support_ticket_attachment")
+    _add_column_if_missing(
+        db,
+        columns,
+        "event_id",
+        "ALTER TABLE v2_support_ticket_attachment ADD COLUMN event_id INTEGER",
+    )
+
+
 def _backfill_users(db: Session) -> None:
     free_plan = get_free_plan()
     for user in db.query(User).all():
@@ -584,6 +597,7 @@ def run_schema_upgrade() -> None:
     Base.metadata.create_all(bind=engine)
     db = Session(bind=engine)
     try:
+        _ensure_support_ticket_columns(db)
         _ensure_default_test_v2_user(db)
         db.commit()
         logger.info(

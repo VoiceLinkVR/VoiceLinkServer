@@ -11,10 +11,11 @@ from limits.strategies import MovingWindowRateLimiter
 from sqlalchemy.orm import Session
 
 from core.config import settings
-from core.dependencies import get_db, get_effective_user_limit_rule, oauth2_scheme, resolve_authenticated_user
+from core.dependencies import get_effective_user_limit_rule, oauth2_scheme, resolve_authenticated_user
 from core.logging_config import logger
 from core.quota_service import prepare_quota_allocation
 from core.v2_dependencies import resolve_authenticated_v2_user
+from db.base import SessionLocal
 from db.models import User, V2User
 
 DEFAULT_GLOBAL_LIMIT = "3000/hour"
@@ -231,66 +232,94 @@ async def _resolve_rate_limited_user(
 async def enforce_user_rate_limit(
     request: Request,
     token: Optional[str] = Depends(oauth2_scheme),
-    db: Session = Depends(get_db),
 ) -> User | V2User:
-    current_user = await _resolve_rate_limited_user(request, token, db)
-    client_ip = get_client_ip(request)
-    request.state.quota_user = current_user
-    request.state.quota_db = db
-    request.state.quota_username = current_user.username
-    request.state.quota_client_ip = client_ip
-    request.state.pending_quota_allocation = None
+    db = SessionLocal()
+    try:
+        current_user = await _resolve_rate_limited_user(request, token, db)
+        client_ip = get_client_ip(request)
+        request.state.quota_user_uuid = str(getattr(current_user, "user_uuid", "") or "").strip()
+        request.state.quota_username = current_user.username
+        request.state.quota_user_is_v2 = isinstance(current_user, V2User)
+        request.state.quota_client_ip = client_ip
+        request.state.pending_quota_allocation = None
 
-    if not rate_limiter.enabled:
-        return current_user
+        if not rate_limiter.enabled:
+            return current_user
 
-    limit_rule = _strip_limit_metadata(get_effective_user_limit_rule(current_user) or "")
-    is_default_test_user = bool(getattr(current_user, "is_default_test_user", False))
+        limit_rule = _strip_limit_metadata(get_effective_user_limit_rule(current_user) or "")
+        is_default_test_user = bool(getattr(current_user, "is_default_test_user", False))
 
-    if is_default_test_user:
-        limit_rule = settings.DEFAULT_TEST_USER_IP_RATE_LIMIT or limit_rule
-        context = rate_limiter.create_context(
-            limit_string=limit_rule,
-            key=f"{client_ip}:{_utc_day_bucket()}",
-            scope=f"anonymous_ip:{client_ip}",
-            context_type="user",
-            deduct_when=lambda status: status == 200,
-        )
-    else:
-        if not settings.LEGACY_CLIENT_COMPAT:
-            limit_rule = _strip_day_limits(limit_rule)
-        # 普通用户没有配置分钟/小时等频率规则时，不回退默认速率限制；
-        # 新额度模式下 /day 只作为额度规则，由 quota_service 负责。
-        context = None
-        if limit_rule:
-            user_key = (
-                str(getattr(current_user, "user_uuid", "") or "").strip()
-                if request.scope.get("path", "").startswith("/v2/")
-                else str(getattr(current_user, "user_uuid", None) or current_user.username).strip()
-            )
-            if not user_key:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Not authenticated",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
+        if is_default_test_user:
+            limit_rule = settings.DEFAULT_TEST_USER_IP_RATE_LIMIT or limit_rule
             context = rate_limiter.create_context(
                 limit_string=limit_rule,
-                key=f"{user_key}:{_utc_day_bucket()}",
-                scope=f"user:{user_key}",
+                key=f"{client_ip}:{_utc_day_bucket()}",
+                scope=f"anonymous_ip:{client_ip}",
                 context_type="user",
                 deduct_when=lambda status: status == 200,
             )
+        else:
+            if not settings.LEGACY_CLIENT_COMPAT:
+                limit_rule = _strip_day_limits(limit_rule)
+            # 普通用户没有配置分钟/小时等频率规则时，不回退默认速率限制；
+            # 新额度模式下 /day 只作为额度规则，由 quota_service 负责。
+            context = None
+            if limit_rule:
+                user_key = (
+                    str(getattr(current_user, "user_uuid", "") or "").strip()
+                    if request.scope.get("path", "").startswith("/v2/")
+                    else str(getattr(current_user, "user_uuid", None) or current_user.username).strip()
+                )
+                if not user_key:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Not authenticated",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                context = rate_limiter.create_context(
+                    limit_string=limit_rule,
+                    key=f"{user_key}:{_utc_day_bucket()}",
+                    scope=f"user:{user_key}",
+                    context_type="user",
+                    deduct_when=lambda status: status == 200,
+                )
 
-    if context:
-        context.check()
-        pending = getattr(request.state, "rate_limit_contexts", None)
-        if pending is None:
-            pending = []
-            request.state.rate_limit_contexts = pending
-        pending.append(context)
+        if context:
+            context.check()
+            pending = getattr(request.state, "rate_limit_contexts", None)
+            if pending is None:
+                pending = []
+                request.state.rate_limit_contexts = pending
+            pending.append(context)
 
-    return current_user
+        return current_user
+    finally:
+        db.close()
+
+
+def _load_quota_user(
+    db: Session,
+    *,
+    user_uuid: str,
+    username: str,
+    is_v2: bool,
+) -> User | V2User | None:
+    if is_v2:
+        if user_uuid:
+            user = db.query(V2User).filter(V2User.user_uuid == user_uuid).first()
+            if user is not None:
+                return user
+        if username:
+            return db.query(V2User).filter(V2User.username == username).first()
+        return None
+
+    if username:
+        user = db.query(User).filter(User.username == username).first()
+        if user is not None:
+            return user
+    if user_uuid:
+        return db.query(User).filter(User.user_uuid == user_uuid).first()
+    return None
 
 
 def set_user_context_cost(request: Request, cost: int) -> None:
@@ -305,13 +334,26 @@ def set_user_context_cost(request: Request, cost: int) -> None:
     if settings.LEGACY_CLIENT_COMPAT:
         return
 
-    db = getattr(request.state, "quota_db", None)
-    current_user = getattr(request.state, "quota_user", None)
+    username = str(getattr(request.state, "quota_username", "") or "").strip()
+    user_uuid = str(getattr(request.state, "quota_user_uuid", "") or "").strip()
+    is_v2 = bool(getattr(request.state, "quota_user_is_v2", False))
     client_ip = getattr(request.state, "quota_client_ip", None)
-    if db is None or current_user is None:
+    if not username and not user_uuid:
         return
 
-    request.state.pending_quota_allocation = prepare_quota_allocation(db, current_user, desired_cost, client_ip=client_ip)
+    db = SessionLocal()
+    try:
+        current_user = _load_quota_user(db, user_uuid=user_uuid, username=username, is_v2=is_v2)
+        if current_user is None:
+            return
+        request.state.pending_quota_allocation = prepare_quota_allocation(
+            db,
+            current_user,
+            desired_cost,
+            client_ip=client_ip,
+        )
+    finally:
+        db.close()
 
 
 def enforce_auth_attempt_rate_limit(

@@ -14,18 +14,19 @@ from core.entitlement_service import (
     reset_user_entitlements_to_free,
     sync_user_cache_from_entitlements,
 )
+from core.email_service import send_email_message
 from core.logging_config import logger
 from core.plan_catalog import get_free_plan
-from core.v2_request_metrics import V2_METRIC_EXCLUDED_ENDPOINTS, V2_METRIC_EXCLUDED_PREFIXES
 from core.quota_service import get_daily_subscription_limit
+from core.v2_request_metrics import V2_METRIC_EXCLUDED_ENDPOINTS, V2_METRIC_EXCLUDED_PREFIXES
 from db.models import (
     LegacyRequestLog,
     PaymentOrder,
     RequestLog,
     V2EndpointHourlyStats,
     V2RequestAuditLog,
-    V2User,
     V2SubjectDailyUsage,
+    V2User,
     normalize_payment_lookup_value,
     payment_lookup_digest,
 )
@@ -938,8 +939,8 @@ def build_user_stats_payload(db: Session, user_id: int, *, days: int = 14) -> di
     }
 
 
-    username = payload.username.strip()
 def create_user(db: Session, payload: Any) -> dict[str, Any]:
+    username = payload.username.strip()
     email = normalize_email(payload.email) if payload.email else None
     if db.query(V2User).filter(V2User.username == username).first() is not None:
         raise ValueError("Username already exists")
@@ -1395,6 +1396,57 @@ def get_order_detail_payload(db: Session, order_id: int) -> dict[str, Any]:
     return _build_afdian_order_payload(order)
 
 
+def _resolve_order_notification_email(db: Session, order: PaymentOrder) -> Optional[str]:
+    direct_email = str(getattr(order, "email", "") or "").strip()
+    if direct_email:
+        return normalize_email(direct_email)
+
+    user = None
+    user_uuid = str(getattr(order, "user_uuid", "") or "").strip()
+    username = str(getattr(order, "username", "") or "").strip()
+    if user_uuid:
+        user = db.query(V2User).filter(V2User.user_uuid == user_uuid).first()
+    if user is None and username:
+        user = db.query(V2User).filter(V2User.username == username).first()
+
+    user_email = str(getattr(user, "email", "") or "").strip() if user is not None else ""
+    return normalize_email(user_email) if user_email else None
+
+
+def _send_order_manual_handled_email(db: Session, order: PaymentOrder) -> tuple[bool, Optional[str]]:
+    try:
+        recipient = _resolve_order_notification_email(db, order)
+    except Exception as exc:  # pylint: disable=broad-except
+        detail = f"Invalid recipient email: {exc}"
+        logger.warning("[ORDER-MANUAL-HANDLED] %s order_id=%s", detail, order.id)
+        return False, detail[:1000]
+
+    if not recipient:
+        return False, "No recipient email"
+
+    order_ref = str(order.out_trade_no or order.order_no or f"#{order.id}")
+    amount_text = f"{float(order.amount):.2f} CNY" if order.amount is not None else "-"
+    body = (
+        "你的 VoiceLinkVR 支持记录已完成手工处理。\n\n"
+        f"支持编号：{order_ref}\n"
+        f"支持金额：{amount_text}\n"
+        f"当前状态：已手工处理\n\n"
+        "如果这是因为自动算力回馈同步异常触发的人工处理，相关处理结果已由管理员确认。"
+        "你可以在控制台的「支持记录」或「反馈中心」查看后续状态。"
+    )
+    try:
+        send_email_message(
+            recipient=recipient,
+            subject=f"VoiceLinkVR 支持记录已手工处理 {order_ref}",
+            text_body=body,
+        )
+        return True, None
+    except Exception as exc:  # pylint: disable=broad-except
+        detail = str(getattr(exc, "detail", None) or exc)
+        logger.warning("[ORDER-MANUAL-HANDLED] Failed to notify order %s: %s", order_ref, detail)
+        return False, detail[:1000]
+
+
 def mark_order_manually_handled(db: Session, order_id: int) -> dict[str, Any]:
     order = db.query(PaymentOrder).filter(PaymentOrder.id == order_id).first()
     if order is None:
@@ -1413,7 +1465,11 @@ def mark_order_manually_handled(db: Session, order_id: int) -> dict[str, Any]:
     order.updated_at = utcnow_naive()
     db.commit()
     db.refresh(order)
-    return _build_afdian_order_payload(order)
+    email_sent, email_error = _send_order_manual_handled_email(db, order)
+    payload = _build_afdian_order_payload(order)
+    payload["manual_handle_email_sent"] = email_sent
+    payload["manual_handle_email_error"] = email_error or ""
+    return payload
 
 
 def _find_local_order_by_keyword(db: Session, query_value: str) -> Optional[PaymentOrder]:

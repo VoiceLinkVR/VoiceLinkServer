@@ -49,6 +49,14 @@ ASR_HTTP_CONNECT_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_CONNECT_TIMEOUT
 ASR_HTTP_WRITE_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_WRITE_TIMEOUT_SECONDS", "10")), 0.05)
 ASR_HTTP_POOL_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_POOL_TIMEOUT_SECONDS", "3")), 0.05)
 ASR_HTTP_CLOSE_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_CLOSE_TIMEOUT_SECONDS", "1")), 0.05)
+ASR_BACKEND_STATUS_ENABLED = os.getenv("ASR_BACKEND_STATUS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+ASR_BACKEND_STATUS_TTL_SECONDS = max(float(os.getenv("ASR_BACKEND_STATUS_TTL_SECONDS", "1.5")), 0.05)
+ASR_BACKEND_STATUS_TIMEOUT_SECONDS = max(float(os.getenv("ASR_BACKEND_STATUS_TIMEOUT_SECONDS", "0.6")), 0.05)
+ASR_BACKEND_STATUS_OVERLOAD_ACTIVE_REQUESTS = max(int(os.getenv("ASR_BACKEND_STATUS_OVERLOAD_ACTIVE_REQUESTS", "4")), 1)
+ASR_BACKEND_STATUS_OVERLOAD_OLDEST_SECONDS = max(float(os.getenv("ASR_BACKEND_STATUS_OVERLOAD_OLDEST_SECONDS", "30")), 0.1)
+ASR_BACKEND_STATUS_OVERLOAD_MIN_SECONDS = max(float(os.getenv("ASR_BACKEND_STATUS_OVERLOAD_MIN_SECONDS", "12")), 0.0)
+ASR_BACKEND_STATUS_RECOVERY_OLDEST_SECONDS = max(float(os.getenv("ASR_BACKEND_STATUS_RECOVERY_OLDEST_SECONDS", "12")), 0.0)
+ASR_BACKEND_STATUS_RECOVERY_ACTIVE_REQUESTS = max(int(os.getenv("ASR_BACKEND_STATUS_RECOVERY_ACTIVE_REQUESTS", "2")), 0)
 
 
 @dataclass(frozen=True)
@@ -83,8 +91,34 @@ class AsrQueuePermit:
     enabled: bool = True
 
 
+@dataclass(frozen=True)
+class AsrBackendRuntimeStatus:
+    endpoint: str
+    fetched_at: float
+    ok: bool
+    active_requests: int = 0
+    oldest_active_seconds: float = 0.0
+    recent_p95_completed_seconds: float = 0.0
+    recent_average_completed_seconds: float = 0.0
+    recent_completed: int = 0
+    recent_failed: int = 0
+    recent_cancelled: int = 0
+    system_load_1m: float = 0.0
+    system_cpu_count: int = 1
+    error: str | None = None
+
+
+@dataclass
+class AsrBackendProtectionState:
+    overload_started_at: float | None = None
+    protected: bool = False
+    last_reason: str = ""
+
+
 _asr_endpoint_queues: dict[str, AsrEndpointQueue] = {}
 _asr_backend_rr_index: dict[str, int] = {}
+_asr_backend_status_cache: dict[str, AsrBackendRuntimeStatus] = {}
+_asr_backend_protection_state: dict[str, AsrBackendProtectionState] = {}
 
 
 def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
@@ -206,6 +240,209 @@ def _build_asr_http_timeout(total_timeout_seconds: float) -> httpx.Timeout:
 
 def _asr_no_keepalive_limits() -> httpx.Limits:
     return httpx.Limits(max_keepalive_connections=0)
+
+
+def _asr_backend_root_url(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        return normalized[:-3]
+    return normalized
+
+
+def _asr_backend_status_url(base_url: str) -> str:
+    return f"{_asr_backend_root_url(base_url)}/api/asr/status"
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _parse_asr_backend_status(
+    backend: AsrBackend,
+    payload: Any,
+    fetched_at: float,
+) -> AsrBackendRuntimeStatus:
+    data = _as_mapping(payload)
+    recent = _as_mapping(data.get("recent"))
+    system = _as_mapping(data.get("system"))
+    return AsrBackendRuntimeStatus(
+        endpoint=backend.endpoint,
+        fetched_at=fetched_at,
+        ok=True,
+        active_requests=max(_as_int(data.get("activeRequests")), 0),
+        oldest_active_seconds=max(_as_float(data.get("oldestActiveSeconds")), 0.0),
+        recent_p95_completed_seconds=max(_as_float(recent.get("p95CompletedSeconds")), 0.0),
+        recent_average_completed_seconds=max(_as_float(recent.get("averageCompletedSeconds")), 0.0),
+        recent_completed=max(_as_int(recent.get("completed")), 0),
+        recent_failed=max(_as_int(recent.get("failed")), 0),
+        recent_cancelled=max(_as_int(recent.get("cancelled")), 0),
+        system_load_1m=max(_as_float(system.get("loadAverage1m")), 0.0),
+        system_cpu_count=max(_as_int(system.get("cpuCount"), 1), 1),
+    )
+
+
+async def _fetch_asr_backend_status(backend: AsrBackend) -> AsrBackendRuntimeStatus:
+    fetched_at = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(
+            timeout=ASR_BACKEND_STATUS_TIMEOUT_SECONDS,
+            limits=_asr_no_keepalive_limits(),
+            headers={"Connection": "close"},
+        ) as client:
+            response = await client.get(_asr_backend_status_url(backend.base_url))
+        response.raise_for_status()
+        return _parse_asr_backend_status(backend, response.json(), fetched_at)
+    except Exception as exc:  # pylint: disable=broad-except
+        return AsrBackendRuntimeStatus(
+            endpoint=backend.endpoint,
+            fetched_at=fetched_at,
+            ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+async def _get_asr_backend_status(backend: AsrBackend) -> AsrBackendRuntimeStatus:
+    now = time.perf_counter()
+    cached = _asr_backend_status_cache.get(backend.endpoint)
+    if cached is not None and now - cached.fetched_at <= ASR_BACKEND_STATUS_TTL_SECONDS:
+        return cached
+
+    status = await _fetch_asr_backend_status(backend)
+    _asr_backend_status_cache[backend.endpoint] = status
+    return status
+
+
+def _asr_backend_status_detail(status: AsrBackendRuntimeStatus) -> dict[str, Any]:
+    return {
+        "endpoint": status.endpoint,
+        "ok": status.ok,
+        "activeRequests": status.active_requests,
+        "oldestActiveSeconds": round(status.oldest_active_seconds, 3),
+        "recentP95CompletedSeconds": round(status.recent_p95_completed_seconds, 3),
+        "recentAverageCompletedSeconds": round(status.recent_average_completed_seconds, 3),
+        "recentCompleted": status.recent_completed,
+        "recentFailed": status.recent_failed,
+        "recentCancelled": status.recent_cancelled,
+        "systemLoad1m": round(status.system_load_1m, 3),
+        "systemCpuCount": status.system_cpu_count,
+        "error": status.error,
+    }
+
+
+def _asr_backend_status_is_overloaded(status: AsrBackendRuntimeStatus) -> bool:
+    if not status.ok:
+        return False
+    return (
+        status.active_requests >= ASR_BACKEND_STATUS_OVERLOAD_ACTIVE_REQUESTS
+        and status.oldest_active_seconds >= ASR_BACKEND_STATUS_OVERLOAD_OLDEST_SECONDS
+    )
+
+
+def _update_asr_backend_protection(status: AsrBackendRuntimeStatus) -> tuple[bool, float, str]:
+    state = _asr_backend_protection_state.setdefault(status.endpoint, AsrBackendProtectionState())
+    now = time.perf_counter()
+
+    if not _asr_backend_status_is_overloaded(status):
+        if (
+            status.active_requests <= ASR_BACKEND_STATUS_RECOVERY_ACTIVE_REQUESTS
+            or status.oldest_active_seconds <= ASR_BACKEND_STATUS_RECOVERY_OLDEST_SECONDS
+            or not status.ok
+        ):
+            state.overload_started_at = None
+            state.protected = False
+            state.last_reason = ""
+        return state.protected, 0.0, state.last_reason
+
+    if state.overload_started_at is None:
+        state.overload_started_at = now
+    overload_seconds = max(now - state.overload_started_at, 0.0)
+    state.last_reason = (
+        f"activeRequests={status.active_requests} oldestActiveSeconds={status.oldest_active_seconds:.3f}"
+    )
+    if overload_seconds >= ASR_BACKEND_STATUS_OVERLOAD_MIN_SECONDS:
+        state.protected = True
+    return state.protected, overload_seconds, state.last_reason
+
+
+def _asr_backend_status_rejection(
+    endpoint_group: str,
+    language: str,
+    protected: Sequence[tuple[AsrBackend, AsrBackendRuntimeStatus, float, str]],
+) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": "asr_backend_overloaded",
+            "engine": endpoint_group,
+            "language": language,
+            "backends": [
+                {
+                    **_asr_backend_status_detail(status),
+                    "overloadSeconds": round(overload_seconds, 3),
+                    "reason": reason,
+                }
+                for _, status, overload_seconds, reason in protected
+            ],
+            "overloadActiveRequests": ASR_BACKEND_STATUS_OVERLOAD_ACTIVE_REQUESTS,
+            "overloadOldestSeconds": ASR_BACKEND_STATUS_OVERLOAD_OLDEST_SECONDS,
+            "overloadMinSeconds": ASR_BACKEND_STATUS_OVERLOAD_MIN_SECONDS,
+        },
+        headers={"Retry-After": str(max(1, int(ASR_QUEUE_DEFAULT_RETRY_AFTER_SECONDS + 0.999)))},
+    )
+
+
+async def _filter_asr_backends_by_runtime_status(
+    endpoint_group: str,
+    backends: Sequence[AsrBackend],
+    language: str,
+) -> tuple[list[AsrBackend], list[tuple[AsrBackend, AsrBackendRuntimeStatus, float, str]]]:
+    if not ASR_BACKEND_STATUS_ENABLED or endpoint_group != "whisper" or not backends:
+        return list(backends), []
+
+    statuses = await asyncio.gather(*(_get_asr_backend_status(backend) for backend in backends))
+    available: list[AsrBackend] = []
+    protected: list[tuple[AsrBackend, AsrBackendRuntimeStatus, float, str]] = []
+    for backend, status in zip(backends, statuses):
+        protected_now, overload_seconds, reason = _update_asr_backend_protection(status)
+        if protected_now:
+            protected.append((backend, status, overload_seconds, reason))
+        else:
+            available.append(backend)
+
+    if protected:
+        logger.warning(
+            "[ASR_BACKEND_STATUS] protected overloaded backend(s). group=%s language=%s protected=%s available=%s",
+            endpoint_group,
+            language,
+            [
+                {
+                    "endpoint": backend.endpoint,
+                    "active": status.active_requests,
+                    "oldest": round(status.oldest_active_seconds, 3),
+                    "overloadSeconds": round(overload_seconds, 3),
+                }
+                for backend, status, overload_seconds, _ in protected
+            ],
+            [backend.endpoint for backend in available],
+        )
+
+    if not available:
+        raise _asr_backend_status_rejection(endpoint_group, language, protected)
+    return available, protected
 
 
 async def _close_asr_resource(awaitable: Awaitable[Any], label: str) -> None:
@@ -473,6 +710,8 @@ async def _acquire_asr_backend_slot(
             status_code=503,
             detail={"error": "asr_backend_unavailable", "engine": endpoint_group, "language": language},
         )
+    available_backends, _ = await _filter_asr_backends_by_runtime_status(endpoint_group, backends, language)
+    backends = tuple(available_backends)
     if len(backends) == 1:
         backend = backends[0]
         permit = await _acquire_asr_endpoint_slot(backend.endpoint, language, cancel_check)

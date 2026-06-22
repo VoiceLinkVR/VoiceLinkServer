@@ -21,6 +21,10 @@ _settings_override_signature: tuple[bool, int, int] | None = None
 
 
 class Settings(BaseSettings):
+    VOICELINK_RUNTIME_MODE: str = "all"
+    VOICELINK_RUN_SCHEDULER: bool = True
+    VOICELINK_RUN_SCHEMA_UPGRADE: bool = True
+
     WHISPER_HOST: str = "127.0.0.1"
     WHISPER_PORT: int = 8000
     WHISPER_ENDPOINTS: str = ""

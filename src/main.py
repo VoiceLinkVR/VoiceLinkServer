@@ -352,7 +352,80 @@ def _is_admin_surface_path(path: str) -> bool:
     )
 
 
+RUNTIME_MODES = {"all", "light", "heavy"}
+HEAVY_PATH_PREFIXES = (
+    "/v1/api/whisper/",
+    "/v2/api/whisper/",
+    "/v2/api/tts/",
+    "/v2/api/clone/",
+)
+HEAVY_EXACT_PATHS = {
+    "/v1/api/whisper",
+    "/v2/api/whisper",
+    "/v2/api/tts",
+    "/v2/api/clone",
+    "/v1/api/func/translateToEnglish",
+    "/v1/api/func/translateToOtherLanguage",
+    "/v1/api/func/multitranslateToOtherLanguage",
+    "/v1/api/func/photoTranslate",
+    "/v1/api/func/tts",
+    "/v1/api/func/webtranslate",
+    "/v2/api/func/translateToEnglish",
+    "/v2/api/func/translateToOtherLanguage",
+    "/v2/api/func/multitranslateToOtherLanguage",
+    "/v2/api/func/photoTranslate",
+    "/v2/api/func/tts",
+    "/v2/api/func/webtranslate",
+}
+RUNTIME_ALWAYS_ALLOWED_PATHS = {
+    "/",
+    "/healthz",
+    "/readyz",
+}
+
+
+def _runtime_mode() -> str:
+    mode = str(getattr(settings, "VOICELINK_RUNTIME_MODE", "all") or "all").strip().lower()
+    return mode if mode in RUNTIME_MODES else "all"
+
+
+def _is_heavy_path(path: str) -> bool:
+    normalized = path.rstrip("/") if path != "/" else path
+    if normalized in HEAVY_EXACT_PATHS:
+        return True
+    return any(path.startswith(prefix) for prefix in HEAVY_PATH_PREFIXES)
+
+
+def _runtime_mode_rejection_response(path: str) -> JSONResponse | None:
+    mode = _runtime_mode()
+    if mode == "all":
+        return None
+    if path in RUNTIME_ALWAYS_ALLOWED_PATHS:
+        return None
+
+    if mode == "light" and _is_heavy_path(path):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": {
+                    "code": "heavy_endpoint_not_available_on_light",
+                    "message": "Heavy endpoint is routed to light backend",
+                }
+            },
+            headers={"Retry-After": "2"},
+        )
+
+    if mode == "heavy" and not _is_heavy_path(path):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+
+    return None
+
+
 def _validate_runtime_security_settings() -> None:
+    mode = str(getattr(settings, "VOICELINK_RUNTIME_MODE", "all") or "all").strip().lower()
+    if mode not in RUNTIME_MODES:
+        raise RuntimeError("VOICELINK_RUNTIME_MODE must be one of all, light, heavy")
+    settings.VOICELINK_RUNTIME_MODE = mode
     settings.SESSION_COOKIE_SAME_SITE = normalize_cookie_samesite(settings.SESSION_COOKIE_SAME_SITE)
     if int(settings.SESSION_COOKIE_MAX_AGE or 0) <= 0:
         raise RuntimeError("SESSION_COOKIE_MAX_AGE must be greater than 0")
@@ -374,15 +447,22 @@ def _validate_runtime_security_settings() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Application startup")
+    logger.info("Application startup runtime_mode=%s", _runtime_mode())
     _validate_runtime_security_settings()
     scheduler_lock_connection = None
-    with _startup_db_init_lock():
-        run_schema_upgrade()
+    if settings.VOICELINK_RUN_SCHEMA_UPGRADE:
+        with _startup_db_init_lock():
+            run_schema_upgrade()
+    else:
+        logger.info("Skipped schema upgrade because VOICELINK_RUN_SCHEMA_UPGRADE=false")
     load_filter_config()
     init_supported_languages()
     refresh_translation_capabilities_cache()
-    run_scheduler, scheduler_lock_connection = _try_acquire_scheduler_lock()
+    run_scheduler = False
+    if settings.VOICELINK_RUN_SCHEDULER:
+        run_scheduler, scheduler_lock_connection = _try_acquire_scheduler_lock()
+    else:
+        logger.info("Skipped scheduler startup because VOICELINK_RUN_SCHEDULER=false")
     if run_scheduler:
         scheduler.add_job(check_user_expiration, "cron", hour=0, minute=0, second=0)
         scheduler.add_job(update_filter_config, "cron", day_of_week=0, hour=3, minute=0, second=0)
@@ -473,6 +553,18 @@ async def request_logging_middleware(request: Request, call_next):
     rate_limit_triggered = False
     authenticated_user = None
     authenticated_user_is_v2 = False
+
+    runtime_rejection = _runtime_mode_rejection_response(request.url.path)
+    if runtime_rejection is not None:
+        logger.warning(
+            "[RUNTIME-MODE] rejected request before auth. mode=%s path=%s method=%s",
+            _runtime_mode(),
+            request.url.path,
+            request.method,
+        )
+        runtime_rejection.headers["X-Request-ID"] = request_id
+        reset_request_id(request_id_token)
+        return runtime_rejection
 
     try:
         token = await oauth2_scheme(request)
@@ -731,6 +823,43 @@ if settings.API_V2_ENABLED:
 
 app.include_router(admin_api.router, prefix="/v2/adminapi", tags=["V2 Admin API"])
 app.include_router(voice_clone_presets.admin_router, prefix="/v2/adminapi", tags=["V2 Admin Voice Clone Presets"])
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    return {
+        "status": "ok",
+        "mode": _runtime_mode(),
+        "schedulerEnabled": bool(settings.VOICELINK_RUN_SCHEDULER),
+        "schemaUpgradeEnabled": bool(settings.VOICELINK_RUN_SCHEMA_UPGRADE),
+    }
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz():
+    db = None
+    try:
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("[READYZ] dependency check failed: %s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "mode": _runtime_mode(),
+                "error": "database_unavailable",
+            },
+        )
+    finally:
+        if db is not None:
+            db.close()
+    return {
+        "status": "ready",
+        "mode": _runtime_mode(),
+        "schedulerEnabled": bool(settings.VOICELINK_RUN_SCHEDULER),
+        "schemaUpgradeEnabled": bool(settings.VOICELINK_RUN_SCHEMA_UPGRADE),
+    }
 
 
 @app.get("/", include_in_schema=False)

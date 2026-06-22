@@ -116,6 +116,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      VOICELINK_RUNTIME_MODE: ${VOICELINK_RUNTIME_MODE:-all}
+      VOICELINK_RUN_SCHEDULER: ${VOICELINK_RUN_SCHEDULER:-true}
+      VOICELINK_RUN_SCHEMA_UPGRADE: ${VOICELINK_RUN_SCHEMA_UPGRADE:-true}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-4}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-aaargwgwqewe}
       SESSION_SECRET_KEY: ${SESSION_SECRET_KEY:-feefadfagagagwadsee}
       SESSION_COOKIE_HTTPS_ONLY: ${SESSION_COOKIE_HTTPS_ONLY:-True}

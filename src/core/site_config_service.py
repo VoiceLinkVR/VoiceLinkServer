@@ -73,6 +73,9 @@ GROUP_DESCRIPTIONS = {
 }
 
 LABEL_OVERRIDES = {
+    "VOICELINK_RUNTIME_MODE": "业务后端运行模式",
+    "VOICELINK_RUN_SCHEDULER": "启用后台定时任务",
+    "VOICELINK_RUN_SCHEMA_UPGRADE": "启动时执行数据库升级",
     "OCR_IMAGE_TRANSLATE_ENABLED": "OCR 图片翻译开关",
     "OCR_IMAGE_TRANSLATE_BASE_URL": "OCR 图片翻译地址",
     "OCR_IMAGE_TRANSLATE_TIMEOUT": "OCR 图片翻译超时",
@@ -211,6 +214,9 @@ SECRET_KEYS = {
 }
 
 RESTART_REQUIRED_KEYS = {
+    "VOICELINK_RUNTIME_MODE",
+    "VOICELINK_RUN_SCHEDULER",
+    "VOICELINK_RUN_SCHEMA_UPGRADE",
     "JWT_SECRET_KEY",
     "SESSION_SECRET_KEY",
     "SESSION_COOKIE_HTTPS_ONLY",
@@ -331,6 +337,7 @@ POSITIVE_FLOAT_KEYS = {
 }
 LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 JWT_ALGORITHMS = {"HS256", "HS384", "HS512"}
+RUNTIME_MODE_VALUES = {"all", "light", "heavy"}
 ASR_ENGINE_VALUES = {
     "firered",
     "fireredasr",
@@ -738,6 +745,11 @@ def _post_validate_value(spec: ConfigSpec, value: Any) -> Any:
             return _validate_log_level(value, spec.key)
         if spec.key == "JWT_ALGORITHM":
             return _validate_jwt_algorithm(value, spec.key)
+        if spec.key == "VOICELINK_RUNTIME_MODE":
+            normalized_mode = _validate_token_string(value, spec.key).lower()
+            if normalized_mode not in RUNTIME_MODE_VALUES:
+                raise ValueError(f"{spec.key} must be one of {', '.join(sorted(RUNTIME_MODE_VALUES))}")
+            return normalized_mode
         if spec.key == "DEFAULT_TEST_USER_UUID":
             return _validate_uuid_string(value, spec.key)
         if spec.key in {

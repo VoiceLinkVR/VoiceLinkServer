@@ -384,6 +384,14 @@ RUNTIME_ALWAYS_ALLOWED_PATHS = {
 }
 
 
+def _should_charge_resource(status_code: int | None) -> bool:
+    try:
+        normalized = int(status_code or 0)
+    except (TypeError, ValueError):
+        return False
+    return 200 <= normalized < 400
+
+
 def _runtime_mode() -> str:
     mode = str(getattr(settings, "VOICELINK_RUNTIME_MODE", "all") or "all").strip().lower()
     return mode if mode in RUNTIME_MODES else "all"
@@ -692,13 +700,14 @@ async def request_logging_middleware(request: Request, call_next):
         try:
             session_for_log = SessionLocal()
             status_for_limits = response_status_code or 500
+            should_charge_resource = _should_charge_resource(status_for_limits)
 
             pending_quota = getattr(request.state, "pending_quota_allocation", None)
             if (
                 not rate_limit_triggered
                 and is_new_quota_mode_enabled()
                 and pending_quota is not None
-                and 200 <= status_for_limits < 400
+                and should_charge_resource
             ):
                 try:
                     finalized_quota = commit_quota_allocation(session_for_log, pending_quota)
@@ -730,6 +739,7 @@ async def request_logging_middleware(request: Request, call_next):
                     if (
                         not is_new_quota_mode_enabled()
                         and not rate_limit_triggered
+                        and should_charge_resource
                         and should_deduct
                         and getattr(context, "context_type", "") == "user"
                     ):

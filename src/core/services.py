@@ -12,7 +12,8 @@ import unicodedata
 from contextlib import contextmanager, suppress
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Deque, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Deque, Optional, Sequence, TypeVar
+from urllib.parse import urlparse
 
 from fastapi import HTTPException
 from io import BytesIO
@@ -62,6 +63,12 @@ class AsrEndpointQueue:
 
 
 @dataclass(frozen=True)
+class AsrBackend:
+    endpoint: str
+    base_url: str
+
+
+@dataclass(frozen=True)
 class AsrQueuePermit:
     endpoint: str
     language: str
@@ -72,6 +79,7 @@ class AsrQueuePermit:
 
 
 _asr_endpoint_queues: dict[str, AsrEndpointQueue] = {}
+_asr_backend_rr_index: dict[str, int] = {}
 
 
 async def _run_cancel_check(cancel_check: Optional[CancelCheck]) -> None:
@@ -135,17 +143,38 @@ async def _post_with_cancel(
 
 
 def _asr_endpoint_env_prefix(endpoint: str) -> str:
-    return endpoint.upper().replace("-", "_")
+    return re.sub(r"[^A-Z0-9]+", "_", endpoint.upper()).strip("_") or "ENDPOINT"
+
+
+def _asr_endpoint_group(endpoint: str) -> str:
+    if ":" in endpoint:
+        return endpoint.split(":", 1)[0]
+    match = re.match(r"^(.+)-\d+$", endpoint)
+    return match.group(1) if match else endpoint
+
+
+def _asr_endpoint_env_keys(endpoint: str, name: str) -> list[str]:
+    exact_prefix = _asr_endpoint_env_prefix(endpoint)
+    keys = [f"ASR_QUEUE_{exact_prefix}_{name}"]
+    group_prefix = _asr_endpoint_env_prefix(_asr_endpoint_group(endpoint))
+    group_key = f"ASR_QUEUE_{group_prefix}_{name}"
+    if group_key not in keys:
+        keys.append(group_key)
+    return keys
 
 
 def _asr_endpoint_int_env(endpoint: str, name: str, default_value: int) -> int:
-    specific_key = f"ASR_QUEUE_{_asr_endpoint_env_prefix(endpoint)}_{name}"
-    return max(int(os.getenv(specific_key, str(default_value))), 0)
+    for key in _asr_endpoint_env_keys(endpoint, name):
+        if key in os.environ:
+            return max(int(os.getenv(key, str(default_value))), 0)
+    return max(int(default_value), 0)
 
 
 def _asr_endpoint_float_env(endpoint: str, name: str, default_value: float) -> float:
-    specific_key = f"ASR_QUEUE_{_asr_endpoint_env_prefix(endpoint)}_{name}"
-    return max(float(os.getenv(specific_key, str(default_value))), 0.0)
+    for key in _asr_endpoint_env_keys(endpoint, name):
+        if key in os.environ:
+            return max(float(os.getenv(key, str(default_value))), 0.0)
+    return max(float(default_value), 0.0)
 
 
 def _asr_queue_config(endpoint: str) -> AsrQueueConfig:
@@ -194,6 +223,206 @@ def _asr_queue_rejection(
         },
         headers={"Retry-After": str(max(1, int(config.retry_after_seconds + 0.999)))},
     )
+
+
+def _asr_backend_group_rejection(
+    endpoint_group: str,
+    language: str,
+    reason: str,
+    snapshots: Sequence[tuple[AsrBackend, AsrQueueConfig, int, int]],
+) -> HTTPException:
+    active = sum(item[2] for item in snapshots)
+    waiting = sum(item[3] for item in snapshots)
+    max_concurrency = sum(item[1].max_concurrency for item in snapshots)
+    max_waiting = sum(item[1].max_waiting for item in snapshots)
+    retry_after = max((item[1].retry_after_seconds for item in snapshots), default=ASR_QUEUE_DEFAULT_RETRY_AFTER_SECONDS)
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": reason,
+            "engine": endpoint_group,
+            "language": language,
+            "active": active,
+            "waiting": waiting,
+            "maxConcurrency": max_concurrency,
+            "maxWaiting": max_waiting,
+            "backends": [
+                {
+                    "endpoint": backend.endpoint,
+                    "active": backend_active,
+                    "waiting": backend_waiting,
+                    "maxConcurrency": config.max_concurrency,
+                    "maxWaiting": config.max_waiting,
+                }
+                for backend, config, backend_active, backend_waiting in snapshots
+            ],
+            "queueTimeoutSeconds": max(
+                (item[1].timeout_seconds for item in snapshots),
+                default=ASR_QUEUE_DEFAULT_TIMEOUT_SECONDS,
+            ),
+        },
+        headers={"Retry-After": str(max(1, int(retry_after + 0.999)))},
+    )
+
+
+def _rotate_asr_backends(endpoint_group: str, backends: Sequence[AsrBackend]) -> list[AsrBackend]:
+    if not backends:
+        return []
+    start_index = _asr_backend_rr_index.get(endpoint_group, 0) % len(backends)
+    _asr_backend_rr_index[endpoint_group] = start_index + 1
+    ordered = list(backends)
+    return ordered[start_index:] + ordered[:start_index]
+
+
+async def _snapshot_asr_backends(backends: Sequence[AsrBackend]) -> list[tuple[AsrBackend, AsrQueueConfig, int, int]]:
+    snapshots: list[tuple[AsrBackend, AsrQueueConfig, int, int]] = []
+    for backend in backends:
+        config = _asr_queue_config(backend.endpoint)
+        queue = _asr_endpoint_queue(backend.endpoint)
+        async with queue.condition:
+            snapshots.append((backend, config, queue.active, queue.waiting))
+    return snapshots
+
+
+def _backend_load_score(snapshot: tuple[AsrBackend, AsrQueueConfig, int, int]) -> tuple[float, int, int]:
+    _, config, active, waiting = snapshot
+    return (active / max(config.max_concurrency, 1), waiting, active)
+
+
+async def _try_acquire_asr_backend_now(
+    endpoint_group: str,
+    backends: Sequence[AsrBackend],
+    language: str,
+    queued_at: float,
+) -> tuple[AsrBackend, AsrQueuePermit] | None:
+    snapshots = await _snapshot_asr_backends(backends)
+    for backend, config, _, _ in sorted(snapshots, key=_backend_load_score):
+        queue = _asr_endpoint_queue(backend.endpoint)
+        async with queue.condition:
+            if queue.active >= config.max_concurrency:
+                continue
+            queue.active += 1
+            queued_seconds = time.perf_counter() - queued_at
+            if queued_seconds >= 0.25:
+                logger.info(
+                    "[ASR_QUEUE_LIMIT] acquired queued backend slot. group=%s endpoint=%s language=%s queued=%.3fs active=%s waiting=%s max_concurrency=%s max_waiting=%s",
+                    endpoint_group,
+                    backend.endpoint,
+                    language,
+                    queued_seconds,
+                    queue.active,
+                    queue.waiting,
+                    config.max_concurrency,
+                    config.max_waiting,
+                )
+            return backend, AsrQueuePermit(
+                backend.endpoint,
+                language,
+                queued_seconds,
+                time.perf_counter(),
+                config,
+            )
+    return None
+
+
+async def _release_waiting_backend(waiting_endpoint: str | None) -> None:
+    if not waiting_endpoint:
+        return
+    queue = _asr_endpoint_queue(waiting_endpoint)
+    async with queue.condition:
+        queue.waiting = max(0, queue.waiting - 1)
+        queue.condition.notify(1)
+
+
+async def _acquire_asr_backend_slot(
+    endpoint_group: str,
+    backends: Sequence[AsrBackend],
+    language: str,
+    cancel_check: Optional[CancelCheck],
+) -> tuple[AsrBackend, AsrQueuePermit]:
+    if not backends:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "asr_backend_unavailable", "engine": endpoint_group, "language": language},
+        )
+    if len(backends) == 1:
+        backend = backends[0]
+        permit = await _acquire_asr_endpoint_slot(backend.endpoint, language, cancel_check)
+        return backend, permit
+    if not ASR_QUEUE_LIMIT_ENABLED:
+        backend = _rotate_asr_backends(endpoint_group, backends)[0]
+        return backend, AsrQueuePermit(
+            endpoint=backend.endpoint,
+            language=language,
+            queued_seconds=0.0,
+            started_at=time.perf_counter(),
+            config=_asr_queue_config(backend.endpoint),
+            enabled=False,
+        )
+
+    await _run_cancel_check(cancel_check)
+    ordered_backends = _rotate_asr_backends(endpoint_group, backends)
+    queued_at = time.perf_counter()
+    waiting_endpoint: str | None = None
+
+    try:
+        while True:
+            acquired = await _try_acquire_asr_backend_now(endpoint_group, ordered_backends, language, queued_at)
+            if acquired is not None:
+                await _release_waiting_backend(waiting_endpoint)
+                waiting_endpoint = None
+                return acquired
+
+            snapshots = await _snapshot_asr_backends(ordered_backends)
+            timeout_seconds = max((item[1].timeout_seconds for item in snapshots), default=ASR_QUEUE_DEFAULT_TIMEOUT_SECONDS)
+            elapsed = time.perf_counter() - queued_at
+            remaining = timeout_seconds - elapsed
+            if remaining <= 0:
+                logger.warning(
+                    "[ASR_QUEUE_LIMIT] reject request because backend group queue wait timed out. group=%s language=%s elapsed=%.3fs",
+                    endpoint_group,
+                    language,
+                    elapsed,
+                )
+                raise _asr_backend_group_rejection(endpoint_group, language, "asr_queue_timeout", snapshots)
+
+            if waiting_endpoint is None:
+                waiting_candidates = [
+                    snapshot for snapshot in snapshots if snapshot[3] < snapshot[1].max_waiting
+                ]
+                if not waiting_candidates:
+                    logger.warning(
+                        "[ASR_QUEUE_LIMIT] reject request because backend group queue is full. group=%s language=%s",
+                        endpoint_group,
+                        language,
+                    )
+                    raise _asr_backend_group_rejection(endpoint_group, language, "asr_queue_full", snapshots)
+                backend, config, _, _ = min(waiting_candidates, key=lambda item: (item[3], item[2] / max(item[1].max_concurrency, 1)))
+                queue = _asr_endpoint_queue(backend.endpoint)
+                async with queue.condition:
+                    if queue.active < config.max_concurrency:
+                        queue.active += 1
+                        return backend, AsrQueuePermit(
+                            backend.endpoint,
+                            language,
+                            time.perf_counter() - queued_at,
+                            time.perf_counter(),
+                            config,
+                        )
+                    if queue.waiting >= config.max_waiting:
+                        continue
+                    queue.waiting += 1
+                    waiting_endpoint = backend.endpoint
+
+            wait_queue = _asr_endpoint_queue(waiting_endpoint)
+            async with wait_queue.condition:
+                try:
+                    await asyncio.wait_for(wait_queue.condition.wait(), timeout=min(remaining, 0.25))
+                except asyncio.TimeoutError:
+                    pass
+            await _run_cancel_check(cancel_check)
+    finally:
+        await _release_waiting_backend(waiting_endpoint)
 
 
 async def _acquire_asr_endpoint_slot(
@@ -321,6 +550,25 @@ async def _run_asr_endpoint(
     record_latency = True
     try:
         return await operation()
+    except ClientDisconnectedError:
+        record_latency = False
+        raise
+    finally:
+        await _release_asr_endpoint_slot(permit, record_latency=record_latency)
+
+
+async def _run_asr_backend(
+    endpoint_group: str,
+    backends: Sequence[AsrBackend],
+    language: str,
+    operation: Callable[[AsrBackend], Awaitable[T]],
+    cancel_check: Optional[CancelCheck] = None,
+) -> T:
+    backend, permit = await _acquire_asr_backend_slot(endpoint_group, backends, language, cancel_check)
+    record_latency = True
+    try:
+        logger.debug("[ASR] selected backend. group=%s endpoint=%s base_url=%s", endpoint_group, backend.endpoint, backend.base_url)
+        return await operation(backend)
     except ClientDisconnectedError:
         record_latency = False
         raise
@@ -646,16 +894,64 @@ def _whisper_trt_base_url() -> str:
     return f"http://{settings.WHISPER_TRT_HOST}:{settings.WHISPER_TRT_PORT}"
 
 
-def _whisper_base_url() -> str:
+def _normalize_whisper_backend_base_url(raw_value: str) -> str:
+    value = str(raw_value or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"http://{value}"
+    for suffix in ("/audio/transcriptions", "/audio/translations"):
+        if value.endswith(suffix):
+            value = value[: -len(suffix)].rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"invalid Whisper endpoint: {raw_value}")
+    if not parsed.path.rstrip("/").endswith("/v1"):
+        value = f"{value}/v1"
+    return value.rstrip("/")
+
+
+def _configured_whisper_base_urls() -> tuple[str, ...]:
+    configured = str(getattr(settings, "WHISPER_ENDPOINTS", "") or "").replace(";", ",")
+    raw_endpoints = [endpoint.strip() for endpoint in configured.split(",") if endpoint.strip()]
+    if not raw_endpoints:
+        raw_endpoints = [f"{settings.WHISPER_HOST}:{settings.WHISPER_PORT}"]
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw_endpoint in raw_endpoints:
+        base_url = _normalize_whisper_backend_base_url(raw_endpoint)
+        if base_url and base_url not in seen:
+            urls.append(base_url)
+            seen.add(base_url)
+    return tuple(urls)
+
+
+def _whisper_backends() -> tuple[AsrBackend, ...]:
+    base_urls = _configured_whisper_base_urls()
+    if len(base_urls) <= 1:
+        return tuple(AsrBackend("whisper", base_url) for base_url in base_urls)
+    return tuple(
+        AsrBackend(f"whisper-{index}", base_url)
+        for index, base_url in enumerate(base_urls, start=1)
+    )
+
+
+def _whisper_base_url(base_url: str | None = None) -> str:
+    if base_url:
+        return _normalize_whisper_backend_base_url(base_url)
+    backends = _whisper_backends()
+    if backends:
+        return backends[0].base_url
     return WHISPER_URL.rstrip("/")
 
 
-def _whisper_transcription_url() -> str:
-    return f"{_whisper_base_url()}/audio/transcriptions"
+def _whisper_transcription_url(base_url: str | None = None) -> str:
+    return f"{_whisper_base_url(base_url)}/audio/transcriptions"
 
 
-def _whisper_translation_url() -> str:
-    return f"{_whisper_base_url()}/audio/translations"
+def _whisper_translation_url(base_url: str | None = None) -> str:
+    return f"{_whisper_base_url(base_url)}/audio/translations"
 
 
 def _sensevoice_transcription_url() -> str:
@@ -1191,7 +1487,7 @@ async def async_transcribe(
     Returns:
         识别出的文本
     """
-    async def operation() -> str:
+    async def operation(backend: AsrBackend) -> str:
         data = {
             "model": settings.WHISPER_MODEL,
             "response_format": "json",
@@ -1208,7 +1504,7 @@ async def async_transcribe(
             files = {"file": (filename or "audio.wav", audio_file, "audio/wav")}
             response = await _post_with_cancel(
                 client,
-                _whisper_transcription_url(),
+                _whisper_transcription_url(backend.base_url),
                 files=files,
                 data=data,
                 cancel_check=cancel_check,
@@ -1218,7 +1514,7 @@ async def async_transcribe(
             return _extract_asr_response_text(response, "ASYNC_TRANSCRIBE")
 
     try:
-        return await _run_asr_endpoint("whisper", language, operation, cancel_check=cancel_check)
+        return await _run_asr_backend("whisper", _whisper_backends(), language, operation, cancel_check=cancel_check)
     except ClientDisconnectedError:
         raise
     except Exception as e:
@@ -1241,7 +1537,7 @@ async def async_translate_audio(
     Returns:
         翻译后的英文文本
     """
-    async def operation() -> str:
+    async def operation(backend: AsrBackend) -> str:
         async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
             files = {"file": (filename or "audio.wav", audio_file, "audio/wav")}
             data = {
@@ -1250,7 +1546,7 @@ async def async_translate_audio(
             }
             response = await _post_with_cancel(
                 client,
-                _whisper_translation_url(),
+                _whisper_translation_url(backend.base_url),
                 files=files,
                 data=data,
                 cancel_check=cancel_check,
@@ -1260,7 +1556,7 @@ async def async_translate_audio(
             return _extract_asr_response_text(response, "ASYNC_TRANSLATE_AUDIO")
 
     try:
-        return await _run_asr_endpoint("whisper", "translate-en", operation, cancel_check=cancel_check)
+        return await _run_asr_backend("whisper", _whisper_backends(), "translate-en", operation, cancel_check=cancel_check)
     except ClientDisconnectedError:
         raise
     except Exception as e:

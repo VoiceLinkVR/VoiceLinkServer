@@ -23,6 +23,7 @@ _settings_override_signature: tuple[bool, int, int] | None = None
 class Settings(BaseSettings):
     WHISPER_HOST: str = "127.0.0.1"
     WHISPER_PORT: int = 8000
+    WHISPER_ENDPOINTS: str = ""
     WHISPER_BACKEND: str = "faster-whisper"
     WHISPER_TRT_HOST: str = "127.0.0.1"
     WHISPER_TRT_PORT: int = 8000
@@ -221,9 +222,39 @@ class Settings(BaseSettings):
         return parse_csv_hosts(self.API_V2_HOSTS)
 
 
+def _normalize_whisper_base_url(raw_value: str) -> str:
+    value = str(raw_value or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"http://{value}"
+    for suffix in ("/audio/transcriptions", "/audio/translations"):
+        if value.endswith(suffix):
+            value = value[: -len(suffix)].rstrip("/")
+    if not value.endswith("/v1"):
+        value = f"{value}/v1"
+    return f"{value}/"
+
+
+def _primary_whisper_url(active_settings: Settings) -> str:
+    endpoint_values = [
+        endpoint
+        for endpoint in (
+            raw_endpoint.strip()
+            for raw_endpoint in str(active_settings.WHISPER_ENDPOINTS or "").replace(";", ",").split(",")
+        )
+        if endpoint
+    ]
+    if endpoint_values:
+        normalized = _normalize_whisper_base_url(endpoint_values[0])
+        if normalized:
+            return normalized
+    return f"http://{active_settings.WHISPER_HOST}:{active_settings.WHISPER_PORT}/v1/"
+
+
 def _refresh_runtime_urls(active_settings: Settings) -> None:
     global WHISPER_URL, WHISPER_TRT_URL, SENSEVOICE_URL, GEMMA_TRANSLATE_BASE_URL
-    WHISPER_URL = f"http://{active_settings.WHISPER_HOST}:{active_settings.WHISPER_PORT}/v1/"
+    WHISPER_URL = _primary_whisper_url(active_settings)
     WHISPER_TRT_URL = f"http://{active_settings.WHISPER_TRT_HOST}:{active_settings.WHISPER_TRT_PORT}"
     SENSEVOICE_URL = f"http://{active_settings.SENSEVOICE_HOST}:{active_settings.SENSEVOICE_PORT}/v1/audio/transcriptions"
     GEMMA_TRANSLATE_BASE_URL = f"http://{active_settings.GEMMA_TRANSLATE_URL}"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from ipaddress import ip_address
@@ -78,6 +79,7 @@ LABEL_OVERRIDES = {
     "OCR_IMAGE_TRANSLATE_FALLBACK_TO_GEMMA": "OCR 失败回退 Gemma",
     "WHISPER_HOST": "Whisper 主机",
     "WHISPER_PORT": "Whisper 端口",
+    "WHISPER_ENDPOINTS": "Whisper 后端列表",
     "WHISPER_BACKEND": "Whisper 后端",
     "WHISPER_TRT_HOST": "Whisper TRT 主机",
     "WHISPER_TRT_PORT": "Whisper TRT 端口",
@@ -338,6 +340,13 @@ ASR_ENGINE_VALUES = {
     "fire-red-asr",
     "sensevoice",
     "sense-voice",
+    "whisper",
+    "faster-whisper",
+    "faster_whisper",
+    "openai",
+    "whisper-trt",
+    "whisper_trt",
+    "trt",
 }
 SAFE_TOKEN_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 SAFE_LIMIT_RULE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789=;_./,:- ")
@@ -622,6 +631,34 @@ def _validate_services_list(value: str, key: str) -> str:
     return ",".join(items)
 
 
+def _validate_whisper_endpoints(value: str, key: str) -> str:
+    normalized = _validate_common_string(value, key)
+    if not normalized:
+        return normalized
+
+    endpoints = [part.strip() for part in re.split(r"[;,]+", normalized) if part.strip()]
+    if not endpoints:
+        return ""
+
+    validated: list[str] = []
+    for endpoint in endpoints:
+        candidate = endpoint if "://" in endpoint else f"http://{endpoint}"
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(f"{key} 包含非法 Whisper 后端地址: {endpoint}")
+        host = parsed.hostname or ""
+        _validate_host(host, key)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"{key} 包含非法端口: {endpoint}") from exc
+        if port is not None and (port <= 0 or port > 65535):
+            raise ValueError(f"{key} 包含非法端口: {endpoint}")
+        validated.append(endpoint.rstrip("/"))
+
+    return ",".join(validated)
+
+
 def _validate_log_level(value: str, key: str) -> str:
     normalized = _validate_common_string(value, key).upper()
     if normalized not in LOG_LEVELS:
@@ -662,6 +699,8 @@ def _post_validate_value(spec: ConfigSpec, value: Any) -> Any:
             return _validate_host_port(value, spec.key)
         if spec.key in URL_KEYS:
             return _validate_url(value, spec.key, schemes={"http", "https"})
+        if spec.key == "WHISPER_ENDPOINTS":
+            return _validate_whisper_endpoints(value, spec.key)
         if spec.key in REDIS_URL_KEYS:
             return _validate_url(value, spec.key, schemes={"redis", "rediss"})
         if spec.key in CSV_HOST_KEYS:

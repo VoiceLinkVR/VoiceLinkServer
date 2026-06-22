@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     WHISPER_PORT: int = 8000
     WHISPER_ENDPOINTS: str = ""
     WHISPER_BACKEND: str = "faster-whisper"
+    WHISPER_ASR_TIMEOUT: float = 30.0
     WHISPER_TRT_HOST: str = "127.0.0.1"
     WHISPER_TRT_PORT: int = 8000
     SENSEVOICE_HOST: str = "127.0.0.1"

@@ -84,6 +84,7 @@ LABEL_OVERRIDES = {
     "WHISPER_PORT": "Whisper 端口",
     "WHISPER_ENDPOINTS": "Whisper 后端列表",
     "WHISPER_BACKEND": "Whisper 后端",
+    "WHISPER_ASR_TIMEOUT": "Whisper ASR 超时",
     "WHISPER_TRT_HOST": "Whisper TRT 主机",
     "WHISPER_TRT_PORT": "Whisper TRT 端口",
     "SENSEVOICE_HOST": "SenseVoice 主机",
@@ -313,6 +314,7 @@ POSITIVE_INT_KEYS = {
 }
 POSITIVE_FLOAT_KEYS = {
     "TRANSLATION_TIMEOUT",
+    "WHISPER_ASR_TIMEOUT",
     "FIRERED_ASR_TIMEOUT",
     "FIRERED_LID_TIMEOUT",
     "FIRERED_LID_QUEUE_TIMEOUT",

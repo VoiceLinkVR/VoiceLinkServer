@@ -44,6 +44,11 @@ ASR_QUEUE_DEFAULT_TIMEOUT_SECONDS = max(float(os.getenv("ASR_QUEUE_TIMEOUT_SECON
 ASR_QUEUE_DEFAULT_RETRY_AFTER_SECONDS = max(float(os.getenv("ASR_QUEUE_RETRY_AFTER_SECONDS", "2")), 1.0)
 ASR_QUEUE_SLOW_LOG_SECONDS = max(float(os.getenv("ASR_QUEUE_SLOW_LOG_SECONDS", "15")), 0.1)
 ASR_QUEUE_LATENCY_WINDOW = max(int(os.getenv("ASR_QUEUE_LATENCY_WINDOW", "64")), 4)
+ASR_DOWNSTREAM_CANCEL_GRACE_SECONDS = max(float(os.getenv("ASR_DOWNSTREAM_CANCEL_GRACE_SECONDS", "1")), 0.05)
+ASR_HTTP_CONNECT_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_CONNECT_TIMEOUT_SECONDS", "3")), 0.05)
+ASR_HTTP_WRITE_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_WRITE_TIMEOUT_SECONDS", "10")), 0.05)
+ASR_HTTP_POOL_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_POOL_TIMEOUT_SECONDS", "3")), 0.05)
+ASR_HTTP_CLOSE_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_CLOSE_TIMEOUT_SECONDS", "1")), 0.05)
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,37 @@ _asr_endpoint_queues: dict[str, AsrEndpointQueue] = {}
 _asr_backend_rr_index: dict[str, int] = {}
 
 
+def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("[ASR] background task finished after cancellation: %s", exc)
+
+
+async def _cancel_task_with_grace(task: asyncio.Task[Any], label: str) -> None:
+    if task.done():
+        _consume_background_task_result(task)
+        return
+
+    task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=ASR_DOWNSTREAM_CANCEL_GRACE_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[%s] cancellation cleanup exceeded %.3fs; releasing caller path",
+            label,
+            ASR_DOWNSTREAM_CANCEL_GRACE_SECONDS,
+        )
+        task.add_done_callback(_consume_background_task_result)
+    except asyncio.CancelledError:
+        task.add_done_callback(_consume_background_task_result)
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("[%s] cancelled task finished with error during cleanup: %s", label, exc)
+
+
 async def _run_cancel_check(cancel_check: Optional[CancelCheck]) -> None:
     if cancel_check is not None:
         await cancel_check()
@@ -109,11 +145,7 @@ async def _await_with_cancel(
             return_when=asyncio.FIRST_COMPLETED,
         )
         if watcher in done:
-            worker.cancel()
-            try:
-                await worker
-            except asyncio.CancelledError:
-                pass
+            await _cancel_task_with_grace(worker, label)
             logger.info("[%s] cancelled because client disconnected", label)
             await watcher
         watcher.cancel()
@@ -122,6 +154,25 @@ async def _await_with_cancel(
         watcher.cancel()
         with suppress(asyncio.CancelledError, ClientDisconnectedError):
             await watcher
+
+
+async def _await_with_hard_timeout(
+    awaitable: Awaitable[T],
+    timeout_seconds: float | None,
+    label: str,
+) -> T:
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return await awaitable
+
+    worker = asyncio.create_task(awaitable)
+    try:
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        await _cancel_task_with_grace(worker, label)
+        raise
+    except asyncio.CancelledError:
+        await _cancel_task_with_grace(worker, label)
+        raise
 
 
 async def _post_with_cancel(
@@ -140,6 +191,83 @@ async def _post_with_cancel(
     )
     await _run_cancel_check(cancel_check)
     return response
+
+
+def _build_asr_http_timeout(total_timeout_seconds: float) -> httpx.Timeout:
+    total_timeout = max(float(total_timeout_seconds or 0), 0.05)
+    return httpx.Timeout(
+        timeout=total_timeout,
+        connect=min(ASR_HTTP_CONNECT_TIMEOUT_SECONDS, total_timeout),
+        read=total_timeout,
+        write=min(ASR_HTTP_WRITE_TIMEOUT_SECONDS, total_timeout),
+        pool=min(ASR_HTTP_POOL_TIMEOUT_SECONDS, total_timeout),
+    )
+
+
+def _asr_no_keepalive_limits() -> httpx.Limits:
+    return httpx.Limits(max_keepalive_connections=0)
+
+
+async def _close_asr_resource(awaitable: Awaitable[Any], label: str) -> None:
+    cleanup_task = asyncio.create_task(awaitable)
+    try:
+        await asyncio.wait_for(asyncio.shield(cleanup_task), timeout=ASR_HTTP_CLOSE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[%s] HTTP close cleanup exceeded %.3fs",
+            label,
+            ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+        )
+        cleanup_task.add_done_callback(_consume_background_task_result)
+    except asyncio.CancelledError:
+        cleanup_task.add_done_callback(_consume_background_task_result)
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("[%s] HTTP close cleanup failed: %s", label, exc)
+
+
+async def _close_response_quietly(response: httpx.Response | None, label: str) -> None:
+    if response is None:
+        return
+    await _close_asr_resource(response.aclose(), f"{label}.response")
+
+
+async def _close_client_quietly(client: httpx.AsyncClient | None, label: str) -> None:
+    if client is None:
+        return
+    await _close_asr_resource(client.aclose(), f"{label}.client")
+
+
+async def _post_asr_form_and_extract_text(
+    url: str,
+    *,
+    files: dict[str, Any],
+    data: dict[str, Any] | None,
+    timeout_seconds: float,
+    cancel_check: Optional[CancelCheck],
+    label: str,
+) -> str:
+    client: httpx.AsyncClient | None = None
+    response: httpx.Response | None = None
+    try:
+        client = httpx.AsyncClient(
+            timeout=_build_asr_http_timeout(timeout_seconds),
+            limits=_asr_no_keepalive_limits(),
+            headers={"Connection": "close"},
+        )
+        response = await _post_with_cancel(
+            client,
+            url,
+            files=files,
+            data=data,
+            cancel_check=cancel_check,
+            label=label,
+        )
+        response.raise_for_status()
+        return _extract_asr_response_text(response, label)
+    finally:
+        await _close_response_quietly(response, label)
+        await _close_client_quietly(client, label)
 
 
 def _asr_endpoint_env_prefix(endpoint: str) -> str:
@@ -545,16 +673,35 @@ async def _run_asr_endpoint(
     language: str,
     operation: Callable[[], Awaitable[T]],
     cancel_check: Optional[CancelCheck] = None,
+    hard_timeout_seconds: float | None = None,
 ) -> T:
     permit = await _acquire_asr_endpoint_slot(endpoint, language, cancel_check)
     record_latency = True
     try:
-        return await operation()
+        return await _await_with_hard_timeout(operation(), hard_timeout_seconds, f"ASR:{endpoint}")
     except ClientDisconnectedError:
         record_latency = False
         raise
+    except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+        logger.warning(
+            "[ASR_QUEUE_LIMIT] downstream ASR request timed out. endpoint=%s language=%s timeout=%.3fs queued=%.3fs",
+            endpoint,
+            language,
+            float(hard_timeout_seconds or 0),
+            permit.queued_seconds,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "asr_downstream_timeout",
+                "engine": endpoint,
+                "language": language,
+                "timeoutSeconds": float(hard_timeout_seconds or 0),
+            },
+            headers={"Retry-After": str(max(1, int(permit.config.retry_after_seconds + 0.999)))},
+        ) from exc
     finally:
-        await _release_asr_endpoint_slot(permit, record_latency=record_latency)
+        await asyncio.shield(_release_asr_endpoint_slot(permit, record_latency=record_latency))
 
 
 async def _run_asr_backend(
@@ -563,17 +710,38 @@ async def _run_asr_backend(
     language: str,
     operation: Callable[[AsrBackend], Awaitable[T]],
     cancel_check: Optional[CancelCheck] = None,
+    hard_timeout_seconds: float | None = None,
 ) -> T:
     backend, permit = await _acquire_asr_backend_slot(endpoint_group, backends, language, cancel_check)
     record_latency = True
     try:
         logger.debug("[ASR] selected backend. group=%s endpoint=%s base_url=%s", endpoint_group, backend.endpoint, backend.base_url)
-        return await operation(backend)
+        return await _await_with_hard_timeout(operation(backend), hard_timeout_seconds, f"ASR:{backend.endpoint}")
     except ClientDisconnectedError:
         record_latency = False
         raise
+    except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+        logger.warning(
+            "[ASR_QUEUE_LIMIT] downstream ASR request timed out. group=%s endpoint=%s language=%s timeout=%.3fs queued=%.3fs",
+            endpoint_group,
+            backend.endpoint,
+            language,
+            float(hard_timeout_seconds or 0),
+            permit.queued_seconds,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "asr_downstream_timeout",
+                "engine": endpoint_group,
+                "endpoint": backend.endpoint,
+                "language": language,
+                "timeoutSeconds": float(hard_timeout_seconds or 0),
+            },
+            headers={"Retry-After": str(max(1, int(permit.config.retry_after_seconds + 0.999)))},
+        ) from exc
     finally:
-        await _release_asr_endpoint_slot(permit, record_latency=record_latency)
+        await asyncio.shield(_release_asr_endpoint_slot(permit, record_latency=record_latency))
 
 def get_translators():
     global translators
@@ -1500,21 +1668,24 @@ async def async_transcribe(
         if lid_segments:
             data["lid_segments"] = lid_segments
 
-        async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
-            files = {"file": (filename or "audio.wav", audio_file, "audio/wav")}
-            response = await _post_with_cancel(
-                client,
-                _whisper_transcription_url(backend.base_url),
-                files=files,
-                data=data,
-                cancel_check=cancel_check,
-                label="ASYNC_TRANSCRIBE",
-            )
-            response.raise_for_status()
-            return _extract_asr_response_text(response, "ASYNC_TRANSCRIBE")
+        return await _post_asr_form_and_extract_text(
+            _whisper_transcription_url(backend.base_url),
+            files={"file": (filename or "audio.wav", audio_file, "audio/wav")},
+            data=data,
+            timeout_seconds=settings.WHISPER_ASR_TIMEOUT,
+            cancel_check=cancel_check,
+            label="ASYNC_TRANSCRIBE",
+        )
 
     try:
-        return await _run_asr_backend("whisper", _whisper_backends(), language, operation, cancel_check=cancel_check)
+        return await _run_asr_backend(
+            "whisper",
+            _whisper_backends(),
+            language,
+            operation,
+            cancel_check=cancel_check,
+            hard_timeout_seconds=settings.WHISPER_ASR_TIMEOUT + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+        )
     except ClientDisconnectedError:
         raise
     except Exception as e:
@@ -1538,25 +1709,27 @@ async def async_translate_audio(
         翻译后的英文文本
     """
     async def operation(backend: AsrBackend) -> str:
-        async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
-            files = {"file": (filename or "audio.wav", audio_file, "audio/wav")}
-            data = {
+        return await _post_asr_form_and_extract_text(
+            _whisper_translation_url(backend.base_url),
+            files={"file": (filename or "audio.wav", audio_file, "audio/wav")},
+            data={
                 "model": settings.WHISPER_MODEL,
                 "response_format": "json",
-            }
-            response = await _post_with_cancel(
-                client,
-                _whisper_translation_url(backend.base_url),
-                files=files,
-                data=data,
-                cancel_check=cancel_check,
-                label="ASYNC_TRANSLATE_AUDIO",
-            )
-            response.raise_for_status()
-            return _extract_asr_response_text(response, "ASYNC_TRANSLATE_AUDIO")
+            },
+            timeout_seconds=settings.WHISPER_ASR_TIMEOUT,
+            cancel_check=cancel_check,
+            label="ASYNC_TRANSLATE_AUDIO",
+        )
 
     try:
-        return await _run_asr_backend("whisper", _whisper_backends(), "translate-en", operation, cancel_check=cancel_check)
+        return await _run_asr_backend(
+            "whisper",
+            _whisper_backends(),
+            "translate-en",
+            operation,
+            cancel_check=cancel_check,
+            hard_timeout_seconds=settings.WHISPER_ASR_TIMEOUT + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+        )
     except ClientDisconnectedError:
         raise
     except Exception as e:
@@ -1566,20 +1739,23 @@ async def async_translate_audio(
 
 async def async_transcribe_sensevoice(audio_file: bytes, filename: str = "audio.wav", cancel_check: Optional[CancelCheck] = None) -> str:
     async def operation() -> str:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            files = {'file': (filename or 'audio.wav', audio_file, 'audio/wav')}
-            response = await _post_with_cancel(
-                client,
-                _sensevoice_transcription_url(),
-                files=files,
-                cancel_check=cancel_check,
-                label="ASYNC_TRANSCRIBE_SENSEVOICE",
-            )
-            response.raise_for_status()
-            return _extract_asr_text(response.json(), "ASYNC_TRANSCRIBE_SENSEVOICE")
+        return await _post_asr_form_and_extract_text(
+            _sensevoice_transcription_url(),
+            files={'file': (filename or 'audio.wav', audio_file, 'audio/wav')},
+            data=None,
+            timeout_seconds=30.0,
+            cancel_check=cancel_check,
+            label="ASYNC_TRANSCRIBE_SENSEVOICE",
+        )
 
     try:
-        return await _run_asr_endpoint("sensevoice", "zh", operation, cancel_check=cancel_check)
+        return await _run_asr_endpoint(
+            "sensevoice",
+            "zh",
+            operation,
+            cancel_check=cancel_check,
+            hard_timeout_seconds=30.0 + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+        )
     except ClientDisconnectedError:
         raise
     except Exception as e:
@@ -1591,20 +1767,23 @@ async def async_transcribe_firered(audio_file: bytes, filename: str = "audio.wav
     _raise_if_firered_audio_too_short(audio_file)
 
     async def operation() -> str:
-        async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
-            files = {'file': (filename or 'audio.wav', audio_file, 'application/octet-stream')}
-            response = await _post_with_cancel(
-                client,
-                f"{_firered_asr_base_url()}/transcribe",
-                files=files,
-                cancel_check=cancel_check,
-                label="ASYNC_TRANSCRIBE_FIRERED",
-            )
-            response.raise_for_status()
-            return _extract_asr_text(response.json(), "ASYNC_TRANSCRIBE_FIRERED")
+        return await _post_asr_form_and_extract_text(
+            f"{_firered_asr_base_url()}/transcribe",
+            files={'file': (filename or 'audio.wav', audio_file, 'application/octet-stream')},
+            data=None,
+            timeout_seconds=settings.FIRERED_ASR_TIMEOUT,
+            cancel_check=cancel_check,
+            label="ASYNC_TRANSCRIBE_FIRERED",
+        )
 
     try:
-        return await _run_asr_endpoint("firered", "zh", operation, cancel_check=cancel_check)
+        return await _run_asr_endpoint(
+            "firered",
+            "zh",
+            operation,
+            cancel_check=cancel_check,
+            hard_timeout_seconds=settings.FIRERED_ASR_TIMEOUT + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+        )
     except HTTPException:
         raise
     except ClientDisconnectedError:
@@ -1632,25 +1811,26 @@ async def async_transcribe_trt(audio_file: bytes, language: str = 'zh', cancel_c
     target_language = _normalize_target_language_for_trt(language)
 
     async def operation() -> str:
-        async with httpx.AsyncClient(timeout=settings.FIRERED_ASR_TIMEOUT) as client:
-            files = {'file': ('audio.wav', audio_file, 'audio/wav')}
-            data = {
+        return await _post_asr_form_and_extract_text(
+            f"{_whisper_trt_base_url()}/v1/audio/transcriptions",
+            files={'file': ('audio.wav', audio_file, 'audio/wav')},
+            data={
                 'language': target_language,
                 'response_format': 'json',
-            }
-            response = await _post_with_cancel(
-                client,
-                f"{_whisper_trt_base_url()}/v1/audio/transcriptions",
-                files=files,
-                data=data,
-                cancel_check=cancel_check,
-                label="ASYNC_TRANSCRIBE_TRT",
-            )
-            response.raise_for_status()
-            return _extract_asr_text(response.json(), "ASYNC_TRANSCRIBE_TRT")
+            },
+            timeout_seconds=settings.FIRERED_ASR_TIMEOUT,
+            cancel_check=cancel_check,
+            label="ASYNC_TRANSCRIBE_TRT",
+        )
 
     try:
-        return await _run_asr_endpoint("whisper-trt", target_language, operation, cancel_check=cancel_check)
+        return await _run_asr_endpoint(
+            "whisper-trt",
+            target_language,
+            operation,
+            cancel_check=cancel_check,
+            hard_timeout_seconds=settings.FIRERED_ASR_TIMEOUT + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+        )
     except ClientDisconnectedError:
         raise
     except Exception as e:

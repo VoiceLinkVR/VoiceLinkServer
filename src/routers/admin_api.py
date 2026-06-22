@@ -1,3 +1,7 @@
+import asyncio
+import time
+from typing import Any, Callable
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -14,6 +18,7 @@ from core.dependencies import (
     utcnow_naive,
 )
 from core.rate_limiter import enforce_auth_attempt_rate_limit
+from core.logging_config import logger
 from core.v2_dependencies import (
     authenticate_v2_user,
     get_current_admin_v2_user,
@@ -46,8 +51,32 @@ from schemas.admin import (
     AdminUserResponse,
     AdminUserUpdateRequest,
 )
+from db.base import SessionLocal
 
 router = APIRouter()
+_admin_stats_cache: dict[tuple[str], tuple[float, dict[str, Any]]] = {}
+
+
+async def _run_admin_db_task(label: str, task: Callable[[Session], Any]) -> Any:
+    started_at = time.perf_counter()
+
+    def _runner() -> Any:
+        db = SessionLocal()
+        try:
+            return task(db)
+        finally:
+            db.close()
+
+    try:
+        return await asyncio.to_thread(_runner)
+    finally:
+        elapsed = time.perf_counter() - started_at
+        if elapsed >= 2.0:
+            logger.warning("[ADMIN-SLOW] label=%s elapsed=%.3fs", label, elapsed)
+
+
+def _admin_stats_cache_key(hour: str | None) -> tuple[str]:
+    return ((hour or "").strip(),)
 
 
 def _serialize_admin_user(user: V2User) -> AdminUserResponse:
@@ -190,15 +219,17 @@ async def list_users(
     role: str | None = Query(default=None, max_length=32),
     user_status: str | None = Query(default=None, alias="status", max_length=32),
     _: V2User = Depends(get_current_admin_v2_user),
-    db: Session = Depends(get_db),
 ):
-    return admin_service.list_users_payload(
-        db,
-        page=page,
-        page_size=page_size,
-        search=search,
-        role=role,
-        status_filter=user_status,
+    return await _run_admin_db_task(
+        "admin.users",
+        lambda db: admin_service.list_users_payload(
+            db,
+            page=page,
+            page_size=page_size,
+            search=search,
+            role=role,
+            status_filter=user_status,
+        ),
     )
 
 
@@ -438,8 +469,22 @@ async def update_support_ticket(
 
 
 @router.get("/stats")
-async def stats(hour: str | None = None, _: V2User = Depends(get_current_admin_v2_user), db: Session = Depends(get_db)):
-    return admin_service.build_stats_payload(db, hour)
+async def stats(hour: str | None = None, _: V2User = Depends(get_current_admin_v2_user)):
+    ttl_seconds = max(float(settings.ADMIN_STATS_CACHE_TTL_SECONDS or 0), 0.0)
+    cache_key = _admin_stats_cache_key(hour)
+    now = time.perf_counter()
+    if ttl_seconds > 0:
+        cached = _admin_stats_cache.get(cache_key)
+        if cached is not None and now - cached[0] <= ttl_seconds:
+            return cached[1]
+
+    payload = await _run_admin_db_task(
+        "admin.stats",
+        lambda db: admin_service.build_stats_payload(db, hour),
+    )
+    if ttl_seconds > 0:
+        _admin_stats_cache[cache_key] = (time.perf_counter(), payload)
+    return payload
 
 
 @router.get("/content/announcements", response_model=AdminAnnouncementListResponse)

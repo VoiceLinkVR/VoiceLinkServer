@@ -1,3 +1,4 @@
+import asyncio
 import emoji
 import httpx
 import json
@@ -71,7 +72,14 @@ USAGE_EXCLUDED_PREFIXES = (
 
 
 async def _raise_if_client_disconnected(request: Request, stage: str) -> None:
-    if await request.is_disconnected():
+    try:
+        disconnected = await asyncio.wait_for(
+            request.is_disconnected(),
+            timeout=max(float(settings.CLIENT_DISCONNECT_CHECK_TIMEOUT_SECONDS or 0), 0.001),
+        )
+    except (asyncio.TimeoutError, RuntimeError):
+        disconnected = False
+    if disconnected:
         request_id = getattr(request.state, "request_id", "")
         logger.info("[CLIENT-DISCONNECT] request_id=%s path=%s stage=%s", request_id, request.url.path, stage)
         raise ClientDisconnectedError(stage)

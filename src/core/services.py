@@ -11,7 +11,7 @@ import re
 import unicodedata
 from contextlib import contextmanager, suppress
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Deque, Optional, Sequence, TypeVar
 from urllib.parse import urlparse
 
@@ -22,7 +22,7 @@ import opuslib
 import emoji
 from core.config import settings, WHISPER_URL
 from core.gemma_translate_service import async_gemma_translate, gemma_translate, is_gemma_translation_supported
-from core.logging_config import logger
+from core.logging_config import get_request_id, logger
 from core.text_compressor import compress_repeated_chars
 from core.update_service import get_translation_capabilities
 
@@ -39,17 +39,19 @@ class ClientDisconnectedError(Exception):
 
 ASR_QUEUE_LIMIT_ENABLED = os.getenv("ASR_QUEUE_LIMIT_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 ASR_QUEUE_DEFAULT_MAX_CONCURRENCY = max(int(os.getenv("ASR_QUEUE_MAX_CONCURRENCY", "4")), 1)
-ASR_QUEUE_DEFAULT_MAX_WAITING = max(int(os.getenv("ASR_QUEUE_MAX_WAITING", "20")), 0)
-ASR_QUEUE_DEFAULT_TIMEOUT_SECONDS = max(float(os.getenv("ASR_QUEUE_TIMEOUT_SECONDS", "3")), 0.05)
+ASR_QUEUE_DEFAULT_MAX_WAITING = max(int(os.getenv("ASR_QUEUE_MAX_WAITING", "4")), 0)
+ASR_QUEUE_DEFAULT_TIMEOUT_SECONDS = max(float(os.getenv("ASR_QUEUE_TIMEOUT_SECONDS", "1.5")), 0.05)
 ASR_QUEUE_DEFAULT_RETRY_AFTER_SECONDS = max(float(os.getenv("ASR_QUEUE_RETRY_AFTER_SECONDS", "2")), 1.0)
 ASR_QUEUE_SLOW_LOG_SECONDS = max(float(os.getenv("ASR_QUEUE_SLOW_LOG_SECONDS", "15")), 0.1)
 ASR_QUEUE_LATENCY_WINDOW = max(int(os.getenv("ASR_QUEUE_LATENCY_WINDOW", "64")), 4)
 ASR_DOWNSTREAM_CANCEL_GRACE_SECONDS = max(float(os.getenv("ASR_DOWNSTREAM_CANCEL_GRACE_SECONDS", "1")), 0.05)
+ASR_CANCEL_CHECK_INTERVAL_SECONDS = max(float(os.getenv("ASR_CANCEL_CHECK_INTERVAL_SECONDS", "0.25")), 0.05)
 ASR_HTTP_CONNECT_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_CONNECT_TIMEOUT_SECONDS", "3")), 0.05)
 ASR_HTTP_WRITE_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_WRITE_TIMEOUT_SECONDS", "10")), 0.05)
 ASR_HTTP_POOL_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_POOL_TIMEOUT_SECONDS", "3")), 0.05)
 ASR_HTTP_CLOSE_TIMEOUT_SECONDS = max(float(os.getenv("ASR_HTTP_CLOSE_TIMEOUT_SECONDS", "1")), 0.05)
-ASR_BACKEND_STATUS_ENABLED = os.getenv("ASR_BACKEND_STATUS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+ASR_HARD_TIMEOUT_GRACE_SECONDS = max(float(os.getenv("ASR_HARD_TIMEOUT_GRACE_SECONDS", "10")), 0.0)
+ASR_BACKEND_STATUS_ENABLED = os.getenv("ASR_BACKEND_STATUS_ENABLED", "false").strip().lower() not in {"0", "false", "no", "off"}
 ASR_BACKEND_STATUS_TTL_SECONDS = max(float(os.getenv("ASR_BACKEND_STATUS_TTL_SECONDS", "1.5")), 0.05)
 ASR_BACKEND_STATUS_TIMEOUT_SECONDS = max(float(os.getenv("ASR_BACKEND_STATUS_TIMEOUT_SECONDS", "0.6")), 0.05)
 ASR_BACKEND_STATUS_OVERLOAD_ACTIVE_REQUESTS = max(int(os.getenv("ASR_BACKEND_STATUS_OVERLOAD_ACTIVE_REQUESTS", "4")), 1)
@@ -57,6 +59,15 @@ ASR_BACKEND_STATUS_OVERLOAD_OLDEST_SECONDS = max(float(os.getenv("ASR_BACKEND_ST
 ASR_BACKEND_STATUS_OVERLOAD_MIN_SECONDS = max(float(os.getenv("ASR_BACKEND_STATUS_OVERLOAD_MIN_SECONDS", "12")), 0.0)
 ASR_BACKEND_STATUS_RECOVERY_OLDEST_SECONDS = max(float(os.getenv("ASR_BACKEND_STATUS_RECOVERY_OLDEST_SECONDS", "12")), 0.0)
 ASR_BACKEND_STATUS_RECOVERY_ACTIVE_REQUESTS = max(int(os.getenv("ASR_BACKEND_STATUS_RECOVERY_ACTIVE_REQUESTS", "2")), 0)
+ASR_ENDPOINT_CIRCUIT_BREAKER_ENABLED = os.getenv("ASR_ENDPOINT_CIRCUIT_BREAKER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+ASR_ENDPOINT_CIRCUIT_WINDOW_SECONDS = max(float(os.getenv("ASR_ENDPOINT_CIRCUIT_WINDOW_SECONDS", "60")), 1.0)
+ASR_ENDPOINT_CIRCUIT_CONSECUTIVE_TIMEOUTS = max(int(os.getenv("ASR_ENDPOINT_CIRCUIT_CONSECUTIVE_TIMEOUTS", "2")), 1)
+ASR_ENDPOINT_CIRCUIT_CONSECUTIVE_FAILURES = max(int(os.getenv("ASR_ENDPOINT_CIRCUIT_CONSECUTIVE_FAILURES", "3")), 1)
+ASR_ENDPOINT_CIRCUIT_TIMEOUT_RATE = min(max(float(os.getenv("ASR_ENDPOINT_CIRCUIT_TIMEOUT_RATE", "0.2")), 0.0), 1.0)
+ASR_ENDPOINT_CIRCUIT_MIN_SAMPLES = max(int(os.getenv("ASR_ENDPOINT_CIRCUIT_MIN_SAMPLES", "5")), 1)
+ASR_ENDPOINT_CIRCUIT_OPEN_SECONDS = max(float(os.getenv("ASR_ENDPOINT_CIRCUIT_OPEN_SECONDS", "15")), 1.0)
+ASR_ENDPOINT_CIRCUIT_RETRY_AFTER_SECONDS = max(float(os.getenv("ASR_ENDPOINT_CIRCUIT_RETRY_AFTER_SECONDS", "2")), 1.0)
+ASR_ENDPOINT_CIRCUIT_MAX_EVENTS = max(int(os.getenv("ASR_ENDPOINT_CIRCUIT_MAX_EVENTS", "128")), 8)
 
 
 @dataclass(frozen=True)
@@ -115,10 +126,30 @@ class AsrBackendProtectionState:
     last_reason: str = ""
 
 
+@dataclass
+class AsrEndpointCircuitState:
+    events: Deque[tuple[float, bool, bool]] = field(default_factory=lambda: deque(maxlen=ASR_ENDPOINT_CIRCUIT_MAX_EVENTS))
+    consecutive_timeouts: int = 0
+    consecutive_failures: int = 0
+    opened_until: float = 0.0
+    half_open_inflight: bool = False
+    last_reason: str = ""
+
+
+@dataclass(frozen=True)
+class AsrCircuitPermit:
+    endpoint: str
+    group: str
+    language: str
+    half_open: bool = False
+    enabled: bool = True
+
+
 _asr_endpoint_queues: dict[str, AsrEndpointQueue] = {}
 _asr_backend_rr_index: dict[str, int] = {}
 _asr_backend_status_cache: dict[str, AsrBackendRuntimeStatus] = {}
 _asr_backend_protection_state: dict[str, AsrBackendProtectionState] = {}
+_asr_endpoint_circuits: dict[str, AsrEndpointCircuitState] = {}
 
 
 def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
@@ -157,12 +188,6 @@ async def _run_cancel_check(cancel_check: Optional[CancelCheck]) -> None:
         await cancel_check()
 
 
-async def _watch_cancel(cancel_check: CancelCheck, interval_seconds: float = 0.25) -> None:
-    while True:
-        await cancel_check()
-        await asyncio.sleep(interval_seconds)
-
-
 async def _await_with_cancel(
     awaitable: Awaitable[T],
     cancel_check: Optional[CancelCheck],
@@ -171,23 +196,29 @@ async def _await_with_cancel(
     if cancel_check is None:
         return await awaitable
 
+    await _run_cancel_check(cancel_check)
     worker = asyncio.create_task(awaitable)
-    watcher = asyncio.create_task(_watch_cancel(cancel_check))
     try:
-        done, pending = await asyncio.wait(
-            {worker, watcher},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if watcher in done:
-            await _cancel_task_with_grace(worker, label)
-            logger.info("[%s] cancelled because client disconnected", label)
-            await watcher
-        watcher.cancel()
-        return await worker
+        while True:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(worker),
+                    timeout=ASR_CANCEL_CHECK_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    await _run_cancel_check(cancel_check)
+                except ClientDisconnectedError:
+                    await _cancel_task_with_grace(worker, label)
+                    logger.info("[%s] cancelled because client disconnected", label)
+                    raise
+            except ClientDisconnectedError:
+                await _cancel_task_with_grace(worker, label)
+                logger.info("[%s] cancelled because client disconnected", label)
+                raise
     finally:
-        watcher.cancel()
-        with suppress(asyncio.CancelledError, ClientDisconnectedError):
-            await watcher
+        if not worker.done():
+            await _cancel_task_with_grace(worker, label)
 
 
 async def _await_with_hard_timeout(
@@ -203,6 +234,9 @@ async def _await_with_hard_timeout(
         return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout_seconds)
     except asyncio.TimeoutError:
         await _cancel_task_with_grace(worker, label)
+        if worker.done() and not worker.cancelled():
+            logger.warning("[%s] hard timeout fired after worker completed; returning completed result", label)
+            return worker.result()
         raise
     except asyncio.CancelledError:
         await _cancel_task_with_grace(worker, label)
@@ -236,6 +270,10 @@ def _build_asr_http_timeout(total_timeout_seconds: float) -> httpx.Timeout:
         write=min(ASR_HTTP_WRITE_TIMEOUT_SECONDS, total_timeout),
         pool=min(ASR_HTTP_POOL_TIMEOUT_SECONDS, total_timeout),
     )
+
+
+def _asr_hard_timeout_seconds(downstream_timeout_seconds: float) -> float:
+    return max(float(downstream_timeout_seconds or 0), 0.05) + ASR_HTTP_CLOSE_TIMEOUT_SECONDS + ASR_HARD_TIMEOUT_GRACE_SECONDS
 
 
 def _asr_no_keepalive_limits() -> httpx.Limits:
@@ -445,6 +483,190 @@ async def _filter_asr_backends_by_runtime_status(
     return available, protected
 
 
+def _asr_circuit_state(endpoint: str) -> AsrEndpointCircuitState:
+    state = _asr_endpoint_circuits.get(endpoint)
+    if state is None:
+        state = AsrEndpointCircuitState()
+        _asr_endpoint_circuits[endpoint] = state
+    return state
+
+
+def _prune_asr_circuit_events(state: AsrEndpointCircuitState, now: float) -> None:
+    cutoff = now - ASR_ENDPOINT_CIRCUIT_WINDOW_SECONDS
+    while state.events and state.events[0][0] < cutoff:
+        state.events.popleft()
+
+
+def _asr_circuit_snapshot(endpoint: str, now: float | None = None) -> dict[str, Any]:
+    current = time.perf_counter() if now is None else now
+    state = _asr_circuit_state(endpoint)
+    _prune_asr_circuit_events(state, current)
+    total = len(state.events)
+    timeout_count = sum(1 for _, _, timed_out in state.events if timed_out)
+    failure_count = sum(1 for _, failed, _ in state.events if failed)
+    return {
+        "endpoint": endpoint,
+        "state": "open" if state.opened_until > current else ("half_open" if state.opened_until > 0 else "closed"),
+        "openedRemainingSeconds": round(max(state.opened_until - current, 0.0), 3),
+        "halfOpenInflight": state.half_open_inflight,
+        "windowSeconds": ASR_ENDPOINT_CIRCUIT_WINDOW_SECONDS,
+        "samples": total,
+        "timeouts": timeout_count,
+        "failures": failure_count,
+        "timeoutRate": round(timeout_count / total, 3) if total else 0.0,
+        "consecutiveTimeouts": state.consecutive_timeouts,
+        "consecutiveFailures": state.consecutive_failures,
+        "lastReason": state.last_reason,
+    }
+
+
+def _asr_circuit_rejection(
+    endpoint_group: str,
+    language: str,
+    endpoints: Sequence[str],
+) -> HTTPException:
+    now = time.perf_counter()
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": "asr_endpoint_circuit_open",
+            "engine": endpoint_group,
+            "language": language,
+            "endpoints": [_asr_circuit_snapshot(endpoint, now) for endpoint in endpoints],
+        },
+        headers={"Retry-After": str(max(1, int(ASR_ENDPOINT_CIRCUIT_RETRY_AFTER_SECONDS + 0.999)))},
+    )
+
+
+def _asr_circuit_endpoint_available(endpoint: str, now: float | None = None) -> bool:
+    if not ASR_ENDPOINT_CIRCUIT_BREAKER_ENABLED:
+        return True
+    current = time.perf_counter() if now is None else now
+    state = _asr_circuit_state(endpoint)
+    _prune_asr_circuit_events(state, current)
+    if state.opened_until > current:
+        return False
+    if state.opened_until > 0 and state.half_open_inflight:
+        return False
+    return True
+
+
+def _filter_asr_backends_by_circuit(
+    endpoint_group: str,
+    backends: Sequence[AsrBackend],
+    language: str,
+) -> list[AsrBackend]:
+    if not ASR_ENDPOINT_CIRCUIT_BREAKER_ENABLED:
+        return list(backends)
+
+    now = time.perf_counter()
+    available = [backend for backend in backends if _asr_circuit_endpoint_available(backend.endpoint, now)]
+    if available:
+        blocked = [backend.endpoint for backend in backends if backend not in available]
+        if blocked:
+            logger.warning(
+                "[ASR_CIRCUIT] skipped open backend(s). group=%s language=%s blocked=%s available=%s",
+                endpoint_group,
+                language,
+                [_asr_circuit_snapshot(endpoint, now) for endpoint in blocked],
+                [backend.endpoint for backend in available],
+            )
+        return available
+
+    raise _asr_circuit_rejection(endpoint_group, language, [backend.endpoint for backend in backends])
+
+
+def _acquire_asr_circuit_permit(endpoint: str, endpoint_group: str, language: str) -> AsrCircuitPermit:
+    if not ASR_ENDPOINT_CIRCUIT_BREAKER_ENABLED:
+        return AsrCircuitPermit(endpoint=endpoint, group=endpoint_group, language=language, enabled=False)
+
+    now = time.perf_counter()
+    state = _asr_circuit_state(endpoint)
+    _prune_asr_circuit_events(state, now)
+    if state.opened_until > now:
+        raise _asr_circuit_rejection(endpoint_group, language, [endpoint])
+
+    half_open = state.opened_until > 0
+    if half_open:
+        if state.half_open_inflight:
+            raise _asr_circuit_rejection(endpoint_group, language, [endpoint])
+        state.half_open_inflight = True
+        logger.info("[ASR_CIRCUIT] half-open probe started. endpoint=%s group=%s language=%s", endpoint, endpoint_group, language)
+
+    return AsrCircuitPermit(endpoint=endpoint, group=endpoint_group, language=language, half_open=half_open)
+
+
+def _release_asr_circuit_probe(permit: AsrCircuitPermit | None) -> None:
+    if permit is None or not permit.enabled or not permit.half_open:
+        return
+    _asr_circuit_state(permit.endpoint).half_open_inflight = False
+
+
+def _record_asr_circuit_result(
+    permit: AsrCircuitPermit | None,
+    *,
+    success: bool,
+    timed_out: bool,
+    error: str | None = None,
+) -> None:
+    if permit is None or not permit.enabled:
+        return
+
+    now = time.perf_counter()
+    state = _asr_circuit_state(permit.endpoint)
+    _prune_asr_circuit_events(state, now)
+    if permit.half_open:
+        state.half_open_inflight = False
+
+    if success:
+        state.consecutive_timeouts = 0
+        state.consecutive_failures = 0
+        state.opened_until = 0.0
+        state.last_reason = ""
+        state.events.append((now, False, False))
+        if permit.half_open:
+            logger.info("[ASR_CIRCUIT] half-open probe succeeded. endpoint=%s group=%s", permit.endpoint, permit.group)
+        return
+
+    state.consecutive_failures += 1
+    if timed_out:
+        state.consecutive_timeouts += 1
+    else:
+        state.consecutive_timeouts = 0
+    state.events.append((now, True, timed_out))
+    _prune_asr_circuit_events(state, now)
+
+    total = len(state.events)
+    timeout_count = sum(1 for _, _, event_timed_out in state.events if event_timed_out)
+    timeout_rate = timeout_count / total if total else 0.0
+    should_open = (
+        permit.half_open
+        or state.consecutive_timeouts >= ASR_ENDPOINT_CIRCUIT_CONSECUTIVE_TIMEOUTS
+        or state.consecutive_failures >= ASR_ENDPOINT_CIRCUIT_CONSECUTIVE_FAILURES
+        or (
+            total >= ASR_ENDPOINT_CIRCUIT_MIN_SAMPLES
+            and timeout_rate >= ASR_ENDPOINT_CIRCUIT_TIMEOUT_RATE
+        )
+    )
+    if not should_open:
+        return
+
+    reason = (
+        f"error={error or 'unknown'} consecutiveTimeouts={state.consecutive_timeouts} "
+        f"consecutiveFailures={state.consecutive_failures} timeoutRate={timeout_rate:.3f} samples={total}"
+    )
+    state.opened_until = now + ASR_ENDPOINT_CIRCUIT_OPEN_SECONDS
+    state.last_reason = reason
+    logger.warning(
+        "[ASR_CIRCUIT] opened endpoint circuit. endpoint=%s group=%s language=%s openSeconds=%.3f reason=%s",
+        permit.endpoint,
+        permit.group,
+        permit.language,
+        ASR_ENDPOINT_CIRCUIT_OPEN_SECONDS,
+        reason,
+    )
+
+
 async def _close_asr_resource(awaitable: Awaitable[Any], label: str) -> None:
     cleanup_task = asyncio.create_task(awaitable)
     try:
@@ -483,28 +705,107 @@ async def _post_asr_form_and_extract_text(
     timeout_seconds: float,
     cancel_check: Optional[CancelCheck],
     label: str,
+    engine: str | None = None,
+    endpoint_name: str | None = None,
+    language: str | None = None,
 ) -> str:
     client: httpx.AsyncClient | None = None
     response: httpx.Response | None = None
+    started_at = time.perf_counter()
+    stage_started_at = started_at
     try:
         client = httpx.AsyncClient(
             timeout=_build_asr_http_timeout(timeout_seconds),
             limits=_asr_no_keepalive_limits(),
             headers={"Connection": "close"},
         )
-        response = await _post_with_cancel(
-            client,
-            url,
-            files=files,
-            data=data,
-            cancel_check=cancel_check,
+        stage_started_at = _log_asr_http_stage(
             label=label,
+            stage="request_start",
+            url=url,
+            started_at=started_at,
+            stage_started_at=stage_started_at,
+            engine=engine,
+            endpoint_name=endpoint_name,
+            language=language,
+        )
+        request = client.build_request("POST", url, files=files, data=data)
+        response = await _await_with_cancel(client.send(request, stream=True), cancel_check, label)
+        stage_started_at = _log_asr_http_stage(
+            label=label,
+            stage="headers_received",
+            url=url,
+            started_at=started_at,
+            stage_started_at=stage_started_at,
+            engine=engine,
+            endpoint_name=endpoint_name,
+            language=language,
+            extra=f"status={response.status_code}",
         )
         response.raise_for_status()
-        return _extract_asr_response_text(response, label)
+        content = await _await_with_cancel(response.aread(), cancel_check, label)
+        stage_started_at = _log_asr_http_stage(
+            label=label,
+            stage="body_read_finished",
+            url=url,
+            started_at=started_at,
+            stage_started_at=stage_started_at,
+            engine=engine,
+            endpoint_name=endpoint_name,
+            language=language,
+            extra=f"bytes={len(content)}",
+        )
+        try:
+            text = _extract_asr_response_text_from_content(response, content, label)
+        except Exception as parse_exc:
+            _log_asr_http_stage(
+                label=label,
+                stage="json_parse_failed",
+                url=url,
+                started_at=started_at,
+                stage_started_at=stage_started_at,
+                engine=engine,
+                endpoint_name=endpoint_name,
+                language=language,
+                extra=f"error={type(parse_exc).__name__}: {parse_exc}",
+            )
+            raise
+        _log_asr_http_stage(
+            label=label,
+            stage="json_parse_finished",
+            url=url,
+            started_at=started_at,
+            stage_started_at=stage_started_at,
+            engine=engine,
+            endpoint_name=endpoint_name,
+            language=language,
+        )
+        return text
     finally:
+        close_started_at = time.perf_counter()
         await _close_response_quietly(response, label)
+        _log_asr_http_stage(
+            label=label,
+            stage="response_close_finished",
+            url=url,
+            started_at=started_at,
+            stage_started_at=close_started_at,
+            engine=engine,
+            endpoint_name=endpoint_name,
+            language=language,
+        )
+        close_started_at = time.perf_counter()
         await _close_client_quietly(client, label)
+        _log_asr_http_stage(
+            label=label,
+            stage="client_close_finished",
+            url=url,
+            started_at=started_at,
+            stage_started_at=close_started_at,
+            engine=engine,
+            endpoint_name=endpoint_name,
+            language=language,
+        )
 
 
 def _asr_endpoint_env_prefix(endpoint: str) -> str:
@@ -710,6 +1011,7 @@ async def _acquire_asr_backend_slot(
             status_code=503,
             detail={"error": "asr_backend_unavailable", "engine": endpoint_group, "language": language},
         )
+    backends = tuple(_filter_asr_backends_by_circuit(endpoint_group, backends, language))
     available_backends, _ = await _filter_asr_backends_by_runtime_status(endpoint_group, backends, language)
     backends = tuple(available_backends)
     if len(backends) == 1:
@@ -914,14 +1216,28 @@ async def _run_asr_endpoint(
     cancel_check: Optional[CancelCheck] = None,
     hard_timeout_seconds: float | None = None,
 ) -> T:
-    permit = await _acquire_asr_endpoint_slot(endpoint, language, cancel_check)
+    circuit_permit: AsrCircuitPermit | None = _acquire_asr_circuit_permit(endpoint, _asr_endpoint_group(endpoint), language)
+    try:
+        permit = await _acquire_asr_endpoint_slot(endpoint, language, cancel_check)
+    except Exception:
+        _release_asr_circuit_probe(circuit_permit)
+        raise
     record_latency = True
     try:
-        return await _await_with_hard_timeout(operation(), hard_timeout_seconds, f"ASR:{endpoint}")
+        result = await _await_with_hard_timeout(operation(), hard_timeout_seconds, f"ASR:{endpoint}")
+        _record_asr_circuit_result(circuit_permit, success=True, timed_out=False)
+        return result
     except ClientDisconnectedError:
         record_latency = False
+        _release_asr_circuit_probe(circuit_permit)
         raise
     except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+        _record_asr_circuit_result(
+            circuit_permit,
+            success=False,
+            timed_out=True,
+            error=f"{type(exc).__name__}: {exc}",
+        )
         logger.warning(
             "[ASR_QUEUE_LIMIT] downstream ASR request timed out. endpoint=%s language=%s timeout=%.3fs queued=%.3fs",
             endpoint,
@@ -939,6 +1255,14 @@ async def _run_asr_endpoint(
             },
             headers={"Retry-After": str(max(1, int(permit.config.retry_after_seconds + 0.999)))},
         ) from exc
+    except Exception as exc:
+        _record_asr_circuit_result(
+            circuit_permit,
+            success=False,
+            timed_out=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
     finally:
         await asyncio.shield(_release_asr_endpoint_slot(permit, record_latency=record_latency))
 
@@ -952,14 +1276,25 @@ async def _run_asr_backend(
     hard_timeout_seconds: float | None = None,
 ) -> T:
     backend, permit = await _acquire_asr_backend_slot(endpoint_group, backends, language, cancel_check)
+    circuit_permit: AsrCircuitPermit | None = None
     record_latency = True
     try:
+        circuit_permit = _acquire_asr_circuit_permit(backend.endpoint, endpoint_group, language)
         logger.debug("[ASR] selected backend. group=%s endpoint=%s base_url=%s", endpoint_group, backend.endpoint, backend.base_url)
-        return await _await_with_hard_timeout(operation(backend), hard_timeout_seconds, f"ASR:{backend.endpoint}")
+        result = await _await_with_hard_timeout(operation(backend), hard_timeout_seconds, f"ASR:{backend.endpoint}")
+        _record_asr_circuit_result(circuit_permit, success=True, timed_out=False)
+        return result
     except ClientDisconnectedError:
         record_latency = False
+        _release_asr_circuit_probe(circuit_permit)
         raise
     except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+        _record_asr_circuit_result(
+            circuit_permit,
+            success=False,
+            timed_out=True,
+            error=f"{type(exc).__name__}: {exc}",
+        )
         logger.warning(
             "[ASR_QUEUE_LIMIT] downstream ASR request timed out. group=%s endpoint=%s language=%s timeout=%.3fs queued=%.3fs",
             endpoint_group,
@@ -979,6 +1314,14 @@ async def _run_asr_backend(
             },
             headers={"Retry-After": str(max(1, int(permit.config.retry_after_seconds + 0.999)))},
         ) from exc
+    except Exception as exc:
+        _record_asr_circuit_result(
+            circuit_permit,
+            success=False,
+            timed_out=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
     finally:
         await asyncio.shield(_release_asr_endpoint_slot(permit, record_latency=record_latency))
 
@@ -1381,11 +1724,49 @@ def _extract_asr_text(result: dict, log_prefix: str) -> str:
     return text
 
 
-def _extract_asr_response_text(response: httpx.Response, log_prefix: str) -> str:
+def _extract_asr_response_text_from_content(response: httpx.Response, content: bytes, log_prefix: str) -> str:
     content_type = response.headers.get("content-type", "")
+    response_text = content.decode(response.encoding or "utf-8", errors="replace")
     if "application/json" in content_type:
-        return _extract_asr_text(response.json(), log_prefix)
-    return response.text
+        return _extract_asr_text(json.loads(response_text or "{}"), log_prefix)
+    return response_text
+
+
+def _asr_log_endpoint(url: str, endpoint_name: str | None = None) -> str:
+    if endpoint_name:
+        return endpoint_name
+    parsed = urlparse(url)
+    if parsed.netloc:
+        return f"{parsed.netloc}{parsed.path}"
+    return url
+
+
+def _log_asr_http_stage(
+    *,
+    label: str,
+    stage: str,
+    url: str,
+    started_at: float,
+    stage_started_at: float,
+    engine: str | None,
+    endpoint_name: str | None,
+    language: str | None,
+    extra: str = "",
+) -> float:
+    now = time.perf_counter()
+    logger.info(
+        "[ASR_HTTP] stage=%s label=%s request_id=%s engine=%s endpoint=%s language=%s stage_elapsed=%.3fs total_elapsed=%.3fs%s",
+        stage,
+        label,
+        get_request_id(),
+        engine or "-",
+        _asr_log_endpoint(url, endpoint_name),
+        language or "-",
+        now - stage_started_at,
+        now - started_at,
+        f" {extra}" if extra else "",
+    )
+    return now
 
 
 def _lid_segments_form_value(lid_metadata: Optional[dict[str, object]]) -> str | None:
@@ -1914,6 +2295,9 @@ async def async_transcribe(
             timeout_seconds=settings.WHISPER_ASR_TIMEOUT,
             cancel_check=cancel_check,
             label="ASYNC_TRANSCRIBE",
+            engine="whisper",
+            endpoint_name=backend.endpoint,
+            language=language,
         )
 
     try:
@@ -1923,7 +2307,7 @@ async def async_transcribe(
             language,
             operation,
             cancel_check=cancel_check,
-            hard_timeout_seconds=settings.WHISPER_ASR_TIMEOUT + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+            hard_timeout_seconds=_asr_hard_timeout_seconds(settings.WHISPER_ASR_TIMEOUT),
         )
     except ClientDisconnectedError:
         raise
@@ -1958,6 +2342,9 @@ async def async_translate_audio(
             timeout_seconds=settings.WHISPER_ASR_TIMEOUT,
             cancel_check=cancel_check,
             label="ASYNC_TRANSLATE_AUDIO",
+            engine="whisper",
+            endpoint_name=backend.endpoint,
+            language="translate-en",
         )
 
     try:
@@ -1967,7 +2354,7 @@ async def async_translate_audio(
             "translate-en",
             operation,
             cancel_check=cancel_check,
-            hard_timeout_seconds=settings.WHISPER_ASR_TIMEOUT + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+            hard_timeout_seconds=_asr_hard_timeout_seconds(settings.WHISPER_ASR_TIMEOUT),
         )
     except ClientDisconnectedError:
         raise
@@ -1985,6 +2372,9 @@ async def async_transcribe_sensevoice(audio_file: bytes, filename: str = "audio.
             timeout_seconds=30.0,
             cancel_check=cancel_check,
             label="ASYNC_TRANSCRIBE_SENSEVOICE",
+            engine="sensevoice",
+            endpoint_name="sensevoice",
+            language="zh",
         )
 
     try:
@@ -1993,7 +2383,7 @@ async def async_transcribe_sensevoice(audio_file: bytes, filename: str = "audio.
             "zh",
             operation,
             cancel_check=cancel_check,
-            hard_timeout_seconds=30.0 + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+            hard_timeout_seconds=_asr_hard_timeout_seconds(30.0),
         )
     except ClientDisconnectedError:
         raise
@@ -2013,6 +2403,9 @@ async def async_transcribe_firered(audio_file: bytes, filename: str = "audio.wav
             timeout_seconds=settings.FIRERED_ASR_TIMEOUT,
             cancel_check=cancel_check,
             label="ASYNC_TRANSCRIBE_FIRERED",
+            engine="firered",
+            endpoint_name="firered",
+            language="zh",
         )
 
     try:
@@ -2021,7 +2414,7 @@ async def async_transcribe_firered(audio_file: bytes, filename: str = "audio.wav
             "zh",
             operation,
             cancel_check=cancel_check,
-            hard_timeout_seconds=settings.FIRERED_ASR_TIMEOUT + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+            hard_timeout_seconds=_asr_hard_timeout_seconds(settings.FIRERED_ASR_TIMEOUT),
         )
     except HTTPException:
         raise
@@ -2060,6 +2453,9 @@ async def async_transcribe_trt(audio_file: bytes, language: str = 'zh', cancel_c
             timeout_seconds=settings.FIRERED_ASR_TIMEOUT,
             cancel_check=cancel_check,
             label="ASYNC_TRANSCRIBE_TRT",
+            engine="whisper-trt",
+            endpoint_name="whisper-trt",
+            language=target_language,
         )
 
     try:
@@ -2068,7 +2464,7 @@ async def async_transcribe_trt(audio_file: bytes, language: str = 'zh', cancel_c
             target_language,
             operation,
             cancel_check=cancel_check,
-            hard_timeout_seconds=settings.FIRERED_ASR_TIMEOUT + ASR_HTTP_CLOSE_TIMEOUT_SECONDS,
+            hard_timeout_seconds=_asr_hard_timeout_seconds(settings.FIRERED_ASR_TIMEOUT),
         )
     except ClientDisconnectedError:
         raise

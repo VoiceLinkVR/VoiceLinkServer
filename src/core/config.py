@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     WHISPER_ENDPOINTS: str = ""
     WHISPER_BACKEND: str = "faster-whisper"
     WHISPER_ASR_TIMEOUT: float = 30.0
-    ASR_BACKEND_STATUS_ENABLED: bool = True
+    ASR_BACKEND_STATUS_ENABLED: bool = False
     ASR_BACKEND_STATUS_TTL_SECONDS: float = 1.5
     ASR_BACKEND_STATUS_TIMEOUT_SECONDS: float = 0.6
     ASR_BACKEND_STATUS_OVERLOAD_ACTIVE_REQUESTS: int = 4
@@ -207,6 +207,8 @@ class Settings(BaseSettings):
     ADMIN_LOGIN_IP_LIMIT: str = "10/10 minutes"
     ADMIN_LOGIN_IDENTITY_LIMIT: str = "5/10 minutes"
     ADMIN_SURFACE_LAN_ONLY: bool = True
+    ADMIN_STATS_CACHE_TTL_SECONDS: float = 45.0
+    CLIENT_DISCONNECT_CHECK_TIMEOUT_SECONDS: float = 0.05
     GUEST_AUTH_ENABLED: bool = True
     GUEST_LOGIN_IP_LIMIT: str = "30/10 minutes"
     GUEST_SESSION_EXPIRES_MINUTES: int = 60

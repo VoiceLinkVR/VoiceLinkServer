@@ -527,8 +527,11 @@ def _release_qwen_clone_queue_slot() -> int:
 
 async def _raise_if_client_disconnected(request: Request, request_id: str) -> None:
     try:
-        disconnected = await request.is_disconnected()
-    except RuntimeError:
+        disconnected = await asyncio.wait_for(
+            request.is_disconnected(),
+            timeout=max(float(settings.CLIENT_DISCONNECT_CHECK_TIMEOUT_SECONDS or 0), 0.001),
+        )
+    except (asyncio.TimeoutError, RuntimeError):
         disconnected = False
     if disconnected:
         logger.info("[V2-TTS] Qwen clone client disconnected while queued request_id=%s", request_id)
